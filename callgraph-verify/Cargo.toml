@@ -1,0 +1,27 @@
+# callgraph_verify — anti-hallucination call-graph gate, sourced PURELY from the
+# real binary's bytes (noivilbo.exe). Unlike tools/analysis/verify_callgraph.py,
+# this never reads Ghidra .asm exports or decompiled .c: it parses the PE and
+# disassembles the actual machine code with iced-x86, so it cannot inherit a
+# decompiler's mistakes (truncated/split functions, misnamed targets).
+#
+# Lives in the rebuild workspace as a proc-macro build dependency — Cargo always
+# compiles proc-macro crates and their dependencies for the HOST (x86_64), so
+# iced-x86 never enters the i686 game binary.
+[package]
+name = "callgraph-verify"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "callgraph_verify"
+path = "src/lib.rs"
+
+[[bin]]
+name = "callgraph_verify"
+path = "src/main.rs"
+
+[dependencies]
+# Pure-Rust x86/x64 decoder (no C deps). Decode-only feature set keeps it lean.
+# `nasm` adds the formatter used by the reference-skeleton emitter (host-only build dep).
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info", "nasm"] }

@@ -1,0 +1,360 @@
+//! Build the `name -> origin-addr` map for the rebuild by scanning the source
+//! tree. A proc-macro can't see the compiler's symbol table, but it can read the
+//! files — so we harvest every function's declared origin address from its tag.
+//!
+//! Three tag forms are recognized, each associated with the `fn NAME` below it:
+//!   * `#[origin(0x004028d0)]`        — the structured attribute (preferred)
+//!   * `#[callgraph_verify(0x..)]`    — the verifier attribute (alias)
+//!   * `/// origin: 0x004028d0`       — the legacy doc-comment convention
+//!
+//! Scanned once per compiler process and cached.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
+
+use crate::body::BodyCalls;
+
+pub struct Corpus {
+    /// Free / associated fns (no `self` receiver), keyed by name.
+    pub free_fns: HashMap<String, HashSet<u64>>,
+    /// Methods (have a `self` receiver), keyed by name.
+    pub methods: HashMap<String, HashSet<u64>>,
+    pub addr2name: HashMap<u64, String>,
+    /// Every fn site (`<path>:<line> <name>`) that cites each origin address, deduped
+    /// per fn. A binary fn may be implemented by exactly ONE Rust fn, so any address
+    /// with >1 owner here is a duplicate (mirrors `check_origins.py`'s dup-addr check).
+    pub addr_owners: HashMap<u64, Vec<String>>,
+    pub corpus: BTreeSet<u64>,
+    /// `inline:`-tagged helpers (no own address) → the calls in their body. The
+    /// binary inlines these into callers, so a caller's verification folds in these
+    /// calls — catching an invented call hidden inside an untagged inline helper.
+    pub inline_fns: HashMap<String, BodyCalls>,
+    /// Inline-helper names defined in more than one place (e.g. a per-module `rd`).
+    /// Bare-name fold-in can't tell which one a caller meant, so these are skipped.
+    pub inline_ambiguous: HashSet<String>,
+    /// Origin addresses of fns carrying a `callgraph-inlined` marker: the binary inlines
+    /// the callee into its callers, so a direct Rust call to it is faithful even though
+    /// no caller shows a direct `CALL 0xADDR`.
+    pub inlined_markers: BTreeSet<u64>,
+    /// `(engine vtable VA, slot count)` for every `vtable_table!` the rebuild declares.
+    /// Lets the verifier read those engine vtables from the PE and recognize which call
+    /// targets are virtual methods (→ "use vcall, not a direct call").
+    pub declared_vtables: Vec<(u64, usize)>,
+}
+
+/// Scan `root` for the corpus map, caching the result per root path.
+pub fn corpus_map(root: &str) -> Arc<Corpus> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<String, Arc<Corpus>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut m = cache.lock().unwrap();
+    if let Some(c) = m.get(root) {
+        return c.clone();
+    }
+    let built = Arc::new(build(root));
+    m.insert(root.to_string(), built.clone());
+    built
+}
+
+fn build(root: &str) -> Corpus {
+    let mut c = Corpus {
+        free_fns: HashMap::new(),
+        methods: HashMap::new(),
+        addr2name: HashMap::new(),
+        addr_owners: HashMap::new(),
+        corpus: BTreeSet::new(),
+        inline_fns: HashMap::new(),
+        inline_ambiguous: HashSet::new(),
+        inlined_markers: BTreeSet::new(),
+        declared_vtables: Vec::new(),
+    };
+    let root_path = std::path::Path::new(root);
+    for path in rust_files(root_path) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let disp = path
+            .strip_prefix(root_path)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        scan_file(&text, &disp, &mut c);
+        scan_vtable_decls(&text, &mut c);
+    }
+    c
+}
+
+/// Collect `vtable_table! { … va = 0xVA, slots = N … }` declarations (va + slot count).
+fn scan_vtable_decls(text: &str, c: &mut Corpus) {
+    let lines: Vec<&str> = text.lines().collect();
+    for i in 0..lines.len() {
+        if !lines[i].contains("vtable_table!") {
+            continue;
+        }
+        let (mut va, mut slots) = (None, None);
+        for line in lines.iter().skip(i).take(10) {
+            if va.is_none() {
+                if let Some(p) = find_kv(line, "va") {
+                    va = hex_addrs(&line[p..], true).first().copied();
+                }
+            }
+            if slots.is_none() {
+                if let Some(p) = find_kv(line, "slots") {
+                    let n: String = line[p..]
+                        .chars()
+                        .skip_while(|ch| *ch != '=')
+                        .skip_while(|ch| !ch.is_ascii_digit())
+                        .take_while(|ch| ch.is_ascii_digit())
+                        .collect();
+                    slots = n.parse().ok();
+                }
+            }
+            if va.is_some() && slots.is_some() {
+                break;
+            }
+        }
+        if let (Some(v), Some(s)) = (va, slots) {
+            c.declared_vtables.push((v, s));
+        }
+    }
+}
+
+/// Find a `key` followed by `=` (a `key = value` field), returning the byte offset of `key`.
+fn find_kv(line: &str, key: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(key) {
+        let at = from + rel;
+        let after = line[at + key.len()..].trim_start();
+        // word boundary before, and `=` after (allowing whitespace)
+        let before_ok = at == 0 || !line.as_bytes()[at - 1].is_ascii_alphanumeric();
+        if before_ok && after.starts_with('=') {
+            return Some(at);
+        }
+        from = at + key.len();
+    }
+    None
+}
+
+/// Collect hex addresses (`0x...`) appearing on a line.
+fn hex_addrs(line: &str, first_only: bool) -> Vec<u64> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'0' && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_hexdigit() {
+                j += 1;
+            }
+            if j > i + 2 {
+                if let Ok(v) = u64::from_str_radix(&line[i + 2..j], 16) {
+                    out.push(v);
+                    if first_only {
+                        return out;
+                    }
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The function name + whether it is a method (has a `self` receiver), from a
+/// signature line, e.g. `pub unsafe fn free(&self, ptr: u32) {` → ("free", true).
+fn fn_sig(line: &str) -> Option<(String, bool)> {
+    let idx = line.find("fn ")?;
+    let rest = &line[idx + 3..];
+    let paren = rest.find('(')?; // a real signature has '(' on the same line
+    let name: String = rest[..paren]
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    // Method iff the first parameter is a `self` receiver.
+    let first_param = rest[paren + 1..].split([',', ')']).next().unwrap_or("");
+    let is_method = first_param.replace(['&', ' '], "").starts_with("self")
+        || first_param.contains("mut self")
+        || first_param
+            .trim_start_matches(['&', ' '])
+            .starts_with("self");
+    Some((name, is_method))
+}
+
+fn scan_file(text: &str, disp_path: &str, c: &mut Corpus) {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut pending: Vec<u64> = Vec::new();
+    let mut pending_inline = false;
+    let mut pending_cginlined = false;
+    for i in 0..lines.len() {
+        let line = lines[i].trim_start();
+        if line.starts_with("#[cfg(test)]") || line.starts_with("mod tests") {
+            break; // ignore test modules, matching the python lint
+        }
+        // `callgraph-inlined` (binary inlines the callee) and `callgraph-virtual` (binary
+        // dispatches it via vtable) both mean: a direct Rust call is faithful even though the
+        // caller shows no `CALL 0xADDR`. Both add the addr to `inlined_markers`.
+        if line.starts_with("//")
+            && (line.contains("callgraph-inlined") || line.contains("callgraph-virtual"))
+        {
+            pending_cginlined = true;
+        }
+
+        // Harvest the origin address from the PROC-MACRO ATTRIBUTE only — the single
+        // source of truth. A `/// origin:` doc comment is decorative and is IGNORED
+        // (it's for humans / the python lint's display). The `#[..]` guard + the
+        // `origin(` / `callgraph_verify(` token match every spelling: `#[origin(..)]`,
+        // `#[callgraph_verify(..)]`, and the full path `#[callgraph_verify_macro::origin(..)]`.
+        // One fn = one binary fn (fusion banned), so only the first addr is taken.
+        let is_origin_attr =
+            line.contains("#[") && (line.contains("origin(") || line.contains("callgraph_verify("));
+        if is_origin_attr {
+            pending.extend(hex_addrs(line, true)); // addr is the first arg
+        } else if line.starts_with("//")
+            && line
+                .trim_start_matches('/')
+                .trim_start()
+                .starts_with("inline:")
+        {
+            // `/// inline:` / `// inline:` helper tag. Two flavours:
+            //   * with an address ("inline: 0x0070b780 (typed entry over [ni_node_ctor])") — the
+            //     fn IS / is part of that binary fn, so a call to it resolves to that address. It is
+            //     also marked inlinable (added to `inlined_markers`) so a direct call is faithful
+            //     whether the binary `CALL`s the address or inlines it into the caller.
+            //   * address-less ("inline: flag accessor") — fall back to body fold-in (the binary
+            //     inlines the helper's own calls into the caller).
+            // Incidental small hex (vtable slots like 0x84, byte offsets) is excluded by the
+            // 0x40_0000 image-base floor so it isn't mistaken for a function address.
+            let addrs: Vec<u64> = hex_addrs(line, false)
+                .into_iter()
+                .filter(|&a| a >= 0x40_0000)
+                .collect();
+            if addrs.is_empty() {
+                pending_inline = true;
+            } else {
+                pending.extend(addrs);
+                pending_cginlined = true;
+            }
+        }
+
+        // A signature whose `(` is on a later line (rustfmt-wrapped long params)
+        // would otherwise be missed — and a missed signature SILENTLY drops the
+        // pending origin tag, leaving that fn (and calls resolving to it)
+        // unverified. Join a few lines so the wrapped form still parses.
+        let sig = fn_sig(line).or_else(|| {
+            if line.contains("fn ") && !line.starts_with("//") && !line.contains('(') {
+                let end = (i + 4).min(lines.len());
+                fn_sig(&lines[i..end].join(" "))
+            } else {
+                None
+            }
+        });
+        if let Some((name, is_method)) = sig {
+            if !pending.is_empty() {
+                let map = if is_method {
+                    &mut c.methods
+                } else {
+                    &mut c.free_fns
+                };
+                let set = map.entry(name.clone()).or_default();
+                // Dedup addrs WITHIN this one fn first: a fn that carries both the
+                // `#[origin(0xA)]` attribute and the `/// origin: 0xA` doc-comment (the
+                // current dual-tag convention) cites 0xA twice — that is NOT a duplicate,
+                // so it must contribute exactly one owner entry for 0xA.
+                let mut seen_here: HashSet<u64> = HashSet::new();
+                let label = format!("{disp_path}:{} {}", i + 1, name);
+                for &a in &pending {
+                    set.insert(a);
+                    c.addr2name.entry(a).or_insert_with(|| name.clone());
+                    c.corpus.insert(a);
+                    if pending_cginlined {
+                        c.inlined_markers.insert(a);
+                    }
+                    if seen_here.insert(a) {
+                        c.addr_owners.entry(a).or_default().push(label.clone());
+                    }
+                }
+            } else if pending_inline {
+                // Untagged inline helper: capture the calls in its body so callers
+                // can fold them in (the binary inlines this helper's calls).
+                let body = grab_body(&lines, i);
+                if let Ok(ts) = proc_macro2::TokenStream::from_str(&body) {
+                    if c.inline_fns
+                        .insert(name.clone(), crate::body::collect_call_idents(ts))
+                        .is_some()
+                    {
+                        c.inline_ambiguous.insert(name); // defined in >1 place
+                    }
+                }
+            }
+            pending.clear();
+            pending_inline = false;
+            pending_cginlined = false;
+        } else if line.is_empty() {
+            pending.clear(); // a blank line ends a doc/attr block
+            pending_inline = false;
+            pending_cginlined = false;
+        }
+    }
+}
+
+/// Grab a function body `{ … }` (first brace to its match) starting at line `start`.
+/// Brace counting is naïve (doesn't strip strings/comments), which is fine for the
+/// small arithmetic helpers `inline:` is used for.
+fn grab_body(lines: &[&str], start: usize) -> String {
+    let mut s = String::new();
+    let mut depth = 0i32;
+    let mut started = false;
+    for line in &lines[start..] {
+        for ch in line.chars() {
+            if ch == '{' {
+                depth += 1;
+                started = true;
+            }
+            if started {
+                s.push(ch);
+            }
+            if ch == '}' {
+                depth -= 1;
+                if started && depth == 0 {
+                    return s;
+                }
+            }
+        }
+        if started {
+            s.push('\n');
+        }
+        if s.len() > 200_000 {
+            break;
+        }
+    }
+    s
+}
+
+fn rust_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let skip: HashSet<&str> = ["target", "tests", "examples", "benches"]
+        .into_iter()
+        .collect();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if !skip.contains(p.file_name().and_then(|s| s.to_str()).unwrap_or("")) {
+                    stack.push(p);
+                }
+            } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}

@@ -1,0 +1,23 @@
+# callgraph_verify_macro — the pure-byte call-graph check AS A FUNCTION ATTRIBUTE.
+#
+#   #[callgraph_verify(0x004028d0, calls = [0x00401f00, 0x00401f20], fields = [0x4, 0x6])]
+#   pub unsafe fn set(..) { .. }
+#
+# The macro disassembles noivilbo.exe at compile time and emits `compile_error!`
+# on any mismatch, so `cargo build`/`cargo check` FAILS on a hallucination — no
+# separate test or build script. Proc-macros always build for the host, so the
+# iced-x86 dependency never touches the rebuild's i686 game build.
+[package]
+name = "callgraph-verify-macro"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+callgraph-verify = { path = "../callgraph-verify" }
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
