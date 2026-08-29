@@ -157,7 +157,7 @@ fn referenced_addrs_cached(pe: &Pe) -> &'static std::collections::HashSet<u32> {
 }
 
 /// One-time stderr note when verification is silently disabled, so a bad
-/// `NOIVILBO_EXE` path can't masquerade as a clean build forever.
+/// `TARGET_EXE` path can't masquerade as a clean build forever.
 fn warn_once(msg: &str) {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
@@ -304,8 +304,8 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let body_calls = body::collect_call_idents(item.clone().into());
     let item2 = proc_macro2::TokenStream::from(item);
 
-    let Ok(exe) = std::env::var("NOIVILBO_EXE") else {
-        warn_once("NOIVILBO_EXE not set — origin verification is DISABLED for this build");
+    let Ok(exe) = std::env::var("TARGET_EXE") else {
+        warn_once("TARGET_EXE not set — origin verification is DISABLED for this build");
         return quote! { #item2 }.into(); // no binary configured → no-op
     };
     let Some(pe) = load_pe_cached(&exe) else {
@@ -314,13 +314,13 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         // file must not silently disable every check with a green build.
         if std::path::Path::new(&exe).exists() {
             let msg = format!(
-                "NOIVILBO_EXE={exe} exists but failed to load as a PE32 image — \
+                "TARGET_EXE={exe} exists but failed to load as a PE32 image — \
                  origin verification would be silently disabled; fix or unset it"
             );
             let err = syn::Error::new(proc_macro2::Span::call_site(), msg).to_compile_error();
             return quote! { #err #item2 }.into();
         }
-        warn_once("NOIVILBO_EXE points to a missing file — origin verification is DISABLED for this build");
+        warn_once("TARGET_EXE points to a missing file — origin verification is DISABLED for this build");
         return quote! { #item2 }.into();
     };
 
@@ -368,16 +368,16 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // (2) address-only body-vs-binary diff, when the corpus root is configured.
-    if let Ok(root) = std::env::var("NV_REBUILD_ROOT") {
+    if let Ok(root) = std::env::var("REBUILD_ROOT") {
         let map = corpus::corpus_map(&root);
 
-        // Duplicate-origin check (opt-in via NV_DUP_STRICT): a binary fn may be
+        // Duplicate-origin check (opt-in via DUP_STRICT): a binary fn may be
         // implemented by exactly ONE Rust fn. Mirrors `check_origins.py`'s dup-addr
         // gate, but at compile time and pointed straight at the offending attribute.
         // OFF by default because ~118 dups exist today — flipping it on would brick
-        // every `cargo build` until they're burned down. Set NV_DUP_STRICT=1 to hunt
+        // every `cargo build` until they're burned down. Set DUP_STRICT=1 to hunt
         // them crate-by-crate, or permanently once the count reaches 0.
-        if std::env::var_os("NV_DUP_STRICT").is_some() {
+        if std::env::var_os("DUP_STRICT").is_some() {
             if let Some(owners) = map.addr_owners.get(&args.addr) {
                 if owners.len() > 1 {
                     errors.push(format!(
@@ -514,7 +514,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                         args.addr
                     ));
                 }
-                // MISSING is NON-FATAL by default (opt-in strict via NV_STRICT_MISSING),
+                // MISSING is NON-FATAL by default (opt-in strict via STRICT_MISSING),
                 // matching this crate's documented contract. A MISSING is often NOT a
                 // defect: a call made via method syntax `x.foo()` isn't resolved yet, the
                 // binary call may be a faithful inline, or the rebuild legitimately routes
@@ -523,7 +523,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // it fatal would block universal `#[origin]` attribution. HALLUCINATED stays
                 // always-fatal — that is the actual invented-code guard. The pure-byte
                 // `callgraph_verify` tool reports the full MISSING worklist.
-                if std::env::var_os("NV_STRICT_MISSING").is_some() {
+                if std::env::var_os("STRICT_MISSING").is_some() {
                     for a in &d.missing {
                         errors.push(format!(
                             "MISSING: binary calls {} ({a:#010x}) — body doesn't",
@@ -535,18 +535,18 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             Err(e) => errors.push(format!("analyze {:#010x}: {e}", args.addr)),
         }
 
-        // (2b) Argument-shape diff (opt-in via NV_STRICT_ARGS): per call site, compare the
+        // (2b) Argument-shape diff (opt-in via STRICT_ARGS): per call site, compare the
         // CONCRETE argument kinds the body passes (immediate / field-load / global) positionally
         // against the binary's recovered call-site args. Catches wrong constants, wrong field
         // offsets, wrong globals, and reordered args — what the call-edge check can't see.
         // Conservative: only unambiguous (single) call sites, only positions concrete on BOTH
         // sides (a register-staged binary arg reads as `Other` and is skipped). OFF by default.
-        if std::env::var_os("NV_STRICT_ARGS").is_some() {
+        if std::env::var_os("STRICT_ARGS").is_some() {
             arg_shape_check(&pe, args.addr, &map, item2.clone(), &mut errors);
         }
     }
 
-    // (3) Operand-fact diff (opt-in via NV_STRICT_OPERANDS). Every in-image ADDRESS
+    // (3) Operand-fact diff (opt-in via STRICT_OPERANDS). Every in-image ADDRESS
     // literal the body bakes in — a global read `[0x00bXXXXX]`, an RTTI typedesc / vtable
     // VA / fn pointer pushed as an immediate, or an IAT slot — must be referenced by the
     // binary at this origin. A body address the binary never touches is invented. This is
@@ -555,11 +555,11 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     //
     // OFF by default: the rebuild legitimately reads some globals DIRECTLY that the
     // original reaches through an accessor CALL (the same reason MISSING is non-fatal),
-    // so flipping it on tree-wide would false-positive. Set NV_STRICT_OPERANDS=1 to hunt
+    // so flipping it on tree-wide would false-positive. Set STRICT_OPERANDS=1 to hunt
     // invented addresses crate-by-crate. Field OFFSETS are intentionally NOT auto-checked
     // here: small hex (`0x10`, `0xff`) is indistinguishable from counts / masks / enum
     // values, so an offset check belongs in an explicit `fields = [..]` declaration.
-    if std::env::var_os("NV_STRICT_OPERANDS").is_some() {
+    if std::env::var_os("STRICT_OPERANDS").is_some() {
         match analyze(&pe, args.addr) {
             Ok(cg) => {
                 let mut referenced: std::collections::BTreeSet<u64> =
@@ -591,12 +591,12 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // (4) CFG-fingerprint diff (opt-in via NV_STRICT_CFG): catch a port that omits a loop the
+    // (4) CFG-fingerprint diff (opt-in via STRICT_CFG): catch a port that omits a loop the
     // binary has, or a jump-table switch, or is straight-line where the binary branches heavily.
     // COARSE + tolerant — optimized CFGs do not map 1:1 to source, so only gross structural
     // divergences are flagged. Caveats: loop unrolling, switch lowered to an if-chain, and inlined
     // helpers can still produce noise — hence opt-in and diagnostic, not a clean always-on gate.
-    if std::env::var_os("NV_STRICT_CFG").is_some() {
+    if std::env::var_os("STRICT_CFG").is_some() {
         match cfg_fingerprint(&pe, args.addr) {
             Ok(fp) => {
                 let r = body::cfg_keyword_counts(item2.clone());
@@ -738,8 +738,8 @@ pub fn vtable_table(input: TokenStream) -> TokenStream {
     // Compile-time verification (no-op if the binary / corpus aren't configured).
     let mut errors: Vec<String> = Vec::new();
     if let (Ok(exe), Ok(root)) = (
-        std::env::var("NOIVILBO_EXE"),
-        std::env::var("NV_REBUILD_ROOT"),
+        std::env::var("TARGET_EXE"),
+        std::env::var("REBUILD_ROOT"),
     ) {
         if let Some(pe) = load_pe_cached(&exe) {
             let map = corpus::corpus_map(&root);
