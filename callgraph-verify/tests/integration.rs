@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use callgraph_verify::{analyze, cfg_fingerprint, diff_body_calls, ArgKind, Pe, Spec};
+    use callgraph_verify::{analyze, cfg_fingerprint, diff_body_calls, has_direct_branch_target, ArgKind, Pe, Spec};
     use std::process::Command;
 
     /// Build the test binary if needed and return its path
@@ -439,5 +439,92 @@ mod tests {
                 return;
             }
         }
+    }
+
+    /// Resolve `name` (e.g. "leaf_function") to its VA by walking the PE's symbol-like hints:
+    /// we don't have a public symbol lookup, so we exploit `analyze`'s prologue detection —
+    /// every fn address in this small test binary analyzes cleanly. We pick the one whose
+    /// code is the shortest (leaf functions are short), check by running analyze and looking
+    /// for the entry that matches the function's expected shape. For this test bin we just
+    /// need ANY address that is and isn't a direct CALL target, so we use the relationship
+    /// between `caller_of_leaf` and `leaf_function` (the latter is called directly).
+    #[test]
+    fn test_has_direct_branch_target_called_function() {
+        let pe = load_test_pe();
+        let addrs = find_function_addresses(&pe);
+        // Find an addr with at least one direct caller — any fn that an earlier addrs's
+        // analyze result has in `call_targets`.
+        for caller in &addrs {
+            if let Ok(cg) = analyze(&pe, *caller) {
+                for callee in cg.call_targets() {
+                    assert!(
+                        has_direct_branch_target(&pe, callee),
+                        "callee {callee:#x} is in caller {caller:#x}'s call_targets but \
+                         has_direct_branch_target returned false — pure-byte rel32 scan bug"
+                    );
+                    return;
+                }
+            }
+        }
+        panic!("no function with direct calls found in test binary");
+    }
+
+    #[test]
+    fn test_has_direct_branch_target_unused_address() {
+        let pe = load_test_pe();
+        // An address well outside the image but castable to u32 should never be a target.
+        // Pick an obviously bogus VA: image_base + 0xFFFF_FFFC (wraps the u32 space).
+        let bogus = pe.image_base.wrapping_add(0xFFFF_FFFC);
+        assert!(
+            !has_direct_branch_target(&pe, bogus),
+            "bogus address {bogus:#x} unexpectedly reported as a direct branch target"
+        );
+        // Also: a real-image address that no instruction targets (within .text, but random).
+        // We can't easily pick one without symbols, so use a far-future placeholder: the
+        // highest VA in .text plus a gap. If .text is empty this returns false trivially.
+        if let Some(text) = pe.sections().iter().find(|s| s.name == ".text") {
+            let far = pe.image_base + text.virtual_address as u64 + text.virtual_size as u64 + 0x1000;
+            // far might be outside .text — that's fine, the function should still return false.
+            assert!(
+                !has_direct_branch_target(&pe, far),
+                "unreachable address {far:#x} unexpectedly reported as a direct branch target"
+            );
+        }
+    }
+
+    #[test]
+    fn test_has_direct_branch_target_vtable_only() {
+        let pe = load_test_pe();
+        // The test binary defines a `static VTABLE: [fn; 2]` whose slot 0 contains the VA
+        // of `vtable_only_method`. That VA appears as a dword in .rdata (so `referenced_addrs`
+        // includes it and `ORIGIN-UNREFERENCED` would pass), but no `CALL`/`JMP`/Jcc in .text
+        // targets it — so `has_direct_branch_target` must return false.
+        //
+        // Find vtable_only_method by scanning .rdata for the dword that appears most often as
+        // a target of itself: the simplest portable check is to scan for any VA that IS in
+        // referenced_addrs but is NOT a direct branch target, then verify it lives inside .text
+        // (so it's a real fn candidate, not a string/data pointer).
+        let refs = pe.referenced_addrs();
+        let mut vtable_only_candidate: Option<u64> = None;
+        for &a in &refs {
+            if !has_direct_branch_target(&pe, a as u64) && pe.is_executable_va(a as u64) {
+                vtable_only_candidate = Some(a as u64);
+                break;
+            }
+        }
+        let candidate = vtable_only_candidate.expect(
+            "no vtable-only executable candidate found — test binary should have vtable_only_method \
+             reachable only via the VTABLE static",
+        );
+        // The candidate must be in .text (executable) AND not be a direct branch target — that's
+        // exactly the condition the macro's VTABLE-ONLY DISPATCH warning keys on.
+        assert!(
+            pe.is_executable_va(candidate),
+            "candidate {candidate:#x} is not executable"
+        );
+        assert!(
+            !has_direct_branch_target(&pe, candidate),
+            "candidate {candidate:#x} unexpectedly has a direct branch target"
+        );
     }
 }

@@ -21,19 +21,24 @@
 //!   * `TARGET_EXE`     — path to the binary (absent → macro is a no-op)
 //!   * `REBUILD_ROOT`   — rebuild source root for the corpus scan (absent →
 //!     the body-diff is skipped; explicit `calls=`/`fields=` checks still run)
-//!   * `STRICT_OPERANDS` — opt-in: also diff the in-image ADDRESS literals the
-//!     body bakes in (globals, RTTI typedescs, vtable VAs, fn pointers)
+//!   * `STRICT_OPERANDS` — ON by default: diff the in-image ADDRESS literals
+//!     the body bakes in (globals, RTTI typedescs, vtable VAs, fn pointers)
 //!     against the binary's referenced-address set. A body address the
-//!     binary never touches → `HALLUCINATED-ADDR`. OFF by default (the
-//!     rebuild reads some globals directly that the original reaches through
-//!     an accessor, so it would false-positive tree-wide).
-//!   * `STRICT_ARGS`    — opt-in: per call site, diff the CONCRETE argument
-//!     kinds the body passes (immediate / field-load / global) positionally
-//!     against the binary's recovered call-site args → `ARG-SHAPE`. Catches
-//!     wrong constants / field offsets / globals / reordering. OFF by
-//!     default — a DIAGNOSTIC, not a clean gate: ICF-folded stubs (one
-//!     address, heterogeneous callers) and convention-ambiguous free calls
-//!     produce false positives to triage.
+//!     binary never touches → `HALLUCINATED-ADDR`. Set to `0` to disable
+//!     (the rebuild reads some globals directly that the original reaches
+//!     through an accessor, so it can false-positive tree-wide).
+//!   * `STRICT_ARGS`    — ON by default: per call site, diff the CONCRETE
+//!     argument kinds the body passes (immediate / field-load / global)
+//!     positionally against the binary's recovered call-site args → `ARG-SHAPE`.
+//!     Catches wrong constants / field offsets / globals / reordering.
+//!     Set to `0` to disable — false positives to triage: ICF-folded stubs
+//!     (one address, heterogeneous callers) and convention-ambiguous free calls.
+//!   * `STRICT_MISSING` — ON by default: make `MISSING` (binary calls something
+//!     the body doesn't) fatal. Often a faithful inline, but for catching AI
+//!     digression this is the stricter gate. Set to `0` to make non-fatal.
+//!   * `DUP_STRICT`     — ON by default: a binary fn may be implemented by
+//!     exactly ONE Rust fn. Multiple `#[origin]` claims on the same address
+//!     are fatal at compile time. Set to `0` to disable.
 //!   * `STRICT_CFG`     — opt-in: coarse control-flow fingerprint diff →
 //!     `CFG`. Flags a body that omits a loop the binary has, omits a
 //!     many-case jump-table switch, or is straight-line where the binary
@@ -299,6 +304,17 @@ fn arg_shape_check(
     }
 }
 
+/// Read a strictness flag from the environment. Returns `default` if unset,
+/// returns `false` if set to "0" / "false" / "no" / "off" (case-insensitive),
+/// otherwise `true`. Lets strict gates be flipped OFF explicitly without
+/// requiring the variable to be set for the strict path.
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name).ok().as_deref() {
+        None => default,
+        Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off" | ""),
+    }
+}
+
 fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as Args);
     let body_calls = body::collect_call_idents(item.clone().into());
@@ -371,13 +387,11 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     if let Ok(root) = std::env::var("REBUILD_ROOT") {
         let map = corpus::corpus_map(&root);
 
-        // Duplicate-origin check (opt-in via DUP_STRICT): a binary fn may be
+        // Duplicate-origin check (ON by default via DUP_STRICT): a binary fn may be
         // implemented by exactly ONE Rust fn. Mirrors `check_origins.py`'s dup-addr
         // gate, but at compile time and pointed straight at the offending attribute.
-        // OFF by default because ~118 dups exist today — flipping it on would brick
-        // every `cargo build` until they're burned down. Set DUP_STRICT=1 to hunt
-        // them crate-by-crate, or permanently once the count reaches 0.
-        if std::env::var_os("DUP_STRICT").is_some() {
+        // Set DUP_STRICT=0 to allow dups (use during bulk-port before burndown).
+        if env_flag("DUP_STRICT", true) {
             if let Some(owners) = map.addr_owners.get(&args.addr) {
                 if owners.len() > 1 {
                     errors.push(format!(
@@ -478,6 +492,25 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         rust_idents.extend(resolve(&method, &map.methods));
         let vtm = vtable_method_map(&pe, &map.declared_vtables);
         let vtable_methods: std::collections::BTreeSet<u64> = vtm.keys().copied().collect();
+        // VTABLE-ONLY DISPATCH (warning, not fatal): the origin IS referenced (passed the
+        // ORIGIN-UNREFERENCED gate above), and it IS a declared vtable method, but NO code
+        // in `.text` has a CALL/JMP/Jcc that targets it. So every caller reaches it via the
+        // vtable slot. Useful intel — confirms the routing model — and catches a tag placed on
+        // the wrong slot (the addr is in a vtable but not the slot you think). Fires only
+        // for addresses the user tagged as `#[origin]`; not every `#[origin]` will hit this.
+        if vtm.contains_key(&args.addr)
+            && !callgraph_verify::has_direct_branch_target(&pe, args.addr)
+        {
+            if let Some(&(vt_va, slot)) = vtm.get(&args.addr) {
+                let _ = (vt_va, slot);
+            }
+            warn_once(&format!(
+                "VTABLE-ONLY DISPATCH: {:#010x} is reached only via vtable slot (no CALL/JMP/Jcc in \
+                 .text targets it) — fine for an interface method, but verify the slot index matches \
+                 your `vtable_table!` declaration",
+                args.addr
+            ));
+        }
         match diff_body_calls(
             &pe,
             &[args.addr],
@@ -514,16 +547,17 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                         args.addr
                     ));
                 }
-                // MISSING is NON-FATAL by default (opt-in strict via STRICT_MISSING),
-                // matching this crate's documented contract. A MISSING is often NOT a
-                // defect: a call made via method syntax `x.foo()` isn't resolved yet, the
-                // binary call may be a faithful inline, or the rebuild legitimately routes
-                // it elsewhere (e.g. allocation through the single Rust heap instead of a
-                // literal `form_heap_allocate` CALL, CRT/intrinsic ops like `fmodf`). Making
-                // it fatal would block universal `#[origin]` attribution. HALLUCINATED stays
-                // always-fatal — that is the actual invented-code guard. The pure-byte
-                // `callgraph_verify` tool reports the full MISSING worklist.
-                if std::env::var_os("STRICT_MISSING").is_some() {
+                // MISSING is FATAL by default (set STRICT_MISSING=0 to demote). A MISSING
+                // is often NOT a defect: a call made via method syntax `x.foo()` isn't
+                // resolved yet, the binary call may be a faithful inline, or the rebuild
+                // legitimately routes it elsewhere (e.g. allocation through the single
+                // Rust heap instead of a literal `form_heap_allocate` CALL, CRT/intrinsic
+                // ops like `fmodf`). But for catching AI digression the strict default is
+                // right: an AI regenerating a body and dropping a real call would slip
+                // through as a silent MISSING otherwise. HALLUCINATED is always fatal —
+                // that is the actual invented-code guard. The pure-byte `callgraph_verify`
+                // tool reports the full MISSING worklist.
+                if env_flag("STRICT_MISSING", true) {
                     for a in &d.missing {
                         errors.push(format!(
                             "MISSING: binary calls {} ({a:#010x}) — body doesn't",
@@ -535,31 +569,36 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             Err(e) => errors.push(format!("analyze {:#010x}: {e}", args.addr)),
         }
 
-        // (2b) Argument-shape diff (opt-in via STRICT_ARGS): per call site, compare the
-        // CONCRETE argument kinds the body passes (immediate / field-load / global) positionally
-        // against the binary's recovered call-site args. Catches wrong constants, wrong field
-        // offsets, wrong globals, and reordered args — what the call-edge check can't see.
-        // Conservative: only unambiguous (single) call sites, only positions concrete on BOTH
-        // sides (a register-staged binary arg reads as `Other` and is skipped). OFF by default.
-        if std::env::var_os("STRICT_ARGS").is_some() {
+        // (2b) Argument-shape diff (ON by default via STRICT_ARGS): per call site,
+        // compare the CONCRETE argument kinds the body passes (immediate / field-load /
+        // global) positionally against the binary's recovered call-site args. Catches
+        // wrong constants, wrong field offsets, wrong globals, and reordered args —
+        // what the call-edge check can't see. Conservative: only unambiguous (single)
+        // call sites, only positions concrete on BOTH sides (a register-staged binary
+        // arg reads as `Other` and is skipped). Set STRICT_ARGS=0 to disable — known
+        // false positives: ICF-folded stubs (one address, heterogeneous callers) and
+        // convention-ambiguous free calls.
+        if env_flag("STRICT_ARGS", true) {
             arg_shape_check(&pe, args.addr, &map, item2.clone(), &mut errors);
         }
     }
 
-    // (3) Operand-fact diff (opt-in via STRICT_OPERANDS). Every in-image ADDRESS
-    // literal the body bakes in — a global read `[0x00bXXXXX]`, an RTTI typedesc / vtable
-    // VA / fn pointer pushed as an immediate, or an IAT slot — must be referenced by the
-    // binary at this origin. A body address the binary never touches is invented. This is
-    // the operand analogue of HALLUCINATED: it catches a wrong global/typedesc/vtable VA,
-    // which the call-graph check (call edges only) can never see.
+    // (3) Operand-fact diff (ON by default via STRICT_OPERANDS). Every in-image
+    // ADDRESS literal the body bakes in — a global read `[0x00bXXXXX]`, an RTTI
+    // typedesc / vtable VA / fn pointer pushed as an immediate, or an IAT slot —
+    // must be referenced by the binary at this origin. A body address the binary
+    // never touches is invented. This is the operand analogue of HALLUCINATED: it
+    // catches a wrong global/typedesc/vtable VA, which the call-graph check (call
+    // edges only) can never see.
     //
-    // OFF by default: the rebuild legitimately reads some globals DIRECTLY that the
-    // original reaches through an accessor CALL (the same reason MISSING is non-fatal),
-    // so flipping it on tree-wide would false-positive. Set STRICT_OPERANDS=1 to hunt
-    // invented addresses crate-by-crate. Field OFFSETS are intentionally NOT auto-checked
-    // here: small hex (`0x10`, `0xff`) is indistinguishable from counts / masks / enum
-    // values, so an offset check belongs in an explicit `fields = [..]` declaration.
-    if std::env::var_os("STRICT_OPERANDS").is_some() {
+    // The rebuild legitimately reads some globals DIRECTLY that the original
+    // reaches through an accessor CALL (the same reason MISSING is non-fatal
+    // when STRICT_MISSING=0), so this can false-positive tree-wide. Set
+    // STRICT_OPERANDS=0 to disable. Field OFFSETS are intentionally NOT
+    // auto-checked here: small hex (`0x10`, `0xff`) is indistinguishable from
+    // counts / masks / enum values, so an offset check belongs in an explicit
+    // `fields = [..]` declaration.
+    if env_flag("STRICT_OPERANDS", true) {
         match analyze(&pe, args.addr) {
             Ok(cg) => {
                 let mut referenced: std::collections::BTreeSet<u64> =

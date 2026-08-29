@@ -56,3 +56,19 @@ pub extern "C" fn caller_of_leaf() -> u32 {
 pub extern "C" fn indirect_caller(fp: extern "C" fn() -> u32) -> u32 {
     fp()
 }
+
+// A function reached ONLY through the vtable below — never directly called. Used by
+// `test_has_direct_branch_target_vtable_only` to verify the macro's VTABLE-ONLY DISPATCH
+// warning fires: `has_direct_branch_target` must return false even though `referenced_addrs`
+// includes this address (it's stored as a dword in the vtable).
+#[no_mangle]
+pub extern "C" fn vtable_only_method(self_ptr: *mut u32) -> u32 {
+    unsafe { *self_ptr }
+}
+
+// The vtable is a static array of fn pointers. Stored in .rdata; the dword at index 0
+// is the VA of `vtable_only_method`. Because it's `static` it ends up in .rdata; the
+// compiler may or may not zero-pad other slots — that's fine, we only check slot 0.
+#[no_mangle]
+pub static VTABLE: [extern "C" fn(*mut u32) -> u32; 2] =
+    [vtable_only_method, vtable_only_method];

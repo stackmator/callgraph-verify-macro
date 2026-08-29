@@ -36,6 +36,49 @@ pub struct Spec {
     iat: Vec<u64>,
 }
 
+/// Does ANY instruction in `.text` statically target `target` via a relative branch
+/// (CALL/JMP/Jcc rel32)? Pure-byte scan over `.text`, no `analyze` cost per fn — answers
+/// "is this origin reached as a direct call/tail/jump by code, or only via data (vtable
+/// slot, switch table, fn pointer)?" Used by the macro to warn on vtable-only dispatch.
+pub fn has_direct_branch_target(pe: &Pe, target: u64) -> bool {
+    let Some(text) = pe.sections().iter().find(|s| s.name == ".text") else {
+        return false;
+    };
+    let text_va = pe.image_base + text.virtual_address as u64;
+    let blob = match pe.read(text_va, text.virtual_size as usize) {
+        Some(b) => b,
+        None => return false,
+    };
+    let target = target as u32;
+    let mut i = 0;
+    while i + 4 < blob.len() {
+        let (rel_at, _take) = match blob[i] {
+            0xE8 | 0xE9 => (i + 1, 4), // CALL rel32 / JMP rel32
+            0x0F if i + 6 <= blob.len() && (0x80..=0x8F).contains(&blob[i + 1]) => (i + 2, 4),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if rel_at + 4 > blob.len() {
+            i += 1;
+            continue;
+        }
+        let rel = i32::from_le_bytes([
+            blob[rel_at],
+            blob[rel_at + 1],
+            blob[rel_at + 2],
+            blob[rel_at + 3],
+        ]) as i64;
+        let t = (text_va + (rel_at as u64 + 4)).wrapping_add(rel as u64) as u32;
+        if t == target {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 impl Spec {
     pub fn new(addr: u64) -> Spec {
         Spec {
