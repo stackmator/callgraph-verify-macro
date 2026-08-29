@@ -1,4 +1,4 @@
-//! `#[callgraph_verify(0xADDR)]` — keep a rebuild function true to `noivilbo.exe`
+//! `#[callgraph_verify(0xADDR)]` — keep a rebuild function true to the target binary
 //! AT COMPILE TIME. On every build the macro:
 //!
 //!   1. parses ITS OWN function body for the functions it calls,
@@ -18,29 +18,27 @@
 //!   `#[callgraph_verify(0x0070b780, vtables = [0x00a7e38c], fields = [0xbc])]`
 //!
 //! ## Environment (set in `.cargo/config.toml` `[env]`)
-//!   * `NOIVILBO_EXE`     — path to the binary (absent → macro is a no-op)
-//!   * `NV_REBUILD_ROOT`  — rebuild source root for the corpus scan (absent →
-//!                          the body-diff is skipped; explicit `calls=`/`fields=`
-//!                          checks still run)
-//!   * `NV_STRICT_OPERANDS` — opt-in: also diff the in-image ADDRESS literals the
-//!                          body bakes in (globals, RTTI typedescs, vtable VAs, fn
-//!                          pointers) against the binary's referenced-address set.
-//!                          A body address the binary never touches → `HALLUCINATED-ADDR`.
-//!                          OFF by default (the rebuild reads some globals directly
-//!                          that the original reaches through an accessor, so it would
-//!                          false-positive tree-wide).
-//!   * `NV_STRICT_ARGS`    — opt-in: per call site, diff the CONCRETE argument kinds the
-//!                          body passes (immediate / field-load / global) positionally
-//!                          against the binary's recovered call-site args → `ARG-SHAPE`.
-//!                          Catches wrong constants / field offsets / globals / reordering.
-//!                          OFF by default — a DIAGNOSTIC, not a clean gate: ICF-folded
-//!                          stubs (one address, heterogeneous callers) and convention-
-//!                          ambiguous free calls produce false positives to triage.
-//!   * `NV_STRICT_CFG`     — opt-in: coarse control-flow fingerprint diff → `CFG`. Flags a
-//!                          body that omits a loop the binary has, omits a many-case
-//!                          jump-table switch, or is straight-line where the binary branches
-//!                          heavily. Tolerant + DIAGNOSTIC (unrolling / switch-as-if-chain /
-//!                          inlining cause noise); OFF by default.
+//!   * `TARGET_EXE`     — path to the binary (absent → macro is a no-op)
+//!   * `REBUILD_ROOT`   — rebuild source root for the corpus scan (absent →
+//!     the body-diff is skipped; explicit `calls=`/`fields=` checks still run)
+//!   * `STRICT_OPERANDS` — opt-in: also diff the in-image ADDRESS literals the
+//!     body bakes in (globals, RTTI typedescs, vtable VAs, fn pointers)
+//!     against the binary's referenced-address set. A body address the
+//!     binary never touches → `HALLUCINATED-ADDR`. OFF by default (the
+//!     rebuild reads some globals directly that the original reaches through
+//!     an accessor, so it would false-positive tree-wide).
+//!   * `STRICT_ARGS`    — opt-in: per call site, diff the CONCRETE argument
+//!     kinds the body passes (immediate / field-load / global) positionally
+//!     against the binary's recovered call-site args → `ARG-SHAPE`. Catches
+//!     wrong constants / field offsets / globals / reordering. OFF by
+//!     default — a DIAGNOSTIC, not a clean gate: ICF-folded stubs (one
+//!     address, heterogeneous callers) and convention-ambiguous free calls
+//!     produce false positives to triage.
+//!   * `STRICT_CFG`     — opt-in: coarse control-flow fingerprint diff →
+//!     `CFG`. Flags a body that omits a loop the binary has, omits a
+//!     many-case jump-table switch, or is straight-line where the binary
+//!     branches heavily. Tolerant + DIAGNOSTIC (unrolling / switch-as-if-chain
+//!     / inlining cause noise); OFF by default.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -711,7 +709,7 @@ impl Parse for VtableTable {
 }
 
 /// See the block comment above. Declarative real-Rust-vtable with compile-time
-/// per-slot verification against the engine vtable in `noivilbo.exe`.
+/// per-slot verification against the engine vtable in the target binary.
 #[proc_macro]
 pub fn vtable_table(input: TokenStream) -> TokenStream {
     let t = parse_macro_input!(input as VtableTable);

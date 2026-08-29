@@ -4,6 +4,9 @@ members = [
     "callgraph-verify-macro",
     "callgraph-verify",
 ]
+exclude = [
+    "callgraph-verify/test-bin",
+]
 
 [workspace.package]
 version = "0.1.0"

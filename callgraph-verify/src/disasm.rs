@@ -12,10 +12,10 @@
 //!   * `vcall_slots`   — displacements of `CALL/JMP [reg+0xNN]` (vtable slots)
 //!   * `iat_calls`     — absolute targets of `CALL [0x00a28xxx]` (IAT imports)
 //!   * `field_offsets` — displacements of `[reg+0xNN]` accesses (struct fields),
-//!                       excluding ESP/EBP (those are stack locals/args)
+//!     excluding ESP/EBP (those are stack locals/args)
 //!   * `globals`       — absolute data addresses referenced as `[0x00bXXXXX]`
 //!   * `imm_addrs`     — in-image immediates (`MOV [esi],0x00a7e38c` vtable VAs,
-//!                       function pointers, string-literal addresses)
+//!     function pointers, string-literal addresses)
 //!
 //! This is *structural* ground truth: no decompiler in the loop.
 
@@ -283,10 +283,9 @@ fn reads_reg(instr: &Instruction, reg: Register) -> bool {
                     return true;
                 }
             }
-            OpKind::Register if i > 0
-                && instr.op_register(i) == reg => {
-                    return true;
-                }
+            OpKind::Register if i > 0 && instr.op_register(i) == reg => {
+                return true;
+            }
             _ => {}
         }
     }

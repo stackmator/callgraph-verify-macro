@@ -1,12 +1,12 @@
-# callgraph_verify — anti-hallucination call-graph gate, sourced PURELY from the
-# real binary's bytes (noivilbo.exe). Unlike tools/analysis/verify_callgraph.py,
+# callgraph-verify — anti-hallucination call-graph gate, sourced PURELY from the
+# real binary's bytes. Unlike tools/analysis/verify_callgraph.py,
 # this never reads Ghidra .asm exports or decompiled .c: it parses the PE and
 # disassembles the actual machine code with iced-x86, so it cannot inherit a
 # decompiler's mistakes (truncated/split functions, misnamed targets).
 #
 # Lives in the rebuild workspace as a proc-macro build dependency — Cargo always
 # compiles proc-macro crates and their dependencies for the HOST (x86_64), so
-# iced-x86 never enters the i686 game binary.
+# iced-x86 never enters the i686 target binary.
 [package]
 name = "callgraph-verify"
 version.workspace = true

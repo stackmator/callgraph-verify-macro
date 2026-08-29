@@ -1,7 +1,7 @@
 //! Pure-byte call-graph + fact verifier for the Rust rebuild.
 //!
 //! When a rebuild function is tagged `origin: 0xADDR`, it claims to be a 1:1
-//! port of the function at that VA in `noivilbo.exe`. This crate establishes
+//! port of the function at that VA in the target binary. This crate establishes
 //! ground truth by disassembling the actual bytes (no Ghidra, no decompiled C)
 //! and lets a port declare what it should structurally match:
 //!
@@ -319,7 +319,7 @@ pub fn diff_body_calls(
 ///
 /// ```ignore
 /// verify_callgraph! {
-///     exe: "../../noivilbo.exe";
+///     exe: "../../target.exe";
 ///
 ///     // 1) shorthand — direct calls only
 ///     fn set_name @ 0x006ff420 => exact [0x00401f00, 0x00401f20, 0x00984b6a];

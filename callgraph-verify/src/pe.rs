@@ -105,6 +105,11 @@ impl Pe {
         Some(&self.data[file_off..file_off + take])
     }
 
+    /// Iterate over all sections in the PE
+    pub fn sections(&self) -> &[Section] {
+        &self.sections
+    }
+
     pub fn is_executable_va(&self, va: u64) -> bool {
         // .text is the only code section here; treat "has a section + readable
         // bytes" as the in-image test the disassembler needs.

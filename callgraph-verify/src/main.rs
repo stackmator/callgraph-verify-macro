@@ -1,4 +1,4 @@
-//! CLI: dump the pure-byte call graph of one function in noivilbo.exe.
+//! CLI: dump the pure-byte call graph of one function in the target binary.
 //!
 //!   callgraph_verify <exe> <addr> [--declared 0xA,0xB,...] [--exact]
 //!
