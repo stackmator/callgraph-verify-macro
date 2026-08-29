@@ -204,6 +204,18 @@ fn vtable_method_map(pe: &Pe, declared: &[(u64, usize)]) -> &'static HashMap<u64
     })
 }
 
+/// Format the VTABLE-ONLY DISPATCH warning. The looked-up `(vt_va, slot)` are included so
+/// the user can tell *which* vtable and slot the origin addr was found at — passing these
+/// through is the whole point of the warning.
+fn vtable_only_dispatch_msg(addr: u64, vt_va: u64, slot: usize) -> String {
+    format!(
+        "VTABLE-ONLY DISPATCH: {addr:#010x} is reached only via vtable {vt_va:#010x} slot {slot} \
+         (byte offset 0x{:x}; no CALL/JMP/Jcc in .text targets it) — fine for an interface \
+         method, but verify the slot index matches your `vtable_table!` declaration",
+        slot * 4,
+    )
+}
+
 /// Compare one Rust argument against one binary argument. `Some(true/false)` only when BOTH are
 /// concrete (immediate / field / global); `None` when either side is unknown (skip — e.g. the
 /// binary staged the value through a register, which reads as `Other`). Differing concrete kinds
@@ -501,15 +513,8 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         if vtm.contains_key(&args.addr)
             && !callgraph_verify::has_direct_branch_target(&pe, args.addr)
         {
-            if let Some(&(vt_va, slot)) = vtm.get(&args.addr) {
-                let _ = (vt_va, slot);
-            }
-            warn_once(&format!(
-                "VTABLE-ONLY DISPATCH: {:#010x} is reached only via vtable slot (no CALL/JMP/Jcc in \
-                 .text targets it) — fine for an interface method, but verify the slot index matches \
-                 your `vtable_table!` declaration",
-                args.addr
-            ));
+            let (vt_va, slot) = vtm.get(&args.addr).copied().unwrap_or((0, 0));
+            warn_once(&vtable_only_dispatch_msg(args.addr, vt_va, slot));
         }
         match diff_body_calls(
             &pe,
@@ -837,5 +842,44 @@ pub fn vtable_table(input: TokenStream) -> TokenStream {
         );
         let err = syn::Error::new(proc_macro2::Span::call_site(), msg).to_compile_error();
         quote! { #err #generated }.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vtable_only_dispatch_msg;
+
+    #[test]
+    fn vtable_only_dispatch_msg_includes_addr_vt_and_slot() {
+        // Regression: the warning previously discarded the looked-up (vt_va, slot) and
+        // emitted a generic message. The slot index is the diagnostic — without it the
+        // user has no way to verify which vtable slot the macro placed the origin in.
+        let msg = vtable_only_dispatch_msg(0x004028d0, 0x00A88EA4, 21);
+        assert!(
+            msg.contains("0x004028d0"),
+            "origin addr missing from message: {msg}"
+        );
+        assert!(
+            msg.contains("0x00a88ea4"),
+            "vtable VA missing from message: {msg}"
+        );
+        assert!(
+            msg.contains("slot 21"),
+            "slot index missing from message: {msg}"
+        );
+        // byte offset is slot*4 — verify both the value and the formatting
+        assert!(
+            msg.contains("byte offset 0x54"),
+            "byte offset (slot*4 = 0x54) missing from message: {msg}"
+        );
+    }
+
+    #[test]
+    fn vtable_only_dispatch_msg_with_zero_slot() {
+        let msg = vtable_only_dispatch_msg(0x00000010, 0x00000020, 0);
+        assert!(msg.contains("0x00000010"), "{msg}");
+        assert!(msg.contains("0x00000020"), "{msg}");
+        assert!(msg.contains("slot 0"), "{msg}");
+        assert!(msg.contains("byte offset 0x0"), "{msg}");
     }
 }

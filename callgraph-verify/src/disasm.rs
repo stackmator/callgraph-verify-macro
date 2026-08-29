@@ -121,6 +121,7 @@ fn scan_operands(pe: &Pe, instr: &Instruction, cg: &mut CallGraph) {
                 } else if base != Register::None
                     && base != Register::ESP
                     && base != Register::EBP
+                    && index == Register::None
                     && disp > 0
                     && disp < MAX_FIELD_OFFSET
                     // LEA computes an address (pointer math / &field), it doesn't
@@ -325,6 +326,15 @@ pub fn reg_params(pe: &Pe, addr: u64) -> (bool, bool) {
                 _ => {}
             }
         }
+        // Per the x86 cdecl/fastcall/thiscall conventions, ECX and EDX are caller-saved:
+        // any CALL in the entry block clobbers them, so a later READ of ECX/EDX is not
+        // evidence that the callee takes that register as a parameter. Mark them written
+        // across the CALL — without this, a stray `MOV EAX, [ECX]` after a prior CALL
+        // would falsely set `ecx_param = true` and pollute ARG-SHAPE diffs.
+        if matches!(instr.flow_control(), FlowControl::Call) {
+            ecx_written = true;
+            edx_written = true;
+        }
         if !matches!(instr.flow_control(), FlowControl::Next | FlowControl::Call) {
             break;
         }
@@ -347,6 +357,20 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
 
     let mut work = vec![entry];
     let mut seen: BTreeSet<u64> = BTreeSet::new();
+    // Per-branch-target seed: when we encounter `Jcc target` / `JMP target` /
+    // indirect-jump case, the args set up before the branch (PUSHes, MOV-to-ECX,
+    // etc.) also apply to the target block's first CALL — the predecessor and
+    // target share the same register/stack state at the branch instruction. The
+    // outer loop resets `block_buf` when it pops a new `start`, so without this
+    // seed map the target's calls would be processed with an empty `block_buf`
+    // and `recover_call_site` would undercount arguments. (BUG #8 fix.)
+    //
+    // Multiple predecessors may push the same target — `entry().or_insert_with`
+    // keeps the FIRST push, since the args are equivalent along either path up
+    // to the branch instruction itself (the differing branches only affect the
+    // value of flags, which `recover_call_site` doesn't read).
+    let mut branch_seed: std::collections::HashMap<u64, Vec<Instruction>> =
+        std::collections::HashMap::new();
 
     while let Some(start) = work.pop() {
         if !seen.insert(start) {
@@ -359,7 +383,8 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
         let mut instr = Instruction::default();
         // Straight-line instruction buffer for the current block, used to recover the argument
         // set-up preceding each CALL. Reset at block boundaries (branches) and after each call.
-        let mut block_buf: Vec<Instruction> = Vec::new();
+        // For non-entry `start`s, seed from the predecessor branch (see `branch_seed`).
+        let mut block_buf: Vec<Instruction> = branch_seed.remove(&start).unwrap_or_default();
 
         loop {
             if !dec.can_decode() {
@@ -400,15 +425,23 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
                 FlowControl::ConditionalBranch => {
                     let t = instr.near_branch_target();
                     if (lo..hi).contains(&t) {
+                        branch_seed.entry(t).or_insert_with(|| block_buf.clone());
                         work.push(t);
                     } else {
                         cg.tail_calls.insert(t);
                     }
-                    block_buf.clear(); // fallthrough starts a new block
+                    // Don't clear `block_buf` here: the args set up before the
+                    // conditional apply to BOTH the taken and the fallthrough
+                    // paths (they share register/stack state at the branch).
+                    // Clearing would make the fallthrough's first CALL recover
+                    // an empty argument set. The buffer is reset by the next
+                    // CALL we encounter (Call/IndirectCall arms above clear
+                    // post-call) or by an explicit boundary.
                 }
                 FlowControl::UnconditionalBranch => {
                     let t = instr.near_branch_target();
                     if (lo..hi).contains(&t) {
+                        branch_seed.entry(t).or_insert_with(|| block_buf.clone());
                         work.push(t);
                     } else {
                         cg.tail_calls.insert(t);
@@ -418,7 +451,12 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
                 FlowControl::IndirectBranch => {
                     cg.indirect_jumps += 1;
                     record_indirect_target(&instr, pe, &mut cg);
-                    follow_jump_table(&instr, pe, lo, hi, &mut work);
+                    let mut cases: Vec<u64> = Vec::new();
+                    follow_jump_table(&instr, pe, lo, hi, &mut cases);
+                    for c in &cases {
+                        branch_seed.entry(*c).or_insert_with(|| block_buf.clone());
+                        work.push(*c);
+                    }
                     break;
                 }
                 FlowControl::Return | FlowControl::Interrupt | FlowControl::Exception => break,

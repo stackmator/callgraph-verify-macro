@@ -36,10 +36,95 @@ pub struct Spec {
     iat: Vec<u64>,
 }
 
+/// Process-wide cache of decoded `.text` instruction-start sets, keyed by
+/// `(image_base, text_rva, text_vsize)`. Each entry holds an `Arc` so the
+/// cached set can be cloned out without holding the MutexGuard.
+fn text_starts_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<
+        (u64, u32, u32),
+        std::sync::OnceLock<std::sync::Arc<std::collections::BTreeSet<u64>>>,
+    >,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                (u64, u32, u32),
+                std::sync::OnceLock<std::sync::Arc<std::collections::BTreeSet<u64>>>,
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Decode the entire `.text` section once and return the set of VAs that are
+/// the start of a valid x86 instruction. Used by [`has_direct_branch_target`]
+/// to gate its byte-scan so a `0xE8` byte sitting inside some other
+/// instruction's encoding (i.e. NOT at an instruction start) is rejected — the
+/// call/jmp pattern there is a spurious coincidence, not a real branch.
+///
+/// Steady-state is lock-free: the cache stores `&'static OnceLock` values, and
+/// once `get_or_init` has populated one, repeated `get()` calls return
+/// `&'static BTreeSet`s without touching the mutex. The mutex is only acquired
+/// on the very first request per `(image_base, text_rva, text_vsize)` triple.
+fn text_instruction_starts<'a>(
+    pe: &'a Pe,
+) -> std::sync::Arc<std::collections::BTreeSet<u64>> {
+    let key = || -> Option<(u64, u32, u32)> {
+        let text = pe.sections().iter().find(|s| s.name == ".text")?;
+        Some((pe.image_base, text.virtual_address, text.virtual_size))
+    };
+    let key = match key() {
+        Some(k) => k,
+        None => {
+            // No .text section: return an empty Arc.
+            static EMPTY: std::sync::OnceLock<std::sync::Arc<std::collections::BTreeSet<u64>>> =
+                std::sync::OnceLock::new();
+            return EMPTY
+                .get_or_init(|| std::sync::Arc::new(std::collections::BTreeSet::new()))
+                .clone();
+        }
+    };
+    let cache = text_starts_cache();
+    // Fast path: lock-free read once the value exists. `Mutex::lock` returns
+    // `LockResult<MutexGuard>`; we ignore poisoning — `OnceLock::get_or_init`
+    // never panics inside the closure.
+    let mut lock = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = lock.entry(key).or_insert_with(std::sync::OnceLock::new);
+    let once = entry.get_or_init(|| {
+        use iced_x86::{Decoder, DecoderOptions};
+        let text = pe
+            .sections()
+            .iter()
+            .find(|s| s.name == ".text")
+            .expect("key was Some");
+        let text_va = pe.image_base + text.virtual_address as u64;
+        let bytes = match pe.read(text_va, text.virtual_size as usize) {
+            Some(b) => b,
+            None => return std::sync::Arc::new(std::collections::BTreeSet::new()),
+        };
+        let mut dec = Decoder::with_ip(32, bytes, text_va, DecoderOptions::NONE);
+        let mut starts = std::collections::BTreeSet::new();
+        starts.insert(text_va);
+        while dec.can_decode() {
+            let ip = dec.ip();
+            starts.insert(ip);
+            let _ = dec.decode();
+        }
+        std::sync::Arc::new(starts)
+    });
+    once.clone()
+}
+
 /// Does ANY instruction in `.text` statically target `target` via a relative branch
-/// (CALL/JMP/Jcc rel32)? Pure-byte scan over `.text`, no `analyze` cost per fn — answers
-/// "is this origin reached as a direct call/tail/jump by code, or only via data (vtable
-/// slot, switch table, fn pointer)?" Used by the macro to warn on vtable-only dispatch.
+/// (CALL/JMP/Jcc rel32)? Used by the macro to warn on vtable-only dispatch.
+///
+/// Implementation: decode `.text` once (cached) to learn every valid instruction
+/// start, then byte-scan for `0xE8`/`0xE9`/`0x0F 0x8x` and only treat a hit as
+/// a real branch if its `0xE8`/`0xE9` byte sits AT an instruction start. Without
+/// the gate (BUG #3), a `0xE8` byte anywhere inside another instruction's
+/// encoding was treated as a CALL, computing a junk rel32 target that could
+/// coincidentally equal `target` — a false positive that suppressed legitimate
+/// VTABLE-ONLY DISPATCH warnings.
 pub fn has_direct_branch_target(pe: &Pe, target: u64) -> bool {
     let Some(text) = pe.sections().iter().find(|s| s.name == ".text") else {
         return false;
@@ -49,6 +134,7 @@ pub fn has_direct_branch_target(pe: &Pe, target: u64) -> bool {
         Some(b) => b,
         None => return false,
     };
+    let starts = text_instruction_starts(pe);
     let target = target as u32;
     let mut i = 0;
     while i + 4 < blob.len() {
@@ -60,6 +146,13 @@ pub fn has_direct_branch_target(pe: &Pe, target: u64) -> bool {
                 continue;
             }
         };
+        // Gate: the branch opcode must sit at a real instruction start. Spurious
+        // `0xE8` bytes inside other instructions are ignored. (BUG #3 fix.)
+        let ip_va = text_va + i as u64;
+        if !starts.contains(&ip_va) {
+            i += 1;
+            continue;
+        }
         if rel_at + 4 > blob.len() {
             i += 1;
             continue;

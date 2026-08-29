@@ -164,25 +164,66 @@ fn hex_addrs(line: &str, first_only: bool) -> Vec<u64> {
 
 /// The function name + whether it is a method (has a `self` receiver), from a
 /// signature line, e.g. `pub unsafe fn free(&self, ptr: u32) {` → ("free", true).
+/// Generics are skipped: `pub fn foo<T>(x: T)` → ("foo", false). Without the skip,
+/// `take_while` stops at `<`, producing an empty name and silently dropping the fn
+/// from the corpus (calls to it then become HALLUCINATED).
 fn fn_sig(line: &str) -> Option<(String, bool)> {
     let idx = line.find("fn ")?;
-    let rest = &line[idx + 3..];
-    let paren = rest.find('(')?; // a real signature has '(' on the same line
-    let name: String = rest[..paren]
+    let after_fn = &line[idx + 3..];
+    // Skip a balanced generic parameter list `<...>` if present, so `foo<T>` parses
+    // as name "foo" rather than name "". Nested generics like `<T, U=U::Item>` are
+    // handled by tracking angle depth; the inner `<` of an associated-type bound
+    // (`<T where T: Foo<Bar>>`) doesn't fool us because depth only opens on `<`.
+    let after_generics = skip_generics(after_fn);
+    let paren_in_sig = after_generics.find('(')?; // a real signature has '(' on the same line
+    // The name is whatever sits between `fn ` (or the closing `>`) and the first
+    // non-name character (`(`, `<`, whitespace, …). Path-qualified names
+    // (`crate::foo`) and lifetimes are not name chars; only alphanumeric + `_`.
+    let name: String = after_generics[..paren_in_sig]
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
         .collect();
     if name.is_empty() {
         return None;
     }
+    // The full rest of the signature (from after `fn `) is needed to read the first
+    // parameter list — params may sit between generics and the outer `(`. For the
+    // common case the outer `(` is the same as `paren_in_sig`; here we re-locate
+    // it on the original `after_fn` slice so `rest[paren + 1..]` still works.
+    let paren = after_fn.find('(')?;
     // Method iff the first parameter is a `self` receiver.
-    let first_param = rest[paren + 1..].split([',', ')']).next().unwrap_or("");
+    let first_param = after_fn[paren + 1..].split([',', ')']).next().unwrap_or("");
     let is_method = first_param.replace(['&', ' '], "").starts_with("self")
         || first_param.contains("mut self")
         || first_param
             .trim_start_matches(['&', ' '])
             .starts_with("self");
     Some((name, is_method))
+}
+
+/// If `s` begins with a balanced `<...>` generic parameter list, return the slice
+/// starting just after the closing `>`. Otherwise return `s` unchanged. Counts `<`
+/// and `>` to handle nested generics (e.g. `<T: Foo<Bar>>`); does not attempt to
+/// parse string/char literals or comments — fine for the short signatures we see.
+fn skip_generics(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.first().copied() != Some(b'<') {
+        return s;
+    }
+    let mut depth: usize = 1;
+    for (i, &b) in bytes.iter().enumerate().skip(1) {
+        match b {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &s[i + 1..];
+                }
+            }
+            _ => {}
+        }
+    }
+    s
 }
 
 fn scan_file(text: &str, disp_path: &str, c: &mut Corpus) {
@@ -210,8 +251,13 @@ fn scan_file(text: &str, disp_path: &str, c: &mut Corpus) {
         // `origin(` / `callgraph_verify(` token match every spelling: `#[origin(..)]`,
         // `#[callgraph_verify(..)]`, and the full path `#[callgraph_verify_macro::origin(..)]`.
         // One fn = one binary fn (fusion banned), so only the first addr is taken.
-        let is_origin_attr =
-            line.contains("#[") && (line.contains("origin(") || line.contains("callgraph_verify("));
+        //
+        // The `trim_start().starts_with("#[")` check is intentional: a naive
+        // `line.contains("#[")` would also fire on commented-out attributes like
+        // `// see #[origin(0xA)]`, silently re-attributing the wrong address to
+        // the next function. (BUG #5)
+        let is_origin_attr = line.trim_start().starts_with("#[")
+            && (line.contains("origin(") || line.contains("callgraph_verify("));
         if is_origin_attr {
             pending.extend(hex_addrs(line, true)); // addr is the first arg
         } else if line.starts_with("//")
@@ -357,4 +403,196 @@ fn rust_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fn_sig, scan_file, skip_generics, Corpus};
+
+    // --- skip_generics ----------------------------------------------------
+
+    #[test]
+    fn skip_generics_passthrough_when_no_angle() {
+        assert_eq!(skip_generics("foo(x: u32)"), "foo(x: u32)");
+        assert_eq!(skip_generics("(x: u32)"), "(x: u32)");
+        assert_eq!(skip_generics(""), "");
+    }
+
+    #[test]
+    fn skip_generics_simple() {
+        assert_eq!(skip_generics("<T>(x: T)"), "(x: T)");
+        assert_eq!(skip_generics("<T, U>(x: T, y: U)"), "(x: T, y: U)");
+    }
+
+    #[test]
+    fn skip_generics_nested() {
+        assert_eq!(skip_generics("<T: Foo<Bar>>(x: T)"), "(x: T)");
+        assert_eq!(
+            skip_generics("<T, U = Vec<T::Item>>(x: T, y: U)"),
+            "(x: T, y: U)"
+        );
+    }
+
+    #[test]
+    fn skip_generics_with_lifetime_and_const() {
+        assert_eq!(
+            skip_generics("<'a, T, const N: usize>(x: &'a T) -> &'a T"),
+            "(x: &'a T) -> &'a T"
+        );
+    }
+
+    // --- fn_sig ----------------------------------------------------------
+
+    #[test]
+    fn fn_sig_plain_function() {
+        let (name, is_method) = fn_sig("pub fn foo(x: u32) -> u32 {").unwrap();
+        assert_eq!(name, "foo");
+        assert!(!is_method);
+    }
+
+    #[test]
+    fn fn_sig_method_with_self() {
+        let (name, is_method) = fn_sig("pub unsafe fn free(&self, ptr: u32) {").unwrap();
+        assert_eq!(name, "free");
+        assert!(is_method);
+    }
+
+    #[test]
+    fn fn_sig_method_with_mut_self() {
+        let (name, is_method) = fn_sig("fn add(&mut self, x: u32) {").unwrap();
+        assert_eq!(name, "add");
+        assert!(is_method);
+    }
+
+    /// Regression for BUG #1: generic functions used to be silently dropped because
+    /// `take_while(alphanumeric|_)` stopped at `<`, producing an empty name. Calls
+    /// to such ported fns would then resolve to nothing and be flagged HALLUCINATED.
+    #[test]
+    fn fn_sig_generic_function() {
+        let (name, is_method) = fn_sig("pub fn foo<T>(x: T) -> T {").unwrap();
+        assert_eq!(name, "foo");
+        assert!(!is_method);
+    }
+
+    #[test]
+    fn fn_sig_generic_with_bound() {
+        let (name, is_method) =
+            fn_sig("pub fn clone_into<T: Clone>(&self, dst: &mut T) {").unwrap();
+        assert_eq!(name, "clone_into");
+        assert!(is_method);
+    }
+
+    #[test]
+    fn fn_sig_generic_with_lifetime_and_const() {
+        let (name, is_method) =
+            fn_sig("pub fn map<'a, T, const N: usize>(x: &'a T) -> &'a T {").unwrap();
+        assert_eq!(name, "map");
+        assert!(!is_method);
+    }
+
+    #[test]
+    fn fn_sig_generic_with_nested_bound() {
+        let (name, is_method) =
+            fn_sig("pub fn deep<T: Foo<Bar>>(x: T) -> T {").unwrap();
+        assert_eq!(name, "deep");
+        assert!(!is_method);
+    }
+
+    #[test]
+    fn fn_sig_no_paren_returns_none() {
+        // A `fn` reference in a comment without `(` shouldn't be picked up.
+        assert!(fn_sig("// see fn foo above for details").is_none());
+    }
+
+    // --- scan_file: attribute vs comment (BUG #5) -------------------------
+
+    /// Build a corpus by running `scan_file` on `text` (no vtable decls). The
+    /// returned corpus exposes `free_fns`/`methods` keyed by fn name; we assert
+    /// that the right names are present (and the wrong ones absent).
+    fn scan(text: &str) -> Corpus {
+        let mut c = Corpus {
+            free_fns: std::collections::HashMap::new(),
+            methods: std::collections::HashMap::new(),
+            addr2name: std::collections::HashMap::new(),
+            addr_owners: std::collections::HashMap::new(),
+            corpus: std::collections::BTreeSet::new(),
+            inline_fns: std::collections::HashMap::new(),
+            inline_ambiguous: std::collections::HashSet::new(),
+            inlined_markers: std::collections::BTreeSet::new(),
+            declared_vtables: Vec::new(),
+        };
+        scan_file(text, "test.rs", &mut c);
+        c
+    }
+
+    #[test]
+    fn scan_file_real_attribute_is_picked_up() {
+        let text = "\
+#[origin(0x004028d0)]
+pub unsafe fn foo() {}
+";
+        let c = scan(text);
+        assert!(c.free_fns.contains_key("foo"));
+        assert!(c.corpus.contains(&0x004028d0));
+    }
+
+    /// Regression for BUG #5: a commented-out `#[origin(..)]` reference (a `//` line
+    /// that just *mentions* the attribute syntax in prose) used to be matched as a
+    /// real attribute. The address from the comment then attached to the next fn
+    /// signature — silently mis-attributing it. With the fix only lines that
+    /// actually start with `#[` are treated as attributes.
+    #[test]
+    fn scan_file_commented_attribute_is_ignored() {
+        let text = "\
+// see #[origin(0xDEADBEEF)] for the old version
+pub unsafe fn foo() {}
+";
+        let c = scan(text);
+        // The corpus must NOT contain 0xDEADBEEF — the `#[origin(..)]` was inside a
+        // comment, not a real attribute. Before the fix the address leaked in and
+        // got attached to `foo` as its pending origin.
+        assert!(
+            !c.corpus.contains(&0xDEADBEEF),
+            "commented #[origin(0xDEADBEEF)] leaked into the corpus: {:?}",
+            c.corpus
+        );
+        // And the address must not be claimable by any fn (no owner entry).
+        assert!(
+            !c.addr2name.contains_key(&0xDEADBEEF),
+            "commented origin was attributed as `foo`'s address — addr2name: {:?}",
+            c.addr2name
+        );
+    }
+
+    #[test]
+    fn scan_file_commented_attribute_does_not_steal_pending_origin() {
+        // A real attribute, then a commented reference to a *different* address,
+        // then the function. The function's real origin must win — the comment's
+        // address must not override or coexist.
+        let text = "\
+#[origin(0x004028d0)]
+// historical note: was originally #[origin(0xCAFEBABE)]
+pub unsafe fn foo() {}
+";
+        let c = scan(text);
+        assert!(c.free_fns.contains_key("foo"));
+        assert!(c.corpus.contains(&0x004028d0), "real origin present");
+        assert!(
+            !c.corpus.contains(&0xCAFEBABE),
+            "comment address 0xCAFEBABE leaked into corpus"
+        );
+    }
+
+    #[test]
+    fn scan_file_indented_attribute_is_picked_up() {
+        // rustfmt may indent attributes — the leading whitespace must not break
+        // the starts_with check (we already trim_start before checking).
+        let text = "\
+    #[origin(0x004028d0)]
+    pub unsafe fn foo() {}
+";
+        let c = scan(text);
+        assert!(c.free_fns.contains_key("foo"));
+        assert!(c.corpus.contains(&0x004028d0));
+    }
 }

@@ -163,8 +163,16 @@ fn classify_arg(toks: &[TokenTree]) -> RustArg {
             if let (TokenTree::Ident(name), TokenTree::Group(g)) = (&toks[gi - 1], &toks[gi]) {
                 let name = name.to_string();
                 let inner = split_args(g.stream());
-                // rd8/rd16/rd32/rdf32/... (base, offset) → field access at `offset`.
-                if name.starts_with("rd") && inner.len() >= 2 {
+                // rd8/rd16/rd32/rdf32/... (base, offset) → field access at `offset`. Use an
+                // explicit list (mirroring the `g*` arm below) so that names like `read`
+                // or `rdata` aren't mis-classified as struct-field helpers just because
+                // they happen to start with `rd`. (BUG #7) Extend this list when new
+                // byte-helper width variants are introduced.
+                if matches!(
+                    name.as_str(),
+                    "rd8" | "rd16" | "rd32" | "rd64" | "rdf32" | "rdf64"
+                ) && inner.len() >= 2
+                {
                     if let RustArg::Imm(off) = classify_arg(&inner[1]) {
                         return RustArg::Field(off);
                     }
@@ -310,5 +318,95 @@ fn walk(ts: TokenStream, out: &mut BodyCalls) {
                 out.plain.insert(id.to_string());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proc_macro2::{Delimiter, Group, Ident, Span, TokenStream, TokenTree};
+    use std::str::FromStr;
+
+    /// Parse `s` as a TokenStream and return its token-tree slice — this is the
+    /// shape `classify_arg` expects.
+    fn toks(s: &str) -> Vec<TokenTree> {
+        TokenStream::from_str(s)
+            .expect("parse")
+            .into_iter()
+            .collect()
+    }
+
+    /// Build `name(arg1, arg2, ...)` as a token slice by parsing each piece
+    /// individually and stitching.
+    fn call_toks(name: &str, args: &[&str]) -> Vec<TokenTree> {
+        let mut v = vec![TokenTree::Ident(Ident::new(name, Span::call_site()))];
+        let mut inner: TokenStream = TokenStream::new();
+        for (i, a) in args.iter().enumerate() {
+            if i > 0 {
+                inner.extend(TokenStream::from_str(",").unwrap());
+            }
+            inner.extend(TokenStream::from_str(a).unwrap());
+        }
+        v.push(TokenTree::Group(Group::new(Delimiter::Parenthesis, inner)));
+        v
+    }
+
+    // --- classify_arg (BUG #7) --------------------------------------------
+
+    /// Regression: the old `starts_with("rd")` over-matched every name that
+    /// started with `rd` (`read`, `rdata`, …) and classified it as a struct-field
+    /// access. With an explicit list, only the canonical byte helpers count.
+    #[test]
+    fn classify_arg_rd_helpers_are_field() {
+        for name in ["rd8", "rd16", "rd32", "rd64", "rdf32", "rdf64"] {
+            let toks = call_toks(name, &["base", "0x10"]);
+            assert!(
+                matches!(classify_arg(&toks), RustArg::Field(0x10)),
+                "{name}(base, 0x10) should be Field(0x10), got {:?}",
+                classify_arg(&toks)
+            );
+        }
+    }
+
+    #[test]
+    fn classify_arg_non_rd_helpers_are_other() {
+        // `read` and `rdata` start with `rd` but are NOT byte-helper idioms.
+        // They must classify as Other, not Field — otherwise a call like
+        // `read(p, 0x10)` would be reported as a field access at 0x10.
+        for name in ["read", "rdata", "rdb", "rdr"] {
+            let toks = call_toks(name, &["base", "0x10"]);
+            assert!(
+                matches!(classify_arg(&toks), RustArg::Other),
+                "{name}(base, 0x10) should be Other (not a byte helper), got {:?}",
+                classify_arg(&toks)
+            );
+        }
+    }
+
+    #[test]
+    fn classify_arg_g_helpers_are_global() {
+        for name in ["g8", "g16", "g32", "g64", "gf32", "gf64"] {
+            let toks = call_toks(name, &["0x00BEEF"]);
+            assert!(
+                matches!(classify_arg(&toks), RustArg::Global(0xBEEF)),
+                "{name}(0xBEEF) should be Global(0xBEEF), got {:?}",
+                classify_arg(&toks)
+            );
+        }
+    }
+
+    #[test]
+    fn classify_arg_bare_literal_is_immediate() {
+        let toks = toks("0x10");
+        assert!(matches!(classify_arg(&toks), RustArg::Imm(0x10)));
+    }
+
+    #[test]
+    fn classify_arg_rd_with_non_literal_offset_is_other() {
+        // The offset must be a literal int to be classified as Field; anything
+        // else falls through to Other. Guards against classifying a variable
+        // offset as a known field.
+        let toks = call_toks("rd32", &["base", "offset"]);
+        assert!(matches!(classify_arg(&toks), RustArg::Other));
     }
 }
