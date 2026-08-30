@@ -1,0 +1,94 @@
+Rewrite corpus scanner on syn::parse_file; fix LEA-as-global
+
+The corpus scanner previously walked .rs files as plain text and applied
+regex-ish heuristics to extract origin addresses, vtable declarations,
+and inline-helper call sites. The first audit found four distinct bugs
+(BUGS.md #5, #12, #15, #16) that were all symptoms of the same root
+cause: text matching can't distinguish an attribute from a comment
+that mentions attribute syntax. Fixing them piecemeal would have left
+the same class of bug latent for any new attribute syntax; the right
+fix is to stop matching text.
+
+This commit rewrites the scanner on top of syn::parse_file. Each .rs
+file is parsed once into a syn::File and walked via structured Items
+(Item::Fn, Item::Impl, Item::Trait, Item::Mod, Item::Macro). Comments
+become Expr::Lit doc-strings to syn and can no longer be confused with
+attribute lists; macro invocations are Item::Macro and can no longer
+match a substring. The only text matching left is inside doc-comment
+strings (legitimate plain-text user annotations: inline:, callgraph-
+inlined, callgraph-virtual).
+
+Bugs eliminated by the rewrite
+- BUG #5   #[origin] in a // ... comment re-attributes next fn
+- BUG #13  attribute-internal calls picked up as body calls
+- BUG #15  vtable_table! substring match fires on comments
+- BUG #16  /// fn foo() { ... } parsed as fn signature
+- BUG #12  /// origin: doc-comment cited as an address (was
+            incidentally cited; now ignored by design)
+
+Body helpers also switched to body-only walking: collect_call_exprs
+and collect_hex_literals now use find_body_group to skip attributes
+and the fn name itself, so attribute-internal calls/literals never
+leak into the operand / arg-shape diffs.
+
+Bug also fixed this pass
+- BUG #14  disasm::scan_operands recorded absolute-address LEA as a
+            global. LEA computes an address without dereferencing
+            memory, so the operand is NOT a global reference. The
+            field-offset arm already had the LEA guard; the global
+            arm did not. Symmetric fix.
+
+Files
+- callgraph-verify-macro/src/corpus.rs
+    Removed: scan_file, scan_vtable_decls, find_kv, hex_addrs,
+    fn_sig, skip_generics, grab_body.
+    Added: scan_item, scan_fn, scan_impl_fn, scan_trait_fn,
+    scan_attrs_and_record, record_fn_addresses, parse_inline_addr,
+    path_is, is_method_sig. Module doc updated.
+- callgraph-verify-macro/src/lib.rs
+    Exposed parse_origin_attr(proc_macro2::TokenStream) and made
+    VtableTable pub(crate) so the scanner reuses the existing Args
+    and vtable_table! parsers without forking them.
+- callgraph-verify-macro/src/body.rs
+    Added find_body_group (locates the body's {...} group via a
+    fn (...) head search). collect_call_exprs, collect_hex_literals,
+    and the new collect_body_calls_only use it.
+- callgraph-verify/src/disasm.rs
+    Added the LEA mnemonic guard to the global arm of scan_operands.
+
+Behavior change
+#[cfg(test)] modules are now harvested (previously SKIPPED to match
+the python lint). cfg attributes are resolved by the compiler, not
+the parser; if the rebuild's tests reference ported fns, those
+references now check correctly. Documented in BUGS-2.md; the
+syn_scan_cfg_test_fn_is_harvested test pins it.
+
+Tests
+Removed obsolete text-matching tests; added 18 syn-based tests:
+- parse_inline_addr_basic / _no_addr / _small_hex_filtered
+- syn_scan_picks_up_free_fn_with_origin
+- syn_scan_commented_origin_in_docstring_does_not_leak (BUG #5)
+- syn_scan_commented_origin_does_not_steal_real (BUG #5)
+- syn_scan_fn_in_doc_comment_does_not_steal_origin (BUG #16)
+- syn_scan_picks_up_impl_method (Item::Impl -> ImplItem::Fn)
+- syn_scan_picks_up_generic_fn (BUG #1 structurally impossible)
+- syn_scan_picks_up_callgraph_verify_alias
+- syn_scan_inline_with_address_records_origin
+- syn_scan_inline_without_address_captures_body
+- syn_scan_callgraph_inlined_marks_addr
+- syn_scan_vtable_table_macro_records_decl (Item::Macro -> VtableTable)
+- syn_scan_vtable_table_in_comment_does_not_record (BUG #15)
+- syn_scan_vtable_table_in_doc_string_does_not_record
+- syn_scan_indented_attribute_is_picked_up
+- syn_scan_dual_tag_does_not_duplicate_owner
+- syn_scan_cfg_test_fn_is_harvested (behavior change)
+- syn_scan_impl_fn_without_self_still_classified_as_method
+- collect_body_calls_only_skips_attributes_and_fn_name
+- collect_hex_literals_excludes_attribute_addresses
+- collect_hex_literals_includes_body_addresses
+- test_scan_operands_lea_absolute_not_a_global (BUG #14)
+- test_scan_operands_mov_absolute_is_a_global
+
+Total: 33 integration + 30 macro-lib unit = 63 passing.
+
+BUGS-2.md documents the rewrite and the additional bug findings.

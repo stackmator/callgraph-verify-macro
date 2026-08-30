@@ -550,7 +550,7 @@ mod tests {
         // MZ header (64 bytes) + PE signature (4) + COFF header (20) +
         // PE32 optional header (96) = 184 bytes minimum before section table.
         let e_lfanew: u32 = 0x40;
-        let mut data: Vec<u8> = vec![0; 0x400];
+        let mut data: Vec<u8> = vec![0; 0x4000];
 
         // MZ magic + e_lfanew pointer
         data[0..2].copy_from_slice(b"MZ");
@@ -580,7 +580,11 @@ mod tests {
         // Section name: 8 bytes ".text\0\0\0"
         data[sec_off..sec_off + 8].copy_from_slice(b".text\0\0\0");
         let text_va: u32 = 0x1000;
-        let text_raw: u32 = 0x200;
+        // `text_raw` must be >= code.len() — `pe.read` rejects reads past
+        // `raw_size`, so a code buffer longer than `text_raw` would be
+        // unwritable. Round up to a 0x200 boundary so the layout looks like a
+        // normal MSVC link.
+        let text_raw: u32 = ((code.len() + 0x1ff) & !0x1ff).max(0x200) as u32;
         let text_vsize: u32 = code.len().max(text_raw as usize) as u32;
         data[sec_off + 8..sec_off + 12].copy_from_slice(&text_vsize.to_le_bytes()); // VirtualSize
         data[sec_off + 12..sec_off + 16].copy_from_slice(&text_va.to_le_bytes()); // VirtualAddress
@@ -709,6 +713,58 @@ mod tests {
             "0x10 should be in field_offsets for plain [ECX+0x10] — non-indexed \
              memory is still a struct field. field_offsets = {:?}",
             cg.field_offsets
+        );
+    }
+
+    /// Regression for BUG #14: `LEA reg, [abs]` (absolute-address LEA) computes
+    /// an address without dereferencing memory. The displacement is NOT a
+    /// global reference, so it must NOT be added to `cg.globals` — otherwise
+    /// the operand check (HALLUCINATED-ADDR) would falsely require the
+    /// displacement to appear elsewhere in the binary.
+    ///
+    /// The .text-only synthetic PE has no globals in scope. To put the
+    /// displacement in range we must point it into the .text section itself
+    /// (image_base + 0x1000 + 5, the address right after the LEA). The test
+    /// asserts that even an in-section displacement is rejected for LEA.
+    #[test]
+    fn test_scan_operands_lea_absolute_not_a_global() {
+        // LEA EAX, [0x00401005]  ; absolute-address LEA
+        //   opcode 8D, ModRM 05 (mod=00, reg=000(EAX), rm=101(Disp32)),
+        //   disp32 = 0x00401005 (the address right after this 6-byte instr).
+        // RET
+        let code = [
+            0x8D, 0x05, 0x05, 0x10, 0x40, 0x00, // LEA EAX, [0x00401005]
+            0xC3, // RET
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let cg = analyze(&pe, entry).expect("analyze");
+        assert!(
+            !cg.globals.contains(&0x00401005),
+            "0x00401005 leaked into globals from a LEA — LEA doesn't dereference, \
+             so its operand isn't a global reference. globals = {:?}",
+            cg.globals
+        );
+    }
+
+    /// Sanity: a MOV (not LEA) with the same operand form DOES count as a global.
+    /// Guards against an over-eager fix that drops the genuine global case.
+    #[test]
+    fn test_scan_operands_mov_absolute_is_a_global() {
+        // MOV EAX, [0x0040100D]  ; the address after this 6-byte instr
+        // RET
+        let code = [
+            0xA1, 0x0D, 0x10, 0x40, 0x00, // MOV EAX, moffs32 (absolute address)
+            0xC3,
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let cg = analyze(&pe, entry).expect("analyze");
+        assert!(
+            cg.globals.contains(&0x0040100D),
+            "0x0040100D should be in globals for MOV EAX, [0x0040100D] — \
+             absolute MOV does dereference. globals = {:?}",
+            cg.globals
         );
     }
 

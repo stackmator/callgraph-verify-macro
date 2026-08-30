@@ -72,6 +72,24 @@ struct Args {
     unreferenced: bool,
 }
 
+/// What the macro needs to harvest from `#[origin(...)]` / `#[callgraph_verify(...)]`
+/// for the corpus scanner. Public(crate) so `corpus::scan_item` can reuse the
+/// same parser instead of inventing a parallel one. The proc-macro's own
+/// `verify_impl` builds a richer `Spec` from `Args`; the scanner only needs
+/// the address (and the `unreferenced` waiver doesn't change the scan).
+#[derive(Debug, Clone)]
+pub(crate) struct OriginAttr {
+    pub addr: u64,
+}
+
+/// Parse the inner tokens of `#[origin(…)]` / `#[callgraph_verify(…)]`.
+/// Accepts a `proc_macro2::TokenStream` so `corpus::scan_item` (which walks
+/// the syn AST) can call it without round-tripping through `proc_macro`.
+pub(crate) fn parse_origin_attr(tokens: proc_macro2::TokenStream) -> syn::Result<OriginAttr> {
+    let args: Args = syn::parse2(tokens)?;
+    Ok(OriginAttr { addr: args.addr })
+}
+
 fn array_of_u64(arr: &ExprArray) -> syn::Result<Vec<u64>> {
     arr.elems
         .iter()
@@ -329,7 +347,10 @@ fn env_flag(name: &str, default: bool) -> bool {
 
 fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as Args);
-    let body_calls = body::collect_call_idents(item.clone().into());
+    // Walk the function BODY only (skip leading attributes and the
+    // `fn name(...)` head) so attribute-internal calls and the function's
+    // own name don't pollute the corpus diff. (BUG #13 / #14)
+    let body_calls = body::collect_body_calls_only(item.clone().into());
     let item2 = proc_macro2::TokenStream::from(item);
 
     let Ok(exe) = std::env::var("TARGET_EXE") else {
@@ -703,7 +724,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
 // the PE (`engine[va + slot*4]`). A mismatch (wrong fn / off-by-one slot) is a
 // `compile_error!`. `default` slots are the un-ported remainder (not checked).
 // ---------------------------------------------------------------------------
-struct VtableTable {
+pub(crate) struct VtableTable {
     name: Ident,
     va: u64,
     slots: usize,

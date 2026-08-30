@@ -75,10 +75,65 @@ pub struct BodyCalls {
     pub method: HashSet<String>,
 }
 
+/// Walks the WHOLE token stream (attributes, fn head, body) collecting call
+/// idents. Retained as a public API for callers that want the full inventory;
+/// the macro's own verifier uses [`collect_body_calls_only`] which excludes
+/// leading attributes and the fn head.
+#[allow(dead_code)]
 pub fn collect_call_idents(ts: TokenStream) -> BodyCalls {
     let mut out = BodyCalls::default();
     walk(ts, &mut out);
     out
+}
+
+/// Walk only the function body (the `{ ... }` block), skipping the function
+/// name itself, its parameters, AND any `#[attribute(...)]` on the item. The
+/// raw `walk` over the entire item conflated three things that look like
+/// calls but aren't: the function's own name (`fn outer() { … }` matches
+/// `outer()` because `outer` is an Ident followed by a parenthesized group),
+/// the attribute macro name (`#[serde(...)]` matches `serde(...)`), and any
+/// call embedded inside an attribute (`#[some_attr(default = helper())]`).
+/// All three polluted the corpus diff with bogus names. (BUG #13 / #14)
+pub fn collect_body_calls_only(ts: TokenStream) -> BodyCalls {
+    let mut out = BodyCalls::default();
+    if let Some(body) = find_body_group(ts) {
+        walk(body, &mut out);
+    }
+    out
+}
+
+fn find_body_group(ts: TokenStream) -> Option<TokenStream> {
+    // Walk the token tree at the top level; the first `{...}` group at the
+    // SHALLOWEST depth that follows `fn <name>(...)` is the body. Any earlier
+    // `{...}` belongs to something else (struct literals, blocks in attribute
+    // args, etc.) — but those aren't reached from a top-level `fn`, so the
+    // first brace group we see AFTER we've seen the parameter parens is the
+    // body. To handle attributes (each `[...]` group) and nested generics
+    // cleanly, we just track a small state machine: ignore tokens until we
+    // see `fn <ident>` followed by a `(...)` group, then the next `{...}` group
+    // is the body.
+    let tts: Vec<TokenTree> = ts.into_iter().collect();
+    let mut i = 0;
+    while i < tts.len() {
+        match &tts[i] {
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => {
+                return Some(g.stream());
+            }
+            TokenTree::Ident(id) if id.to_string() == "fn" => {
+                // Skip `fn`, then the name (one Ident), then the `(...)` group.
+                i += 1;
+                // Optional name (could be path with `::` — consume up to `(`).
+                while i < tts.len() && !matches!(&tts[i], TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis) {
+                    i += 1;
+                }
+                if i < tts.len() {
+                    i += 1; // past `(...)`
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// A recovered Rust argument, classified to mirror the binary-side `callgraph_verify::ArgKind`
@@ -228,7 +283,11 @@ fn count_kw(ts: TokenStream, c: &mut RustCfg) {
 
 pub fn collect_call_exprs(ts: TokenStream) -> Vec<CallExpr> {
     let mut out = Vec::new();
-    walk_calls(ts, &mut out);
+    if let Some(body) = find_body_group(ts.clone()) {
+        walk_calls(body, &mut out);
+    } else {
+        walk_calls(ts, &mut out);
+    }
     out
 }
 
@@ -266,7 +325,11 @@ fn walk_calls(ts: TokenStream, out: &mut Vec<CallExpr>) {
 /// literal that coincidentally lands in a PE section would be a false positive.
 pub fn collect_hex_literals(ts: TokenStream) -> Vec<u64> {
     let mut out = Vec::new();
-    walk_hex(ts, &mut out);
+    if let Some(body) = find_body_group(ts.clone()) {
+        walk_hex(body, &mut out);
+    } else {
+        walk_hex(ts, &mut out);
+    }
     out
 }
 
@@ -324,6 +387,7 @@ fn walk(ts: TokenStream, out: &mut BodyCalls) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::body::{collect_call_idents, collect_hex_literals};
     use proc_macro2::{Delimiter, Group, Ident, Span, TokenStream, TokenTree};
     use std::str::FromStr;
 
@@ -408,5 +472,77 @@ mod tests {
         // offset as a known field.
         let toks = call_toks("rd32", &["base", "offset"]);
         assert!(matches!(classify_arg(&toks), RustArg::Other));
+    }
+
+    // --- collect_call_idents / collect_call_exprs / collect_hex_literals ---
+
+    /// `collect_body_calls_only` walks only the function body's `{ ... }`
+    /// group, skipping leading `#[attribute(...)]` and the `fn name(...)`
+    /// head. A function call embedded in an attribute
+    /// (e.g. `#[serde(default = some_fn())]`) must NOT pollute the corpus
+    /// diff, and the function's own name (`fn outer() { … }`) must not be
+    /// counted as a self-call. (BUG #13 / #14)
+    #[test]
+    fn collect_body_calls_only_skips_attributes_and_fn_name() {
+        // Simulate an item: an attribute group with a call, the fn head, and a
+        // real body call. Real body has `real_fn()`. Attribute contains
+        // `attribute_fn()`. The fn name itself is `outer`.
+        let ts = TokenStream::from_str(
+            "#[some_attr(default = attribute_fn())] pub fn outer() { real_fn(); }",
+        )
+        .unwrap();
+        let calls = collect_body_calls_only(ts);
+        assert!(
+            calls.plain.contains("real_fn"),
+            "real_fn (in body) should be picked up: {:?}",
+            calls.plain
+        );
+        assert!(
+            !calls.plain.contains("attribute_fn"),
+            "attribute_fn (inside #[..]) should NOT be picked up as a body call: {:?}",
+            calls.plain
+        );
+        assert!(
+            !calls.plain.contains("outer"),
+            "fn name `outer` should NOT be counted as a self-call: {:?}",
+            calls.plain
+        );
+    }
+
+    /// `collect_hex_literals` also walks only the body — hex literals inside
+    /// `#[origin(0xA, calls = [0xB, 0xC])]` are NOT included. The macro
+    /// itself applies `v == args.addr` to skip the function's own address,
+    /// and the operand check should only see addresses the BODY actually
+    /// bakes in (global reads, vtable VAs, fn pointers pushed as immediates),
+    /// not the declared `calls = [..]` / `globals = [..]` lists which are
+    /// already validated by the explicit `Spec` clauses. (BUG #13)
+    #[test]
+    fn collect_hex_literals_excludes_attribute_addresses() {
+        let ts = TokenStream::from_str(
+            "#[origin(0x004028d0, calls = [0x00401f00, 0x00401f20])] pub fn outer() {}",
+        )
+        .unwrap();
+        let lits = collect_hex_literals(ts);
+        // The body is empty, so no hex literals are emitted.
+        assert!(!lits.contains(&0x004028d0), "attr hex leaked: {:?}", lits);
+        assert!(!lits.contains(&0x00401f00), "attr hex leaked: {:?}", lits);
+        assert!(!lits.contains(&0x00401f20), "attr hex leaked: {:?}", lits);
+    }
+
+    /// Sanity: hex literals INSIDE the body ARE included.
+    #[test]
+    fn collect_hex_literals_includes_body_addresses() {
+        let ts = TokenStream::from_str(
+            "#[origin(0x004028d0)] pub fn outer() { let g = 0x00401f00u32; }",
+        )
+        .unwrap();
+        let lits = collect_hex_literals(ts);
+        assert!(lits.contains(&0x00401f00), "{:?}", lits);
+        // The attribute's own address is NOT included — it's outside the body.
+        assert!(
+            !lits.contains(&0x004028d0),
+            "attr 0x004028d0 leaked into body hex: {:?}",
+            lits
+        );
     }
 }

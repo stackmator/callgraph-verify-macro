@@ -115,7 +115,11 @@ fn scan_operands(pe: &Pe, instr: &Instruction, cg: &mut CallGraph) {
                 let disp = instr.memory_displacement64();
                 if base == Register::None && index == Register::None {
                     // absolute `[0x...]` — a global/static data reference.
-                    if pe.section_of(disp).is_some() {
+                    // Skip LEA: it computes an address without dereferencing, so
+                    // the operand isn't a memory reference. (BUG #14)
+                    if pe.section_of(disp).is_some()
+                        && instr.mnemonic() != Mnemonic::Lea
+                    {
                         cg.globals.insert(disp);
                     }
                 } else if base != Register::None
