@@ -6,33 +6,40 @@ mod tests {
     };
     use std::process::Command;
 
-    /// Build the test binary if needed and return its path
-    fn get_test_binary_path() -> std::path::PathBuf {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let test_bin_dir = manifest_dir.join("test-bin");
-        let exe_path = test_bin_dir
-            .join("target")
-            .join("i686-pc-windows-msvc")
-            .join("debug")
-            .join("test-bin.exe");
-
-        if !exe_path.exists() {
-            // Build the test binary
-            let status = Command::new("cargo")
-                .args(["build", "--target", "i686-pc-windows-msvc"])
-                .current_dir(&test_bin_dir)
-                .status()
-                .expect("failed to run cargo build for test-bin");
-            assert!(status.success(), "test-bin build failed");
-        }
-
-        exe_path
+/// Build the test-bin binary if needed.
+fn ensure_test_binary_built() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let test_bin_dir = manifest_dir.join("test-bin");
+    let exe_path = test_bin_dir
+        .join("target")
+        .join("i686-pc-windows-msvc")
+        .join("debug")
+        .join("test-bin.exe");
+    if !exe_path.exists() {
+        let status = Command::new("cargo")
+            .args(["build", "--target", "i686-pc-windows-msvc"])
+            .current_dir(&test_bin_dir)
+            .status()
+            .expect("failed to run cargo build for test-bin");
+        assert!(status.success(), "test-bin build failed");
     }
+}
 
-    fn load_test_pe() -> Pe {
-        let path = get_test_binary_path();
-        Pe::load(path.to_str().unwrap()).expect("load test binary")
-    }
+fn get_test_binary_path() -> std::path::PathBuf {
+    ensure_test_binary_built();
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let test_bin_dir = manifest_dir.join("test-bin");
+    test_bin_dir
+        .join("target")
+        .join("i686-pc-windows-msvc")
+        .join("debug")
+        .join("test-bin.exe")
+}
+
+fn load_test_pe() -> Pe {
+    let path = get_test_binary_path();
+    Pe::load(path.to_str().unwrap()).expect("load test binary")
+}
 
     /// Find a function address by scanning the .text section for valid functions
     fn find_function_addresses(pe: &Pe) -> Vec<u64> {

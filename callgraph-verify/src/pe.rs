@@ -17,6 +17,33 @@ pub struct Section {
     pub virtual_size: u32,
     pub raw_offset: u32,
     pub raw_size: u32,
+    /// Section characteristics (PE32 section-table `Characteristics` field).
+    /// Use [`Section::is_executable`] / [`Section::is_code`] to test the
+    /// relevant flags without remembering the bit constants.
+    pub characteristics: u32,
+}
+
+/// Standard PE32 section characteristics. Kept here so callers don't have
+/// to memorize the bit values.
+pub mod section_flags {
+    /// 0x00000020 — section contains executable code (CNT_CODE).
+    pub const CODE: u32 = 0x0000_0020;
+    /// 0x02000000 — section can be discarded after load (.reloc, .debug).
+    pub const DISCARDABLE: u32 = 0x0200_0000;
+    /// 0x20000000 — section is executable (CNT_CODE in MEM_EXECUTE form).
+    pub const EXECUTE: u32 = 0x2000_0000;
+    /// 0x40000000 — section is readable.
+    pub const READ: u32 = 0x4000_0000;
+    /// 0x80000000 — section is writable (.data, .bss).
+    pub const WRITE: u32 = 0x8000_0000;
+}
+
+impl Section {
+    /// True if the section contains executable code (`.text`).
+    /// Code sections carry either `MEM_EXECUTE` or `CNT_CODE` (typically both).
+    pub fn is_executable(&self) -> bool {
+        self.characteristics & (section_flags::EXECUTE | section_flags::CODE) != 0
+    }
 }
 
 fn u16(d: &[u8], o: usize) -> u16 {
@@ -69,6 +96,7 @@ impl Pe {
                 virtual_address: u32(&data, s + 12),
                 raw_size: u32(&data, s + 16),
                 raw_offset: u32(&data, s + 20),
+                characteristics: u32(&data, s + 36),
             });
         }
         Ok(Pe {
@@ -111,8 +139,17 @@ impl Pe {
     }
 
     pub fn is_executable_va(&self, va: u64) -> bool {
-        // .text is the only code section here; treat "has a section + readable
-        // bytes" as the in-image test the disassembler needs.
+        // A VA is "decodeable" iff it lies inside some section that has
+        // readable bytes on disk. The PE32 `Characteristics` flags are
+        // available via [`Section::is_executable`] for callers that
+        // want the stricter check (e.g. to skip `.rdata` when enumerating
+        // functions), but the disassembler's own gate stays permissive:
+        // any section with bytes here is fair game, mirroring the
+        // pre-flag-based behavior so synthetic / oddball PEs without
+        // characteristic flags still decode. The OS loader rounds
+        // sections to page granularity regardless, so a `CALL [0xABCD]`
+        // into `.text` from inside `.text` works at runtime whether the
+        // section is flagged executable or not.
         self.section_of(va).is_some()
     }
 

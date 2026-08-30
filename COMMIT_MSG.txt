@@ -1,0 +1,42 @@
+Add --list/--count/--summary/--json to callgraph_verify CLI; expose
+PE32 section characteristics on Pe::Section
+
+The CLI gains four enumeration modes that walk every executable
+section of a PE and report analyzable function entries. Useful for
+"how many functions does this binary have?" and per-function stats
+without writing a separate enumeration tool each time. Example:
+
+    callgraph_verify <exe> --count        # just the total
+    callgraph_verify <exe> --list          # one line per entry: VA,
+                                          # extent, direct calls, ...
+    callgraph_verify <exe> --summary       # aggregate stats
+    callgraph_verify <exe> --json          # machine-readable
+    callgraph_verify <exe> --list --max 50 # cap the output
+
+The walker uses `analyze()`'s `max_end` to advance past each function
+so the next successful decode is a NEW function entry, not the middle
+of the one we just visited. Sections are filtered via
+`Section::is_executable()` (the new `Characteristics` field on `Section`)
+so `.rdata`/`.data`/`.rsrc`/`.reloc` don't generate phantom entries from
+random data bytes that happen to start a valid opcode.
+
+Plumbing:
+- `Pe::Section` now carries the raw PE32 `Characteristics` field
+  (32 bits) and an `is_executable()` predicate covering MEM_EXECUTE
+  (0x20000000) and CNT_CODE (0x00000020). Callers that need the
+  exact bit constants can import `callgraph_verify::section_flags`.
+- `enumerate_functions()` (CLI) skips non-executable sections, so the
+  per-binary function count reflects the actual `.text` content.
+- `Pe::is_executable_va` is intentionally unchanged — it stays
+  permissive ("any section with bytes here") so synthetic / oddball
+  PEs without characteristic flags still decode. The OS loader rounds
+  sections to page granularity regardless.
+- The integration test extracts `ensure_test_binary_built()` from
+  `get_test_binary_path()` so future tests can build the test-bin
+  without re-implementing the cargo invocation.
+
+The test-bin/.cargo/config.toml drops its `[build] target =
+"i686-pc-windows-gnu"]` (the gnu target's rustflags were leaking into
+msvc builds via the integration test's explicit --target override).
+
+Tests: 38 integration + 34 macro-lib unit = 72 passing.
