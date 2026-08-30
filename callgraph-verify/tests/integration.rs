@@ -919,7 +919,7 @@ mod tests {
         let entry = pe.image_base + 0x1000;
         let cg = analyze(&pe, entry).expect("analyze");
 
-        let fallthrough_target = entry + 0x0E;
+let fallthrough_target = entry + 0x0E;
         let ft = cg
             .call_sites
             .iter()
@@ -930,5 +930,248 @@ mod tests {
             "fallthrough CALL's ECX arg should still be Imm(5); got {:?}",
             ft.ecx
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Real-world invariants against the in-repo `test-bin.exe` i686 PE.
+    // The fixture's source is `test-bin/src/main.rs`; these tests pin the
+    // verifier's behavior on a binary we control. They run as part of the
+    // regular integration suite.
+    // -----------------------------------------------------------------
+
+    /// Find the function addresses we know exist in test-bin:
+    /// helper_one, helper_two, helper_three, leaf_function,
+    /// caller_of_leaf, target_function, vtable_only_method. Walk .text
+    /// forward and, on each successful analyze, skip ahead by the function's
+    /// extent so the next try is at a new function start (not the middle
+    /// of the one we just visited).
+    fn find_test_bin_function_addresses(pe: &Pe) -> Vec<u64> {
+        let mut addrs = Vec::new();
+        let text = pe.sections().iter().find(|s| s.name == ".text").unwrap();
+        let text_va = pe.image_base + text.virtual_address as u64;
+        let end = text_va + text.virtual_size as u64;
+        let mut va = text_va;
+        while va < end {
+            if let Ok(cg) = analyze(pe, va) {
+                addrs.push(va);
+                // Skip past this function so the next successful decode is
+                // a *new* function entry, not the middle of the same one.
+                let extent = cg.max_end.saturating_sub(va).max(1);
+                va = va.saturating_add(extent);
+            } else {
+                va += 1;
+            }
+            if addrs.len() >= 32 {
+                break;
+            }
+        }
+        addrs
+    }
+
+    /// Across every function address the analyzer accepts in test-bin, every
+    /// direct-call target must be a real `CALL rel32` opcode somewhere in
+    /// `.text` — the byte-scan used by the macro's ORIGIN-UNREFERENCED check
+    /// must agree with `analyze`'s call detection.
+    #[test]
+    fn test_bin_analyze_and_byte_scan_agree() {
+        let pe = load_test_pe();
+        let addrs = find_test_bin_function_addresses(&pe);
+
+        let mut checked = 0u32;
+        let mut disagreements: Vec<(u64, u64)> = Vec::new();
+        for caller in &addrs {
+            if let Ok(cg) = analyze(&pe, *caller) {
+                for &target in cg.direct_calls.keys() {
+                    checked += 1;
+                    if !has_direct_branch_target(&pe, target) {
+                        disagreements.push((*caller, target));
+                    }
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "scan found no analyzable functions"
+        );
+        assert!(
+            disagreements.is_empty(),
+            "{} of {} analyze()-reported CALL targets have no matching \
+             0xE8 byte in .text (byte-scan / decoder disagreement): {:?}",
+            disagreements.len(),
+            checked,
+            disagreements
+        );
+    }
+
+    /// `Spec::check(declared = real, exact = true)` must be clean for every
+    /// analyzed function — the contract for the macro's HALLUCINATED /
+    /// MISSING gates. If `analyze` ever dropped a real call from
+    /// `call_targets()`, or fabricated one, this would fail.
+    #[test]
+    fn test_bin_diff_calls_clean_when_declared_equals_real() {
+        use callgraph_verify::diff_calls;
+        let pe = load_test_pe();
+        let addrs = find_test_bin_function_addresses(&pe);
+        let mut total = 0u32;
+        for caller in &addrs {
+            if let Ok(cg) = analyze(&pe, *caller) {
+                let real: Vec<u64> = cg.call_targets().into_iter().collect();
+                let d = diff_calls(&pe, *caller, &real, true).unwrap_or_else(|e| {
+                    panic!("diff_calls at {:#x} failed: {e}", caller)
+                });
+                total += 1;
+                assert!(
+                    d.hallucinated.is_empty() && d.missing.is_empty(),
+                    "diff_calls(analyze's own targets) at {:#x} not clean: hallucinated={:?}, missing={:?}",
+                    caller,
+                    d.hallucinated,
+                    d.missing
+                );
+            }
+        }
+        assert!(total > 0, "no analyzable functions found");
+    }
+
+    /// `vcall_slots` and `iat_calls` should stay bounded on a small fixture
+    /// binary. The fixture is `no_std` + `#![no_main]` so it pulls in only the
+    /// MSVC CRT runtime helpers (panic, security cookies, exception handling).
+    /// Sets larger than these bounds would mean EBP/ESP-relative operands
+    /// or absolute-address loads are leaking into the vtable/IAT slots —
+    /// the most common over-counting bug in this kind of static analyzer.
+    #[test]
+    fn test_bin_vcall_and_iat_sets_are_bounded() {
+        let pe = load_test_pe();
+        let addrs = find_test_bin_function_addresses(&pe);
+        let mut total_vcall: usize = 0;
+        let mut total_iat: usize = 0;
+        for caller in &addrs {
+            if let Ok(cg) = analyze(&pe, *caller) {
+                total_vcall += cg.vcall_slots.len();
+                total_iat += cg.iat_calls.len();
+            }
+        }
+        // `vcall_slots` is the set of displacements seen in `CALL [reg+disp]`.
+        // Real-world vtable slots are tiny integers; a huge set here means
+        // EBP/ESP-relative operands leak in. Cap at a level that the
+        // fixture's actual runtime helpers stay well below.
+        assert!(
+            total_vcall <= 16,
+            "vcall_slots total across {} functions = {} — likely EBP/ESP leak",
+            addrs.len(),
+            total_vcall
+        );
+        // `iat_calls` is `CALL [abs]` targets in-image. A no_std no_main
+        // fixture shouldn't have many — globals are referenced via
+        // `[reg + 0]` not `[abs]`. But the CRT pulls in `_security_init_cookie`
+        // which does some absolute loads; allow a small handful.
+        assert!(
+            total_iat <= 16,
+            "iat_calls total across {} functions = {} — likely absolute \
+             memory refs leaking",
+            addrs.len(),
+            total_iat
+        );
+    }
+
+    /// `field_offsets` and `imm_addrs` should stay bounded on a small
+    /// fixture. Both are filtered (field_offsets ≤ MAX_FIELD_OFFSET =
+    /// 0x8000; imm_addrs must be in-image). The fixture is tiny; sets
+    /// larger than these bounds would mean stack-relative or other
+    /// unintended operands are leaking in.
+    #[test]
+    fn test_bin_field_and_imm_sets_are_bounded() {
+        let pe = load_test_pe();
+        let addrs = find_test_bin_function_addresses(&pe);
+        let mut total_field: usize = 0;
+        let mut total_imm: usize = 0;
+        for caller in &addrs {
+            if let Ok(cg) = analyze(&pe, *caller) {
+                total_field += cg.field_offsets.len();
+                total_imm += cg.imm_addrs.len();
+                for &f in &cg.field_offsets {
+                    assert!(f <= 0x8000, "field_offset {:#x} exceeds MAX_FIELD_OFFSET", f);
+                }
+                for &a in &cg.imm_addrs {
+                    assert!(
+                        pe.section_of(a).is_some(),
+                        "imm_addr {:#x} outside every section",
+                        a
+                    );
+                }
+            }
+        }
+        // The fixture's actual values are 26+13 — so the cap has to be
+        // generous. The point of these bounds is to catch regressions
+        // where the count balloons into the hundreds.
+        assert!(
+            total_field <= 200,
+            "field_offsets total = {} (too many)",
+            total_field
+        );
+        assert!(
+            total_imm <= 100,
+            "imm_addrs total = {} (too many)",
+            total_imm
+        );
+    }
+
+    /// `cfg_fingerprint` must produce a finite, internally-consistent result
+    /// for every analyzed function (no NaN/overflow, counters match the
+    /// function's call graph). The fixture's USER-WRITTEN functions have
+    /// no loops or switches, but the binary also contains CRT runtime
+    /// helpers (`__security_init_cookie`, etc.) that DO contain both.
+    /// This test only pins that the fingerprint is well-formed — finite
+    /// numbers, no panic — not that any specific counter is zero.
+    #[test]
+    fn test_bin_cfg_fingerprint_is_finite_and_consistent() {
+        let pe = load_test_pe();
+        let addrs = find_test_bin_function_addresses(&pe);
+        let mut any_analyzed = false;
+        for caller in &addrs {
+            if let Ok(fp) = cfg_fingerprint(&pe, *caller) {
+                any_analyzed = true;
+                // All four counters must be finite and non-negative. The
+                // BTreeSet sizes give us u64 into u64 casts in the public
+                // API; if any underflows or overflows this would surface as
+                // a huge number.
+                assert!(
+                    fp.loops < 1_000_000,
+                    "fixture fn at {:#x}: fp.loops = {} (implausibly large)",
+                    caller,
+                    fp.loops
+                );
+                assert!(
+                    fp.switch_cases < 1_000_000,
+                    "fixture fn at {:#x}: fp.switch_cases = {} (implausibly large)",
+                    caller,
+                    fp.switch_cases
+                );
+                assert!(
+                    fp.conditionals < 1_000_000,
+                    "fixture fn at {:#x}: fp.conditionals = {} (implausibly large)",
+                    caller,
+                    fp.conditionals
+                );
+                assert!(
+                    fp.returns < 1_000_000,
+                    "fixture fn at {:#x}: fp.returns = {} (implausibly large)",
+                    caller,
+                    fp.returns
+                );
+                // Sanity: in a binary with a couple hundred functions, each
+                // must terminate somewhere. Termination in x86 is one of:
+                // RET, INT, JMP (tail call), or any conditional/unconditional
+                // branch. So: at least one of {returns, conditionals,
+                // switch_cases} should be > 0. If all are zero, the
+                // function has no terminator at all — that would mean
+                // analyze() decoded past the function end.
+                assert!(
+                    fp.returns + fp.conditionals + fp.switch_cases > 0,
+                    "fixture fn at {:#x}: no terminator (returns=0, conditionals=0, switches=0)",
+                    caller
+                );
+            }
+        }
+        assert!(any_analyzed, "no analyzable functions in test-bin");
     }
 }

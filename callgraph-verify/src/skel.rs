@@ -114,9 +114,19 @@ pub fn cfg_fingerprint(pe: &Pe, entry: u64) -> Result<CfgFingerprint, String> {
         };
         loop {
             let instr = instrs[&addrs[idx]];
+            // A terminator ends the basic block. IndirectCall is NOT one: the
+            // callee returns and execution continues at the next IP (the call
+            // is "synchronous" from a CFG perspective). Counting IndirectCall
+            // as a terminator used to make functions that consist of a few
+            // indirect calls followed by a RET (e.g. CRT thunks that fan-out
+            // via the IAT) report zero terminators — a regression in the
+            // "any terminator at all?" check used by the macro's CFG diff.
             let is_term = !matches!(
                 instr.flow_control(),
-                FlowControl::Next | FlowControl::Call | FlowControl::XbeginXabortXend
+                FlowControl::Next
+                    | FlowControl::Call
+                    | FlowControl::IndirectCall
+                    | FlowControl::XbeginXabortXend
             );
             if is_term {
                 match instr.flow_control() {
@@ -131,6 +141,17 @@ pub fn cfg_fingerprint(pe: &Pe, entry: u64) -> Result<CfgFingerprint, String> {
                         let t = instr.near_branch_target();
                         if t <= ld && leaders.contains(&t) {
                             fp.loops += 1;
+                        } else {
+                            // Out-of-function JMP — a tail call (the callee
+                            // will RET for us). Count it as a return-equivalent
+                            // so functions that consist entirely of tail calls
+                            // (e.g. `return foo();` after inlining) aren't
+                            // reported as terminator-less. The macro's CFG
+                            // check keys off "any terminator at all"; missing
+                            // tail-call JMPs would let it fire false positives
+                            // for legitimate delegation. (BUG: tail-call JMP
+                            // didn't contribute to any fingerprint counter.)
+                            fp.returns += 1;
                         }
                     }
                     FlowControl::Return | FlowControl::Interrupt => fp.returns += 1,
