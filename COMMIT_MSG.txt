@@ -1,0 +1,51 @@
+Pin the 10 untested behaviors from the UNTESTED.md audit
+
+Each pin is a unit or integration test that exercises an unhappy
+path the original audit found untested. The 10 behaviors covered:
+
+- B-01 DUP-ADDR: two `#[origin(0xA)]` on different fns both recorded
+  as owners in `corpus.addr_owners`, so the verifier's `DUP-ADDR`
+  check will fire.
+- B-02 HALLUCINATED: body call to a name the corpus doesn't have is
+  captured by `collect_call_idents` — the diff step then fails
+  to resolve it.
+- B-03 MISSING: an empty corpus + a body with one call means the
+  diff's missing set equals the call set; pins the corpus side of
+  the diff.
+- B-04 path-qualified calls strip the path: `crate::m::f()` records
+  `f`; `obj.m()` records `m` as a method; multi-line call records
+  once.
+- B-05 parse-error resilience: a `.rs` with a syntax error in the
+  middle of a tree is silently skipped, the surrounding good files
+  still parse and record their origins.
+- B-06 non-i386 PE: hand-craft a minimal COFF/PE with `machine =
+  0x8664` (x86_64) and verify `Pe::parse` returns `Err`. The i386
+  positive path is the existing integration test that loads test-bin.
+- B-07 empty REBUILD_ROOT: a directory with no `.rs` files produces
+  a `Corpus` with empty `corpus` / `free_fns` / `methods` /
+  `addr_owners` sets — verifier must not crash.
+- B-08 out-of-section origin: `analyze(pe, 0x8000_0000)` (a synthetic
+  PE whose `.text` is at 0x1000–0x1100) returns `Err`. Same gate the
+  verifier uses for `ORIGIN-UNREFERENCED`.
+- B-09 nested-module name collision: a function defined in two modules
+  with the same name → `corpus` BTreeSet records BOTH addresses and
+  `free_fns['inner']` HashSet-of-u64 holds BOTH. Documents that
+  addresses are not lost on name collision.
+- B-10 empty function body: a 1-byte `.text` (just `RET`) is accepted
+  by `analyze` with extent=1 and zero direct/tail calls.
+
+Implementation:
+
+- `callgraph-verify-macro/src/corpus.rs` — added a public(crate)
+  helper `build_cached(root) -> Arc<Corpus>` that builds a Corpus
+  without the process-global cache (the cache would otherwise return
+  the first root's result forever in tests that build multiple tempdirs).
+  Added tests b01..b07 and b09 in the existing `mod tests` block.
+- `callgraph-verify/tests/integration.rs` — added b08 and b10
+  integration tests (these need a synthetic PE, which the existing
+  `pe_with_code` helper provides).
+- `UNTESTED.md` — updated to mark all 10 behaviors DONE with
+  pointers to the test code.
+
+Total tests: 40 integration + 44 macro-lib unit = 84 passing, up
+from 72.

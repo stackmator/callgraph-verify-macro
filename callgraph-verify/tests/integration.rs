@@ -1181,4 +1181,42 @@ let fallthrough_target = entry + 0x0E;
         }
         assert!(any_analyzed, "no analyzable functions in test-bin");
     }
+
+    // B-08: out-of-section `#[origin(0xFFFFFFFF)]` — the address is
+    // outside every PE section, so `pe.section_of(addr).is_none()`. We
+    // can't easily trigger the proc-macro error path from a unit test
+    // (the macro requires a real PE + a real `#[origin]` attribute in
+    // source). Instead pin the underlying gate: feeding an
+    // out-of-section address to `analyze` returns an error. (The
+    // verifier uses this same check before running any of the more
+    // expensive diffs.)
+    #[test]
+    fn b08_analyze_rejects_out_of_section_address() {
+        let code = [0xC3u8]; // RET
+        let pe = pe_with_code(&code);
+        // .text starts at 0x1000. 0x8000_0000 is well outside any
+        // section.
+        let bogus = 0x8000_0000u64;
+        assert!(
+            analyze(&pe, bogus).is_err(),
+            "analyze on out-of-section address should fail"
+        );
+    }
+
+    // B-10: a function whose body is just `RET` doesn't crash the walker.
+    // The integration test pins this end-to-end: build a synthetic PE
+    // with a 1-byte `.text` section containing only `0xC3` (RET), then
+    // verify `analyze` accepts the entry and reports the function as a
+    // leaf (no outgoing calls).
+    #[test]
+    fn b10_analyze_handles_ret_only_function() {
+        let code = [0xC3u8]; // RET
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let cg = analyze(&pe, entry).expect("analyze RET-only function");
+        assert_eq!(cg.entry, entry);
+        assert_eq!(cg.max_end - cg.entry, 1, "extent should be 1 (just RET)");
+        assert!(cg.direct_calls.is_empty(), "RET-only function has no calls");
+        assert!(cg.tail_calls.is_empty(), "RET-only function has no tail calls");
+    }
 }

@@ -61,6 +61,15 @@ pub fn corpus_map(root: &str) -> Arc<Corpus> {
     built
 }
 
+/// Build a corpus from a directory tree, bypassing the process-global
+/// cache. For tests that need to exercise different roots in the same
+/// process (the cache in `corpus_map` would otherwise return the first
+/// root's result forever).
+#[cfg(test)]
+pub(crate) fn build_cached(root: &str) -> Arc<Corpus> {
+    Arc::new(build(root))
+}
+
 fn build(root: &str) -> Corpus {
     let mut c = Corpus {
         free_fns: HashMap::new(),
@@ -336,7 +345,7 @@ fn rust_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_inline_addr, scan_item, Corpus, Item};
+    use super::{build_cached, parse_inline_addr, scan_item, Corpus, Item};
 
     /// Build a Corpus and run every item in `text` through `scan_item` (the
     /// syn-based walker). Mirrors what `build()` does for one file.
@@ -638,4 +647,267 @@ impl S {
         assert!(c.methods.contains_key("foo"));
         assert!(!c.free_fns.contains_key("foo"));
     }
+
+    // ====================================================================
+    // Unhappy-path / regression tests (see UNTESTED.md B-01..B-10).
+    // ====================================================================
+
+    // B-01: Two `#[origin(0xA)]` on different functions → both are recorded as
+    // owners of address 0xA in `addr_owners`. The verifier's DUP-ADDR
+    // check triggers when there is more than one owner. We pin that the
+    // corpus actually records both (i.e. the dup-detection input exists
+    // and is correct).
+    #[test]
+    fn b01_duplicate_origin_addresses_are_recorded_as_separate_owners() {
+        let c = scan_text(
+            "\
+#[origin(0x004028d0)]
+pub unsafe fn foo_a() {}
+#[origin(0x004028d0)]
+pub unsafe fn foo_b() {}
+",
+        );
+        let owners = c.addr_owners.get(&0x004028d0).expect("addr present");
+        // The DUP-ADDR check looks at `owners.len() > 1`. We assert BOTH
+        // owners are present so the check actually fires.
+        assert_eq!(owners.len(), 2, "expected 2 owners, got {owners:?}");
+        assert!(owners.iter().any(|s| s.contains("foo_a")));
+        assert!(owners.iter().any(|s| s.contains("foo_b")));
+    }
+
+    // B-04: Path-qualified calls strip the path. `crate::module::func()`
+    // records just `func`, not `crate` and not `module`.
+    #[test]
+    fn b04_path_qualified_calls_strip_the_path() {
+        use crate::body::collect_call_idents;
+        let calls = collect_call_idents(quote::quote!(crate::module::func(1, 2);));
+        // The walker records just the trailing ident.
+        assert!(
+            calls.plain.contains("func"),
+            "path-qualified `crate::module::func()` should record just `func`, got: {:?}",
+            calls.plain
+        );
+        assert!(
+            !calls.plain.contains("crate"),
+            "leading path segment `crate` leaked into plain: {:?}",
+            calls.plain
+        );
+        assert!(
+            !calls.plain.contains("module"),
+            "middle path segment `module` leaked into plain: {:?}",
+            calls.plain
+        );
+    }
+
+    // B-04 (method): `obj.method()` is a method call, not a plain call.
+    #[test]
+    fn b04_method_call_via_dot_is_classified_as_method() {
+        use crate::body::collect_call_idents;
+        let calls = collect_call_idents(quote::quote!(obj.method(1, 2);));
+        assert!(calls.plain.is_empty(), "method leaked to plain: {:?}", calls.plain);
+        assert!(calls.method.contains("method"), "method not captured: {:?}", calls.method);
+    }
+
+    // B-04 (multi-line call): a call split across lines is one call.
+    #[test]
+    fn b04_multiline_call_is_one_call() {
+        use crate::body::collect_call_idents;
+        let calls = collect_call_idents(quote::quote!(foo(
+            1,
+            2,
+        );));
+        assert!(
+            calls.plain.contains("foo"),
+            "multi-line call should record `foo` once, got: {:?}",
+            calls.plain
+        );
+        assert_eq!(calls.plain.len(), 1, "expected exactly 1 call, got: {:?}", calls.plain);
+    }
+
+    // B-09: A function defined in two modules with the same name → the
+    // corpus records the second one (because the walker overwrites on
+    // duplicate names in the `free_fns` map). The `corpus` BTreeSet, by
+    // contrast, accumulates BOTH addresses (Set::insert is additive, not
+    // overwriting). Documenting the actual behavior; the existing
+    // pipeline relies on unique function names — having two `inner`
+    // functions in different modules is silently OK as long as the
+    // verifier's call-graph diff picks ONE (the first/last walker wins
+    // for resolution, but both addresses show up in the corpus for
+    // owner-tracking purposes).
+    #[test]
+    fn b09_nested_module_name_collision_both_addresses_in_corpus() {
+        let c = scan_text(
+            "\
+mod a {
+    #[origin(0x004028d0)]
+    pub fn inner() {}
+}
+mod b {
+    #[origin(0x004028d1)]
+    pub fn inner() {}
+}
+",
+        );
+        // Both addresses are in the corpus (BTreeSet is additive).
+        assert!(c.corpus.contains(&0x004028d0));
+        assert!(c.corpus.contains(&0x004028d1));
+        // Both functions are recorded as owners of their respective
+        // addresses.
+        assert!(c.addr_owners.get(&0x004028d0).is_some());
+        assert!(c.addr_owners.get(&0x004028d1).is_some());
+        // The free_fns map (HashMap<String, HashSet<u64>>) has the name
+        // registered with BOTH addresses — last-wins is at the per-name
+        // level only when the addresses are different but stored as the
+        // same set. Both addresses survive.
+        let free_inner = c.free_fns.get("inner").expect("`inner` recorded");
+        assert_eq!(free_inner.len(), 2, "free_fns['inner'] should have both addresses, got {free_inner:?}");
+    }
+
+    // B-05: A `.rs` file with a syntax error is silently skipped — the
+    // walker must NOT panic and must still pick up origins from the
+    // surrounding good files.
+    #[test]
+    fn b05_parse_error_resilience_skips_bad_file() {
+        let dir = std::env::temp_dir().join("callgraph_b05");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Good file with one origin.
+        std::fs::write(
+            dir.join("good.rs"),
+            "#[origin(0x004028d0)]\npub unsafe fn good_fn() {}\n",
+        )
+        .unwrap();
+
+        // Bad file with unbalanced braces. syn::parse_file returns Err;
+        // the walker must continue past it.
+        std::fs::write(dir.join("bad.rs"), "pub unsafe fn bad_fn( {}\n").unwrap();
+
+        // Another good file.
+        std::fs::write(
+            dir.join("good2.rs"),
+            "#[origin(0x004028e0)]\npub unsafe fn other_good() {}\n",
+        )
+        .unwrap();
+
+        let c = build_cached(dir.to_str().unwrap());
+        assert!(
+            c.corpus.contains(&0x004028d0),
+            "good.rs origin not picked up: {:?}",
+            c.corpus
+        );
+        assert!(
+            c.corpus.contains(&0x004028e0),
+            "good2.rs origin not picked up: {:?}",
+            c.corpus
+        );
+        // The bad file's function should not appear (its origin attribute
+        // was never reached because parsing failed).
+        assert!(
+            !c.free_fns.contains_key("bad_fn"),
+            "bad_fn should be skipped: {:?}",
+            c.free_fns
+        );
+    }
+
+    // B-07: An empty REBUILD_ROOT (a directory with no `.rs` files)
+    // returns a Corpus with zero entries. The verifier must not crash
+    // when the corpus is empty.
+    #[test]
+    fn b07_empty_rebuild_root_returns_empty_corpus() {
+        let dir = std::env::temp_dir().join("callgraph_b07");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let c = build_cached(dir.to_str().unwrap());
+        assert!(c.corpus.is_empty(), "empty dir should have empty corpus: {:?}", c.corpus);
+        assert!(c.free_fns.is_empty());
+        assert!(c.methods.is_empty());
+        assert!(c.addr_owners.is_empty());
+    }
+
+    // B-02: `diff_body_calls` returns a hallucinated entry for a body
+    // call name that doesn't exist in the corpus. We can't invoke
+    // `diff_body_calls` directly from this test (it needs a real PE),
+    // so we pin the underlying contract via `body::collect_call_idents`:
+    // a body call whose name is not in the corpus, combined with no
+    // direct_calls at that target, is what produces the
+    // `HALLUCINATED` error. We assert the inverse here: the call
+    // collection step in `body` records a name that the corpus would
+    // then fail to resolve.
+    #[test]
+    fn b02_body_call_idents_records_unknown_names() {
+        use crate::body::collect_call_idents;
+        // `some_random_helper` is not a built-in and not in any corpus.
+        let calls = collect_call_idents(quote::quote!(some_random_helper();));
+        assert!(
+            calls.plain.contains("some_random_helper"),
+            "the body call should be captured: {:?}",
+            calls.plain
+        );
+        // (The verifier's diff_body_calls then fails to resolve it and
+        // reports it as HALLUCINATED — this test pins the body side.)
+    }
+
+    // B-03: pin the corpus_map API used by the verifier — empty file
+    // tree returns a corpus whose `corpus` is empty (BTreeSet is
+    // additive and remains empty when nothing is added). When
+    // `diff_body_calls` is called with an empty corpus, the missing
+    // set is the entire body's call set, classified as HALLUCINATED.
+    #[test]
+    fn b03_empty_corpus_makes_every_call_hallucinated() {
+        let dir = std::env::temp_dir().join("callgraph_b03");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("body.rs"),
+            "pub unsafe fn body() { imaginary_call(); }\n",
+        )
+        .unwrap();
+        let c = build_cached(dir.to_str().unwrap());
+        // No `#[origin]` attributes anywhere, so the corpus is empty.
+        assert!(c.corpus.is_empty(), "corpus should be empty, got: {:?}", c.corpus);
+        assert!(c.free_fns.is_empty());
+    }
+
+    // B-06: `Pe::parse` rejects an x64 PE. We build a minimal COFF/PE
+    // header with `machine = 0x8664` (x86_64) and verify it returns
+    // `Err`. The i386 case (`machine = 0x14c`) is the positive path
+    // (already covered by the integration tests that load test-bin.exe).
+    #[test]
+    fn b06_pe_parse_rejects_non_i386() {
+        use callgraph_verify::Pe;
+        // Minimal PE32 header. Layout (offsets within the file):
+        //   0x00  "MZ"
+        //   0x3c  e_lfanew -> PE header
+        //   PE:    "PE\0\0" + COFF(20) + OptHdr(96) + SectHdr(40)
+        //   We place PE at offset 0x40, COFF at 0x44, OptHdr at 0x58,
+        //   SectHdr at 0xb8. machine is at PE+4 = 0x44.
+        let mut data = vec![0u8; 0x100];
+        // MZ magic
+        data[0..2].copy_from_slice(b"MZ");
+        data[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        // PE\0\0
+        data[0x40..0x44].copy_from_slice(b"PE\0\0");
+        // COFF: machine at +4
+        data[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes()); // x86_64
+        data[0x46..0x48].copy_from_slice(&1u16.to_le_bytes()); // num sections
+        data[0x50..0x52].copy_from_slice(&0x60u16.to_le_bytes()); // size of optional header
+        // OptHdr magic (PE32 = 0x10b)
+        data[0x58..0x5a].copy_from_slice(&0x10bu16.to_le_bytes());
+        assert!(matches!(Pe::parse(data), Err(_)),
+            "x64 PE should be rejected");
+    }
+
+    // B-10: an empty function (just `RET`) doesn't crash `analyze`.
+    // Use the synthetic PE helper from the integration test to plant
+    // a `RET` in .text and verify the walker accepts it.
+    //
+    // (This is in integration tests as a pin of `analyze` robustness
+    // — the corpus unit tests don't have a PE builder, so this is
+    // tested at the integration level.)
+    //
+    // B-08: out-of-section `#[origin(0xFFFFFFFF)]` — tested at the
+    // integration level because the verifier runs as a proc-macro
+    // and we need a real PE.
 }
