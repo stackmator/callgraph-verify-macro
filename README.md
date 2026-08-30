@@ -29,16 +29,19 @@ TARGET_EXE = "C:/path/to/target.exe"
 REBUILD_ROOT = "C:/path/to/rebuild/source"
 ```
 
-Optional strictness flags (off by default):
+Required environment (set in `.cargo/config.toml` `[env]`):
 
 ```toml
 [env]
-STRICT_OPERANDS = "1"  # diff in-image address literals (globals, vtables, RTTI, fn ptrs)
-STRICT_ARGS = "1"      # per-call-site concrete arg-kind diff (immediate/field/global)
-STRICT_CFG = "1"       # coarse CFG fingerprint diff (loops, switches, branching)
-STRICT_MISSING = "1"   # make MISSING calls fatal (default: non-fatal)
-DUP_STRICT = "1"       # one Rust fn per binary address (compile-time dup-addr gate)
+TARGET_EXE = "C:/path/to/target.exe"   # the binary to verify against
+REBUILD_ROOT = "C:/path/to/rebuild"     # rebuild source root for the corpus scan
 ```
+
+Strict checks (`DUP-ADDR`, `MISSING`, `ARG-SHAPE`, `HALLUCINATED-ADDR`, `CFG`)
+are always on. Earlier versions had `STRICT_*=0` / `DUP_STRICT=0` escape
+hatches — those are removed. AI agents were flipping them off to silence
+build failures; the macro is a strict gate, not a configurable knob. If a
+check is wrong, fix the check.
 
 ### 2. Annotate a rebuild function
 

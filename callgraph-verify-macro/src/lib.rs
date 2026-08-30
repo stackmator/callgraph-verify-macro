@@ -21,29 +21,14 @@
 //!   * `TARGET_EXE`     — path to the binary (absent → macro is a no-op)
 //!   * `REBUILD_ROOT`   — rebuild source root for the corpus scan (absent →
 //!     the body-diff is skipped; explicit `calls=`/`fields=` checks still run)
-//!   * `STRICT_OPERANDS` — ON by default: diff the in-image ADDRESS literals
-//!     the body bakes in (globals, RTTI typedescs, vtable VAs, fn pointers)
-//!     against the binary's referenced-address set. A body address the
-//!     binary never touches → `HALLUCINATED-ADDR`. Set to `0` to disable
-//!     (the rebuild reads some globals directly that the original reaches
-//!     through an accessor, so it can false-positive tree-wide).
-//!   * `STRICT_ARGS`    — ON by default: per call site, diff the CONCRETE
-//!     argument kinds the body passes (immediate / field-load / global)
-//!     positionally against the binary's recovered call-site args → `ARG-SHAPE`.
-//!     Catches wrong constants / field offsets / globals / reordering.
-//!     Set to `0` to disable — false positives to triage: ICF-folded stubs
-//!     (one address, heterogeneous callers) and convention-ambiguous free calls.
-//!   * `STRICT_MISSING` — ON by default: make `MISSING` (binary calls something
-//!     the body doesn't) fatal. Often a faithful inline, but for catching AI
-//!     digression this is the stricter gate. Set to `0` to make non-fatal.
-//!   * `DUP_STRICT`     — ON by default: a binary fn may be implemented by
-//!     exactly ONE Rust fn. Multiple `#[origin]` claims on the same address
-//!     are fatal at compile time. Set to `0` to disable.
-//!   * `STRICT_CFG`     — opt-in: coarse control-flow fingerprint diff →
-//!     `CFG`. Flags a body that omits a loop the binary has, omits a
-//!     many-case jump-table switch, or is straight-line where the binary
-//!     branches heavily. Tolerant + DIAGNOSTIC (unrolling / switch-as-if-chain
-//!     / inlining cause noise); OFF by default.
+//!
+//! Strict checks (`DUP-ADDR`, `MISSING`, `ARG-SHAPE`, `HALLUCINATED-ADDR`,
+//! `CFG`) are always on. There used to be `DUP_STRICT=0`,
+//! `STRICT_MISSING=0`, `STRICT_ARGS=0`, `STRICT_OPERANDS=0`, and
+//! `STRICT_CFG=1` escape hatches, but AI agents were flipping them off
+//! to silence build failures. Removed: if a check is wrong, fix the
+//! check, don't add a backdoor. The macro is a strict gate, not a
+//! configurable knob.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -387,17 +372,6 @@ fn arg_shape_check(
     }
 }
 
-/// Read a strictness flag from the environment. Returns `default` if unset,
-/// returns `false` if set to "0" / "false" / "no" / "off" (case-insensitive),
-/// otherwise `true`. Lets strict gates be flipped OFF explicitly without
-/// requiring the variable to be set for the strict path.
-fn env_flag(name: &str, default: bool) -> bool {
-    match std::env::var(name).ok().as_deref() {
-        None => default,
-        Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off" | ""),
-    }
-}
-
 fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as Args);
     // Walk the function BODY only (skip leading attributes and the
@@ -473,21 +447,22 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     if let Ok(root) = std::env::var("REBUILD_ROOT") {
         let map = corpus::corpus_map(&root);
 
-        // Duplicate-origin check (ON by default via DUP_STRICT): a binary fn may be
-        // implemented by exactly ONE Rust fn. Mirrors `check_origins.py`'s dup-addr
-        // gate, but at compile time and pointed straight at the offending attribute.
-        // Set DUP_STRICT=0 to allow dups (use during bulk-port before burndown).
-        if env_flag("DUP_STRICT", true) {
-            if let Some(owners) = map.addr_owners.get(&args.addr) {
-                if owners.len() > 1 {
-                    errors.push(format!(
-                        "DUP-ADDR: origin {:#010x} is claimed by {} Rust fns (only ONE may \
-                         implement a given binary fn):\n      {}",
-                        args.addr,
-                        owners.len(),
-                        owners.join("\n      ")
-                    ));
-                }
+        // Duplicate-origin check (always on, no escape hatch): a binary fn
+        // may be implemented by exactly ONE Rust fn. Mirrors
+        // `check_origins.py`'s dup-addr gate, but at compile time and
+        // pointed straight at the offending attribute. There used to be a
+        // `DUP_STRICT=0` escape hatch, but AI agents were flipping it off
+        // to silence build failures — an unverified build is more
+        // dangerous than a build that won't compile.
+        if let Some(owners) = map.addr_owners.get(&args.addr) {
+            if owners.len() > 1 {
+                errors.push(format!(
+                    "DUP-ADDR: origin {:#010x} is claimed by {} Rust fns (only ONE may \
+                     implement a given binary fn):\n      {}",
+                    args.addr,
+                    owners.len(),
+                    owners.join("\n      ")
+                ));
             }
         }
         // Fold-in: an `inline:` helper is pasted into the binary at the call site, so
@@ -626,124 +601,115 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                         args.addr
                     ));
                 }
-                // MISSING is FATAL by default (set STRICT_MISSING=0 to demote). A MISSING
-                // is often NOT a defect: a call made via method syntax `x.foo()` isn't
-                // resolved yet, the binary call may be a faithful inline, or the rebuild
-                // legitimately routes it elsewhere (e.g. allocation through the single
-                // Rust heap instead of a literal `form_heap_allocate` CALL, CRT/intrinsic
-                // ops like `fmodf`). But for catching AI digression the strict default is
-                // right: an AI regenerating a body and dropping a real call would slip
-                // through as a silent MISSING otherwise. HALLUCINATED is always fatal —
-                // that is the actual invented-code guard. The pure-byte `callgraph_verify`
-                // tool reports the full MISSING worklist.
-                if env_flag("STRICT_MISSING", true) {
-                    for a in &d.missing {
-                        errors.push(format!(
-                            "MISSING: binary calls {} ({a:#010x}) — body doesn't",
-                            map.addr2name.get(a).map(String::as_str).unwrap_or("?")
-                        ));
-                    }
+                // MISSING is always fatal. A MISSING is often NOT a defect: a
+                // call made via method syntax `x.foo()` isn't resolved yet,
+                // the binary call may be a faithful inline, or the rebuild
+                // legitimately routes it elsewhere. But for catching AI
+                // digression the strict default is right: an AI regenerating
+                // a body and dropping a real call would slip through as a
+                // silent MISSING otherwise. HALLUCINATED is always fatal.
+                // There used to be a `STRICT_MISSING=0` escape hatch — same
+                // story as DUP_STRICT: AI flipped it off to silence failures.
+                for a in &d.missing {
+                    errors.push(format!(
+                        "MISSING: binary calls {} ({a:#010x}) — body doesn't",
+                        map.addr2name.get(a).map(String::as_str).unwrap_or("?")
+                    ));
                 }
             }
             Err(e) => errors.push(format!("analyze {:#010x}: {e}", args.addr)),
         }
 
-        // (2b) Argument-shape diff (ON by default via STRICT_ARGS): per call site,
-        // compare the CONCRETE argument kinds the body passes (immediate / field-load /
-        // global) positionally against the binary's recovered call-site args. Catches
-        // wrong constants, wrong field offsets, wrong globals, and reordered args —
-        // what the call-edge check can't see. Conservative: only unambiguous (single)
-        // call sites, only positions concrete on BOTH sides (a register-staged binary
-        // arg reads as `Other` and is skipped). Set STRICT_ARGS=0 to disable — known
-        // false positives: ICF-folded stubs (one address, heterogeneous callers) and
-        // convention-ambiguous free calls.
-        if env_flag("STRICT_ARGS", true) {
-            arg_shape_check(&pe, args.addr, &map, item2.clone(), &mut errors);
-        }
+        // (2b) Argument-shape diff (always on): per call site, compare the
+        // CONCRETE argument kinds the body passes (immediate / field-load
+        // / global) positionally against the binary's recovered call-site
+        // args. Catches wrong constants, wrong field offsets, wrong
+        // globals, and reordered args — what the call-edge check can't
+        // see. Conservative: only unambiguous (single) call sites, only
+        // positions concrete on BOTH sides (a register-staged binary arg
+        // reads as `Other` and is skipped). There used to be a
+        // `STRICT_ARGS=0` escape hatch (ICF-folded stubs, free-call ABI
+        // ambiguity). Same story as DUP_STRICT — if the check is wrong,
+        // fix it.
+        arg_shape_check(&pe, args.addr, &map, item2.clone(), &mut errors);
     }
 
-    // (3) Operand-fact diff (ON by default via STRICT_OPERANDS). Every in-image
-    // ADDRESS literal the body bakes in — a global read `[0x00bXXXXX]`, an RTTI
-    // typedesc / vtable VA / fn pointer pushed as an immediate, or an IAT slot —
-    // must be referenced by the binary at this origin. A body address the binary
-    // never touches is invented. This is the operand analogue of HALLUCINATED: it
-    // catches a wrong global/typedesc/vtable VA, which the call-graph check (call
-    // edges only) can never see.
+    // (3) Operand-fact diff (always on). Every in-image ADDRESS literal
+    // the body bakes in — a global read `[0x00bXXXXX]`, an RTTI typedesc /
+    // vtable VA / fn pointer pushed as an immediate, or an IAT slot —
+    // must be referenced by the binary at this origin. A body address the
+    // binary never touches is invented. This is the operand analogue of
+    // HALLUCINATED: it catches a wrong global/typedesc/vtable VA, which
+    // the call-graph check (call edges only) can never see.
     //
-    // The rebuild legitimately reads some globals DIRECTLY that the original
-    // reaches through an accessor CALL (the same reason MISSING is non-fatal
-    // when STRICT_MISSING=0), so this can false-positive tree-wide. Set
-    // STRICT_OPERANDS=0 to disable. Field OFFSETS are intentionally NOT
-    // auto-checked here: small hex (`0x10`, `0xff`) is indistinguishable from
-    // counts / masks / enum values, so an offset check belongs in an explicit
-    // `fields = [..]` declaration.
-    if env_flag("STRICT_OPERANDS", true) {
-        match analyze(&pe, args.addr) {
-            Ok(cg) => {
-                let mut referenced: std::collections::BTreeSet<u64> =
-                    std::collections::BTreeSet::new();
-                referenced.extend(cg.direct_calls.keys().copied());
-                referenced.extend(&cg.tail_calls);
-                referenced.extend(&cg.globals);
-                referenced.extend(&cg.imm_addrs);
-                referenced.extend(&cg.iat_calls);
-                let mut reported: std::collections::BTreeSet<u64> =
-                    std::collections::BTreeSet::new();
-                for v in body::collect_hex_literals(item2.clone()) {
-                    // Skip the function's own address (recursion / self-reference), dups,
-                    // and any literal that isn't an in-image address (counts, masks, sizes).
-                    if v == args.addr || !reported.insert(v) || pe.section_of(v).is_none() {
-                        continue;
-                    }
-                    if !referenced.contains(&v) {
-                        errors.push(format!(
-                            "HALLUCINATED-ADDR: body bakes in {v:#010x} (inside the image), but \
-                             binary at {:#010x} never references it (not a CALL target, global, \
-                             baked immediate, or IAT slot)",
-                            args.addr
-                        ));
-                    }
+    // Field OFFSETS are intentionally NOT auto-checked here: small hex
+    // (`0x10`, `0xff`) is indistinguishable from counts / masks / enum
+    // values, so an offset check belongs in an explicit `fields = [..]`
+    // declaration.
+    match analyze(&pe, args.addr) {
+        Ok(cg) => {
+            let mut referenced: std::collections::BTreeSet<u64> =
+                std::collections::BTreeSet::new();
+            referenced.extend(cg.direct_calls.keys().copied());
+            referenced.extend(&cg.tail_calls);
+            referenced.extend(&cg.globals);
+            referenced.extend(&cg.imm_addrs);
+            referenced.extend(&cg.iat_calls);
+            let mut reported: std::collections::BTreeSet<u64> =
+                std::collections::BTreeSet::new();
+            for v in body::collect_hex_literals(item2.clone()) {
+                // Skip the function's own address (recursion / self-reference), dups,
+                // and any literal that isn't an in-image address (counts, masks, sizes).
+                if v == args.addr || !reported.insert(v) || pe.section_of(v).is_none() {
+                    continue;
+                }
+                if !referenced.contains(&v) {
+                    errors.push(format!(
+                        "HALLUCINATED-ADDR: body bakes in {v:#010x} (inside the image), but \
+                         binary at {:#010x} never references it (not a CALL target, global, \
+                         baked immediate, or IAT slot)",
+                        args.addr
+                    ));
                 }
             }
-            Err(e) => errors.push(format!("operand check {:#010x}: {e}", args.addr)),
         }
+        Err(e) => errors.push(format!("operand check {:#010x}: {e}", args.addr)),
     }
 
-    // (4) CFG-fingerprint diff (opt-in via STRICT_CFG): catch a port that omits a loop the
-    // binary has, or a jump-table switch, or is straight-line where the binary branches heavily.
-    // COARSE + tolerant — optimized CFGs do not map 1:1 to source, so only gross structural
-    // divergences are flagged. Caveats: loop unrolling, switch lowered to an if-chain, and inlined
-    // helpers can still produce noise — hence opt-in and diagnostic, not a clean always-on gate.
-    if std::env::var_os("STRICT_CFG").is_some() {
-        match cfg_fingerprint(&pe, args.addr) {
-            Ok(fp) => {
-                let r = body::cfg_keyword_counts(item2.clone());
-                // Thresholds chosen to suppress the dominant noise: a SINGLE back-edge is usually
-                // an inlined memcpy/strlen/refcount loop, not a source loop, so require ≥2.
-                if fp.loops >= 2 && r.loops == 0 {
-                    errors.push(format!(
-                        "CFG: binary has {} loop back-edge(s) but the body has no loop — missing iteration?",
-                        fp.loops
-                    ));
-                }
-                if fp.switch_cases >= 3 && r.matches == 0 && r.ifs < 2 {
-                    errors.push(format!(
-                        "CFG: binary has a jump-table switch ({} cases) but the body has no match / if-chain",
-                        fp.switch_cases
-                    ));
-                }
-                // High conditional count + a wholly straight-line body suggests gross under-
-                // implementation (delegating bodies have calls but the binary inlined the branches,
-                // so this still fires on faithful delegation — kept high to limit that).
-                if fp.conditionals >= 12 && r.ifs + r.matches + r.loops == 0 {
-                    errors.push(format!(
-                        "CFG: binary branches heavily ({} conditionals) but the body is straight-line (no if/match/loop)",
-                        fp.conditionals
-                    ));
-                }
+    // (4) CFG-fingerprint diff (always on): catch a port that omits a loop
+    // the binary has, or a jump-table switch, or is straight-line where
+    // the binary branches heavily. COARSE + tolerant — optimized CFGs do
+    // not map 1:1 to source, so only gross structural divergences are
+    // flagged. There used to be a `STRICT_CFG=1` opt-in flag — same
+    // story as the others, removed.
+    match cfg_fingerprint(&pe, args.addr) {
+        Ok(fp) => {
+            let r = body::cfg_keyword_counts(item2.clone());
+            // Thresholds chosen to suppress the dominant noise: a SINGLE back-edge is usually
+            // an inlined memcpy/strlen/refcount loop, not a source loop, so require ≥2.
+            if fp.loops >= 2 && r.loops == 0 {
+                errors.push(format!(
+                    "CFG: binary has {} loop back-edge(s) but the body has no loop — missing iteration?",
+                    fp.loops
+                ));
             }
-            Err(e) => errors.push(format!("cfg check {:#010x}: {e}", args.addr)),
+            if fp.switch_cases >= 3 && r.matches == 0 && r.ifs < 2 {
+                errors.push(format!(
+                    "CFG: binary has a jump-table switch ({} cases) but the body has no match / if-chain",
+                    fp.switch_cases
+                ));
+            }
+            // High conditional count + a wholly straight-line body suggests gross under-
+            // implementation (delegating bodies have calls but the binary inlined the branches,
+            // so this still fires on faithful delegation — kept high to limit that).
+            if fp.conditionals >= 12 && r.ifs + r.matches + r.loops == 0 {
+                errors.push(format!(
+                    "CFG: binary branches heavily ({} conditionals) but the body is straight-line (no if/match/loop)",
+                    fp.conditionals
+                ));
+            }
         }
+        Err(e) => errors.push(format!("cfg check {:#010x}: {e}", args.addr)),
     }
 
     if errors.is_empty() {
