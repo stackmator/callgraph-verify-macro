@@ -456,10 +456,12 @@ mod tests {
         let pe = load_test_pe();
         let addrs = find_function_addresses(&pe);
         // Find an addr with at least one direct caller — any fn that an earlier addrs's
-        // analyze result has in `call_targets`.
+        // analyze result has in `call_targets`. We only need to verify ONE such pair
+        // (the rel32-scan correctness isn't input-dependent across callees), so use
+        // `next()` rather than a `for` loop — clippy::never_loop flags the latter.
         for caller in &addrs {
             if let Ok(cg) = analyze(&pe, *caller) {
-                for callee in cg.call_targets() {
+                if let Some(&callee) = cg.call_targets().iter().next() {
                     assert!(
                         has_direct_branch_target(&pe, callee),
                         "callee {callee:#x} is in caller {caller:#x}'s call_targets but \

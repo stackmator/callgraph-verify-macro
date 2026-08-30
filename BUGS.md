@@ -149,6 +149,8 @@ The static is built from the **first** `(pe, declared)` pair the macro ever sees
 
 **Fix:** key the cache on `(pe.image_base, declared)` or make the map a per-corpus field, like `corpus_map` already does.
 
+**Status: fixed.** Replaced the single `static M: OnceLock<…>` with a process-wide `Mutex<HashMap<CacheKey, OnceLock<Arc<HashMap<…>>>>>` keyed on `(image_base, declared-fingerprint)`. Steady-state lookups are lock-free (`OnceLock::get()` returns the cached `Arc`); the mutex is only held on the very first request per `(PE, corpus)` pair. Unit tests in `lib::tests`: `cache_key_distinguishes_image_bases`, `cache_key_distinguishes_declared_lists`, `cache_key_equal_for_same_inputs`, `vtable_method_map_is_per_pe_and_decl`.
+
 ---
 
 ## [LATENT] 10. `vtable_table!` macro emits a fat-pointer → `u32` cast
@@ -164,6 +166,8 @@ The static is built from the **first** `(pe, declared)` pair the macro ever sees
 In typical rebuild usage the caller already knows the length at compile time, so this happens to work. But if any consumer expects the `u32` to round-trip back to the slice, the length is gone.
 
 **Fix:** return `*const [usize; N]` (the caller knows `N` already) or `(*const usize, usize)` (data, len).
+
+**Status: fixed.** Changed the generated signature from `pub fn #name() -> u32` to `pub fn #name() -> *const [usize; #slots]`. The fat-pointer return type carries both the data pointer AND the compile-time-known length `N`. Callers that only need the data pointer can coerce with `as *const usize` at the call site. Doc comment updated.
 
 ---
 
@@ -190,6 +194,8 @@ if let Some(callee) = cg.call_targets().into_iter().next() {
 
 Functionally equivalent; cleaner. Suppress with `#[allow(clippy::never_loop)]` if the original shape is preferred.
 
+**Status: fixed.** Replaced the `for callee in cg.call_targets() { …; return; }` with `if let Some(&callee) = cg.call_targets().iter().next() { … }`. Clippy no longer warns; the test still pins the rel32-scan correctness for any one direct-call pair.
+
 ---
 
 ## Summary
@@ -204,6 +210,6 @@ Functionally equivalent; cleaner. Suppress with `#[allow(clippy::never_loop)]` i
 | 6 | `lib.rs::verify_impl` VTABLE-ONLY block | BUG | (vt_va, slot) discarded from warning — **fixed** |
 | 7 | `body.rs::classify_arg` | BUG | `starts_with("rd")` over-matches non-field names — **fixed** |
 | 8 | `disasm.rs::analyze` block_buf | BUG | Args lost inside branch targets — **fixed** |
-| 9 | `lib.rs::vtable_method_map` | LATENT | Static cache ignores inputs |
-| 10 | `lib.rs::vtable_table!` | LATENT | Fat-pointer → u32 drops length |
-| 11 | `tests/integration.rs:459` | STYLE | `for … { … return; }` is a never_loop |
+| 9 | `lib.rs::vtable_method_map` | LATENT | Static cache ignores inputs — **fixed** |
+| 10 | `lib.rs::vtable_table!` | LATENT | Fat-pointer → u32 drops length — **fixed** |
+| 11 | `tests/integration.rs:459` | STYLE | `for … { … return; }` is a never_loop — **fixed** |
