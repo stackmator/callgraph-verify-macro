@@ -1219,4 +1219,59 @@ let fallthrough_target = entry + 0x0E;
         assert!(cg.direct_calls.is_empty(), "RET-only function has no calls");
         assert!(cg.tail_calls.is_empty(), "RET-only function has no tail calls");
     }
+
+    // -----------------------------------------------------------------
+    // Real-binary CFG pin: the function at 0x00959d60 in the workspace's
+    // `noivilbo.exe` has FOUR back-edges (loop heads) per the reference
+    // skeleton's basic blocks (0x959d8b, 0x959de0, 0x959df1, 0x959e64).
+    // The skeleton view:
+    //   cargo run --bin callgraph_verify --release -- noivilbo.exe 0x959d60 --skeleton
+    // shows each loop head marked with `// loop head`. The macro's
+    // CFG-fingerprint diff at `callgraph-verify-macro/src/lib.rs:690` keys
+    // off `fp.loops >= 2 && r.loops == 0` — meaning a port whose literal
+    // body has no `while`/`loop`/`for` (e.g. one that extracted the loop
+    // bodies into `pick_traverse`/`update_world_bound` helpers) will be
+    // rejected as a compile error.
+    //
+    // This test pins the byte-truth side of that contract: the entry's
+    // CFG really does have 4 back-edges, so the macro's strict check is
+    // correct and the porter must keep the loops in the body (or extract
+    // them into a separate `#[origin]`-tagged helper whose own body has
+    // the matching loops — see README's single-function discipline note).
+    //
+    // Regression guard: if `cfg_fingerprint` ever loses a back-edge
+    // detection (e.g. due to a `decode_all` cap or leader-set bug), this
+    // test fails and the macro's check would silently start accepting
+    // port omissions.
+    // -----------------------------------------------------------------
+    #[test]
+    fn cfg_pin_noivilbo_0x959d60_has_four_back_edges() {
+        // `noivilbo.exe` lives at the workspace root (two levels up from this
+        // crate's manifest). Skip gracefully if it's not present so this test
+        // doesn't break a fresh clone where the fixture binary hasn't been
+        // added yet.
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let pe_path = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("noivilbo.exe"))
+            .expect("workspace root resolves");
+        if !pe_path.exists() {
+            eprintln!(
+                "skipping: {} not found (fixture binary lives at workspace root)",
+                pe_path.display()
+            );
+            return;
+        }
+        let pe = Pe::load(pe_path.to_str().unwrap()).expect("load noivilbo.exe");
+        let fp = cfg_fingerprint(&pe, 0x00959d60).expect("cfg_fingerprint at 0x00959d60");
+        assert_eq!(
+            fp.loops, 4,
+            "binary at 0x00959d60 has {} back-edges; the macro's CFG diff keys \
+             off 4 (>=2 threshold), so any future regression in back-edge \
+             detection will silently let a port that omits the inlined loops \
+             pass. Update this assertion if the binary genuinely changes.",
+            fp.loops
+        );
+    }
 }

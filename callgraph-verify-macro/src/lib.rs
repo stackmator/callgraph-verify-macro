@@ -173,6 +173,49 @@ fn warn_once(msg: &str) {
     });
 }
 
+/// Compute the set of inlined-marker addresses that the binary still
+/// CALL/JMP/Jccs into from .text. Each is returned as a one-line note
+/// suitable for `warn_once`. Extracted from the macro body so it can be
+/// unit-tested without a proc-macro harness.
+pub(crate) fn inline_marker_mismatches(
+    pe: &callgraph_verify::Pe,
+    inlined: &std::collections::BTreeSet<u64>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for &addr in inlined {
+        if callgraph_verify::has_direct_branch_target(pe, addr) {
+            out.push(format!(
+                "INLINE-MARKER MISMATCH: {addr:#010x} is marked `inline:` (or `callgraph-inlined`) \
+                 in the corpus, but the binary still has a real CALL/JMP/Jcc targeting it from .text. \
+                 If the engine only sometimes inlines this helper, ensure the non-inlined call sites \
+                 also have a faithful `#[origin({addr:#010x})]` implementation."
+            ));
+        }
+    }
+    out
+}
+
+/// Pull the `0xADDR` out of an inline-marker note. Used by the macro's
+/// per-build de-dup so a corpus with many `#[origin]` tags doesn't repeat
+/// the same address's note on every expansion.
+fn addr_of_msg(msg: &str) -> u64 {
+    // The note always starts with `INLINE-MARKER MISMATCH: 0xADDR …`. Scan
+    // the first whitespace-delimited hex literal.
+    let mut chars = msg.chars();
+    while let Some(c) = chars.next() {
+        if c == '0' {
+            // Peek next char: if it's 'x' or 'X', parse the hex literal.
+            let rest: String = chars.clone().take_while(|c| *c != ' ' && *c != ',').collect();
+            if let Some(hex) = rest.strip_prefix('x').or_else(|| rest.strip_prefix('X')) {
+                if let Ok(v) = u64::from_str_radix(hex, 16) {
+                    return v;
+                }
+            }
+        }
+    }
+    0
+}
+
 /// `#[origin(0xADDR)]` — provenance tag + compile-time call-graph verifier.
 /// See the crate docs. `#[callgraph_verify(..)]` is kept as an alias.
 #[proc_macro_attribute]
@@ -447,6 +490,29 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     if let Ok(root) = std::env::var("REBUILD_ROOT") {
         let map = corpus::corpus_map(&root);
 
+        // Inline-marker sanity (always on, non-fatal): every address in
+        // `inlined_markers` was claimed by the porter as "the engine inlined
+        // this" via an `/// inline: 0xADDR` or `/// callgraph-inlined`
+        // marker. If `.text` still contains a CALL/JMP/Jcc targeting that
+        // address, the engine did not (always) inline it — the marker is
+        // either wrong or the engine only sometimes inlines. Either way the
+        // porter should be aware: a faithful non-inlined caller must still
+        // have its own `#[origin(0xADDR)]` implementation. Fired as a
+        // NOTE rather than a fatal error: agents were flipping off similar
+        // fatal warnings to silence builds, and a mixed inlining strategy
+        // (header guards, debug builds, hot/cold paths) is a real pattern.
+        // De-duped by address so a build with 200 `#[origin]` tags on a
+        // 200-address corpus still prints at most N notes.
+        static INLINE_NOTED: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+        let noted = INLINE_NOTED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        let mut noted = noted.lock().unwrap();
+        for msg in inline_marker_mismatches(&pe, &map.inlined_markers) {
+            if noted.insert(addr_of_msg(&msg)) {
+                warn_once(&msg);
+            }
+        }
+        drop(noted);
+
         // Duplicate-origin check (always on, no escape hatch): a binary fn
         // may be implemented by exactly ONE Rust fn. Mirrors
         // `check_origins.py`'s dup-addr gate, but at compile time and
@@ -708,6 +774,25 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                     fp.conditionals
                 ));
             }
+            // Fake-loop guard: a body that uses `loop { break; }` as a
+            // structural placeholder satisfies the keyword counter without
+            // actually iterating. Such bodies silently pass the strict CFG
+            // check above (r.loops would be inflated by 1+ per fake loop),
+            // so surface them as a NOTE — not fatal because legitimate
+            // scaffolding during porting is real, but impossible to miss in
+            // review. The check above already subtracted them from r.loops,
+            // so a body that's ONLY fake loops still gets caught by the
+            // `fp.loops >= 2 && r.loops == 0` gate.
+            let fakes = body::fake_loop_spans(item2.clone());
+            if !fakes.spans.is_empty() {
+                warn_once(&format!(
+                    "FAKE-LOOP PLACEHOLDER: {} `loop {{ break; }}` block(s) detected at \
+                     {:#010x} — these satisfy the keyword counter without iterating. \
+                     Replace with the real iteration (or remove the placeholder) before merging.",
+                    fakes.spans.len(),
+                    args.addr
+                ));
+            }
         }
         Err(e) => errors.push(format!("cfg check {:#010x}: {e}", args.addr)),
     }
@@ -893,9 +978,11 @@ pub fn vtable_table(input: TokenStream) -> TokenStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{vtable_only_dispatch_msg, vtable_method_map, CacheKey};
+    use super::{
+        inline_marker_mismatches, vtable_only_dispatch_msg, vtable_method_map, CacheKey,
+    };
     use crate::Pe;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     #[test]
     fn vtable_only_dispatch_msg_includes_addr_vt_and_slot() {
@@ -1029,5 +1116,160 @@ mod tests {
                 declared_fingerprint: h.finish(),
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // inline_marker_mismatches — fake-inline detector
+    //
+    // An `/// inline: 0xADDR` or `/// callgraph-inlined` marker says
+    // "the engine inlined this here." If `.text` still has a real
+    // CALL/JMP/Jcc targeting that address, the marker is suspect —
+    // either the porter got the inlining strategy wrong, or the engine
+    // only sometimes inlines. These tests pin the detector's two paths:
+    //
+    //   1. The address HAS a real CALL → mismatch note emitted.
+    //   2. The address has NO real CALL (truly inlined) → no note.
+    // -----------------------------------------------------------------
+
+    /// Build a minimal PE for the inline-marker tests with a single
+    /// `.text` section containing `code` at offset 0x1000. Returns the PE
+    /// and the entry VA (image_base + 0x1000).
+    fn build_pe_with_code(code: &[u8]) -> (Pe, u64) {
+        let image_base: u32 = 0x0040_0000;
+        let text_va: u32 = 0x1000;
+        let e_lfanew: u32 = 0x40;
+        let text_raw: u32 = ((code.len() + 0x1ff) & !0x1ff).max(0x200) as u32;
+        let mut data: Vec<u8> = vec![0; 0x4000];
+        data[0..2].copy_from_slice(b"MZ");
+        data[0x3c..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+        let pe_off = e_lfanew as usize;
+        data[pe_off..pe_off + 4].copy_from_slice(b"PE\0\0");
+        let coff = pe_off + 4;
+        data[coff..coff + 2].copy_from_slice(&0x014cu16.to_le_bytes());
+        data[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes());
+        data[coff + 16..coff + 18].copy_from_slice(&0x60u16.to_le_bytes());
+        let opt = coff + 20;
+        data[opt..opt + 2].copy_from_slice(&0x010bu16.to_le_bytes());
+        data[opt + 28..opt + 32].copy_from_slice(&image_base.to_le_bytes());
+        let sec_off = opt + 0x60;
+        data[sec_off..sec_off + 8].copy_from_slice(b".text\0\0\0");
+        data[sec_off + 8..sec_off + 12].copy_from_slice(&(code.len().max(text_raw as usize) as u32).to_le_bytes());
+        data[sec_off + 12..sec_off + 16].copy_from_slice(&text_va.to_le_bytes());
+        data[sec_off + 16..sec_off + 20].copy_from_slice(&text_raw.to_le_bytes());
+        data[sec_off + 20..sec_off + 24].copy_from_slice(&text_raw.to_le_bytes());
+        let code_off = text_raw as usize;
+        data[code_off..code_off + code.len()].copy_from_slice(code);
+        (Pe::parse(data).expect("parse"), image_base as u64 + text_va as u64)
+    }
+
+    /// `inline_marker_mismatches` returns a note for any `inlined_markers`
+    /// address that has a real CALL/JMP/Jcc targeting it from `.text`. This
+    /// is the "fake inline" detector: a porter marked something as inlined,
+    /// but the binary still calls it normally — either the marker is wrong
+    /// or the engine only sometimes inlines.
+    #[test]
+    fn inline_marker_mismatch_detects_address_with_real_call() {
+        // Layout:
+        //   entry at 0x00401000: CALL 0x00401006 ; RET
+        //   target at 0x00401006: RET
+        // The CALL at 0x00401000 targets 0x00401006. The corpus marks
+        // 0x00401006 as inlined → the detector should flag it.
+        let target_va = 0x0040_1006u64;
+        let code = [
+            0xE8, 0x01, 0x00, 0x00, 0x00, // CALL +1 → 0x00401006
+            0xC3, // RET at 0x00401005
+            0xC3, // RET at 0x00401006 (the target)
+        ];
+        let (pe, _entry) = build_pe_with_code(&code);
+        let mut inlined = BTreeSet::new();
+        inlined.insert(target_va);
+        let notes = inline_marker_mismatches(&pe, &inlined);
+        assert_eq!(
+            notes.len(),
+            1,
+            "expected 1 mismatch note for {target_va:#x}, got {}: {:?}",
+            notes.len(),
+            notes
+        );
+        assert!(
+            notes[0].contains(&format!("{target_va:#010x}")),
+            "note should name the address: {}",
+            notes[0]
+        );
+        assert!(
+            notes[0].contains("INLINE-MARKER MISMATCH"),
+            "note should self-identify: {}",
+            notes[0]
+        );
+    }
+
+    /// Sanity: when the binary has NO real CALL targeting the inlined
+    /// address, no note is emitted (the engine really did inline it).
+    /// Without this guard, every `/// inline: 0xADDR` would generate noise.
+    #[test]
+    fn inline_marker_no_note_for_truly_inlined_address() {
+        // .text contains only RET; nothing targets any address. An
+        // inlined marker at any executable address should pass silently.
+        let (pe, entry) = build_pe_with_code(&[0xC3]);
+        let mut inlined = BTreeSet::new();
+        // Pick an address *outside* .text on purpose — `has_direct_branch_target`
+        // would return false trivially (no .text byte encodes a CALL to it),
+        // but in production the corpus only registers addresses that ARE
+        // fn entries, so this is a strict-but-realistic test.
+        inlined.insert(entry + 4);
+        let notes = inline_marker_mismatches(&pe, &inlined);
+        assert!(
+            notes.is_empty(),
+            "no mismatch expected (binary has no CALL to {:#x}): {:?}",
+            entry + 4,
+            notes
+        );
+    }
+
+    /// Empty `inlined_markers` set → empty output. Guards against an
+    /// over-eager implementation that synthesises notes for unmarked
+    /// addresses.
+    #[test]
+    fn inline_marker_empty_set_produces_no_notes() {
+        let (pe, _entry) = build_pe_with_code(&[0xC3]);
+        let notes = inline_marker_mismatches(&pe, &BTreeSet::new());
+        assert!(notes.is_empty(), "empty set must yield zero notes: {notes:?}");
+    }
+
+    /// Mixed set: one address with a real CALL, one without. Only the
+    /// first should produce a note. Pin the filter is per-address, not
+    /// "all or nothing".
+    #[test]
+    fn inline_marker_partial_set_only_flags_real_calls() {
+        // Build a .text with one CALL to target_a; nothing targets target_b.
+        let target_a = 0x0040_1006u64;
+        let target_b = 0x0040_2000u64; // outside this PE — no CALL anywhere
+        let code = [
+            0xE8, 0x01, 0x00, 0x00, 0x00, // CALL +1 → 0x00401006
+            0xC3, // RET at 0x00401005
+            0xC3, // RET at 0x00401006 (target_a)
+        ];
+        let (pe, _entry) = build_pe_with_code(&code);
+        let mut inlined = BTreeSet::new();
+        inlined.insert(target_a);
+        inlined.insert(target_b);
+        let notes = inline_marker_mismatches(&pe, &inlined);
+        assert_eq!(
+            notes.len(),
+            1,
+            "expected exactly 1 note (target_a), got {}: {:?}",
+            notes.len(),
+            notes
+        );
+        assert!(
+            notes[0].contains(&format!("{target_a:#010x}")),
+            "note should name target_a: {}",
+            notes[0]
+        );
+        assert!(
+            !notes[0].contains(&format!("{target_b:#010x}")),
+            "note should NOT name target_b: {}",
+            notes[0]
+        );
     }
 }

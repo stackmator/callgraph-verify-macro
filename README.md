@@ -43,6 +43,69 @@ hatches — those are removed. AI agents were flipping them off to silence
 build failures; the macro is a strict gate, not a configurable knob. If a
 check is wrong, fix the check.
 
+### Single-function discipline (CFG check)
+
+The macro's CFG-fingerprint diff compares the binary's CFG *at the attributed
+entry* against the *literal body* you wrote. It does NOT walk into callee
+declarations — by design. Concretely:
+
+- If the binary function at `0xA` has 4 back-edges (loop heads) and your Rust
+  body has zero `while` / `loop` / `for`, the build fails:
+  `CFG: binary has 4 loop back-edge(s) but the body has no loop — missing iteration?`
+- This fires whether the loops were extracted into helper functions, inlined
+  away, or simply forgotten.
+
+**Rule: the binary function is one Rust function.** When the engine inlines
+iteration logic into a single contiguous range (e.g. a 200-byte block with
+nested loops and no `CALL` between them), the faithful Rust port is one
+function with matching nested loops — even if it is 200+ lines. Extracting the
+loops into `pick_traverse` / `update_world_bound` helpers is a *structural*
+divergence from the binary: the binary never calls them, and the verifier
+correctly refuses to accept the split.
+
+If you genuinely must extract (e.g. for readability across multiple rebuild
+functions sharing the helper), each extracted helper is itself a separate
+port: tag it with its own `#[origin(<callee_addr>)]` and reproduce the
+binary's loop structure inside it. The macro will then verify each piece
+against its own byte range — the entry against the entry's loops, the helper
+against the helper's loops. Neither side gets a free pass.
+
+### What `inline:` markers are for (and what they're NOT for)
+
+The verifier supports three inline annotations:
+
+| Annotation | Purpose |
+|---|---|
+| `/// inline: 0xADDR` (with address) | Registers a Rust helper as the inlined-by-the-engine version of the binary function at `0xADDR`. Calls to it from other rebuild fns classify as `inlined_ok` (not `hallucinated`). |
+| `/// inline: <no-addr>` | Body fold-in: a pure-Rust idiom helper with no binary equivalent — its calls are folded into every caller so a call to `flag_helper()` doesn't introduce hidden invented calls. |
+| `/// callgraph-inlined` / `/// callgraph-virtual` | Alternate syntax for the same two ideas above. |
+
+**These markers are for cross-function call resolution. They do NOT relax
+the CFG check on any attributed entry.** A `/// inline: 0xADDR`-tagged
+helper is still verified against the bytes at `0xADDR` — its CFG must match,
+its calls must match, its fields must match. The marker only tells the
+*callers* of the helper "this name is recognised, don't HALLUCINATED-flag it."
+
+Concretely, the pattern from the previous section is unchanged:
+
+```text
+/// inline: 0x00AABBCC           // ← this does NOT exempt you
+fn pick_traverse(...) {          // ← from the CFG check at 0x959d60
+    while ... { ... }            //
+}                                //
+                                 //
+#[origin(0x959d60)]              //
+fn outer(...) {                  //
+    pick_traverse();             // ← still flagged: body has no loop,
+    update_world_bound();        //   binary at 0x959d60 has 4 back-edges
+}                                //
+```
+
+The annotation lives on `pick_traverse`'s *own* `#[origin(0x00AABBCC)]`
+declaration, where it explains "the engine inlined this; callers may share
+me." It does not, and cannot, make `outer`'s body structurally faithful to a
+binary function whose loops were never extracted in the first place.
+
 ### 2. Annotate a rebuild function
 
 ```rust

@@ -253,16 +253,107 @@ fn classify_arg(toks: &[TokenTree]) -> RustArg {
 /// identifiers anywhere in the token tree (a crude but adequate proxy for source control flow).
 #[derive(Default, Debug)]
 pub struct RustCfg {
-    pub loops: usize,   // while / loop / for
+    /// Iterations that actually loop: `while`/`loop`/`for` whose body is not
+    /// a single immediate `break`/`return` (those are placeholder no-ops,
+    /// not iterations — see `cfg_keyword_counts`).
+    pub loops: usize,
     pub matches: usize, // match
     pub ifs: usize,     // if
     pub returns: usize, // return
 }
 
+/// Locations of `loop { ... }` blocks that are syntactic placeholders —
+/// the body is an immediate `break;` (with at most leading trivia), so the
+/// "loop" never iterates. Reported separately so the macro can flag a
+/// body that uses these to satisfy the CFG check without reproducing the
+/// binary's iteration.
+#[derive(Default, Debug)]
+pub struct FakeLoops {
+    /// Each entry: the span of the `loop` keyword, paired with a short
+    /// reason string for the error message (e.g. "body is just `break;`").
+    pub spans: Vec<(proc_macro2::Span, &'static str)>,
+}
+
 pub fn cfg_keyword_counts(ts: TokenStream) -> RustCfg {
     let mut c = RustCfg::default();
+    let mut fakes = FakeLoops::default();
+    // Single fake-loop pass at the top level (the walker recurses into
+    // every group, so this finds all fakes in one walk — calling it
+    // again inside the count loop would double-count).
+    walk_for_fake_loops(ts.clone(), &mut fakes);
     count_kw(ts, &mut c);
+    // Subtract placeholder `loop {}`s from the count — they appear in the
+    // token stream as `loop` keywords but don't actually iterate. The
+    // caller (the macro's CFG check) still sees the fakes list and can
+    // surface them as a NOTE explaining why the count went down.
+    c.loops = c.loops.saturating_sub(fakes.spans.len());
     c
+}
+
+/// Detect `loop {}` blocks whose body is a single immediate `break;` (with
+/// at most leading punctuation / comments). Returns the spans so the macro
+/// can attach a span to a NOTE. Other patterns — `loop { let x = foo();
+/// break; }`, `loop { if cond { break; } ... }` — are NOT flagged: those
+/// have real structure even if they don't match the binary.
+pub fn fake_loop_spans(ts: TokenStream) -> FakeLoops {
+    let mut f = FakeLoops::default();
+    walk_for_fake_loops(ts, &mut f);
+    f
+}
+
+fn walk_for_fake_loops(ts: TokenStream, f: &mut FakeLoops) {
+    let tts: Vec<TokenTree> = ts.into_iter().collect();
+    for (i, tt) in tts.iter().enumerate() {
+        if let TokenTree::Group(g) = tt {
+            walk_for_fake_loops(g.stream(), f);
+        }
+        // Look for the pattern: `loop` ident followed by a `{ ... }` group
+        // whose entire body is `break;` (with optional leading trivia).
+        if let TokenTree::Ident(id) = tt {
+            if id.to_string() != "loop" {
+                continue;
+            }
+            // Skip `for` / `while` — they have a condition, so `loop` is the
+            // only keyword whose body can be a placeholder.
+            if let Some(TokenTree::Ident(prev)) = tts.get(i.wrapping_sub(1)) {
+                if prev.to_string() == "for" {
+                    continue;
+                }
+            }
+            let Some(TokenTree::Group(g)) = tts.get(i + 1) else { continue };
+            if g.delimiter() != Delimiter::Brace {
+                continue;
+            }
+            if is_placeholder_break_body(g.stream()) {
+                f.spans.push((id.span(), "body is just `break;`"));
+            }
+        }
+    }
+}
+
+fn is_placeholder_break_body(body: TokenStream) -> bool {
+    // Skip leading trivia (punctuation like ; or ,) and any nested
+    // doc/regular comments via whitespace — proc_macro2 surfaces comments
+    // as `Punct`s with no text, so we only need to filter non-trivia
+    // tokens. Acceptable placeholders: just `break;` (with optional
+    // trailing semicolon and optional surrounding whitespace tokens).
+    let mut seen_break = false;
+    for tt in body {
+        match tt {
+            TokenTree::Ident(id) => {
+                let s = id.to_string();
+                if s == "break" && !seen_break {
+                    seen_break = true;
+                } else {
+                    return false;
+                }
+            }
+            TokenTree::Punct(_) => continue, // ; , etc. — trivia
+            TokenTree::Literal(_) => return false, // any literal = real code
+            TokenTree::Group(_) => return false, // any nested group = real code
+        }
+    }
+    seen_break
 }
 
 fn count_kw(ts: TokenStream, c: &mut RustCfg) {
@@ -529,9 +620,9 @@ mod tests {
         assert!(!lits.contains(&0x00401f20), "attr hex leaked: {:?}", lits);
     }
 
-    /// Sanity: hex literals INSIDE the body ARE included.
+/// Sanity: hex literals INSIDE the body ARE included.
     #[test]
-    fn collect_hex_literals_includes_body_addresses() {
+    fn collect_hex_literals_includes_body_literals() {
         let ts = TokenStream::from_str(
             "#[origin(0x004028d0)] pub fn outer() { let g = 0x00401f00u32; }",
         )
@@ -544,5 +635,84 @@ mod tests {
             "attr 0x004028d0 leaked into body hex: {:?}",
             lits
         );
+    }
+
+    // --- cfg_keyword_counts / fake_loop_spans (fake-loop placeholder guard) -
+
+    /// A real `loop { ... }` that contains code BEFORE the break (or no
+    /// break at all) is NOT a placeholder — `cfg_keyword_counts` should
+    /// count it as 1 and `fake_loop_spans` should report zero.
+    #[test]
+    fn cfg_real_loop_with_iteration_is_counted() {
+        let ts = TokenStream::from_str(
+            "pub fn outer() { loop { foo(); if cond { break; } } }",
+        )
+        .unwrap();
+        let r = cfg_keyword_counts(ts.clone());
+        assert_eq!(r.loops, 1, "real loop should count: {:?}", r);
+        let f = fake_loop_spans(ts);
+        assert!(f.spans.is_empty(), "real loop should not be flagged as fake: {:?}", f.spans);
+    }
+
+    /// The exact pattern from the bug report: `loop { break; }` (possibly
+    /// with a comment, possibly without a semicolon). `cfg_keyword_counts`
+    /// must subtract it (return 0) and `fake_loop_spans` must flag it.
+    #[test]
+    fn cfg_fake_loop_placeholder_is_subtracted() {
+        // Bare form: `loop { break; }`
+        let ts = TokenStream::from_str("pub fn outer() { loop { break; } }").unwrap();
+        let r = cfg_keyword_counts(ts.clone());
+        assert_eq!(r.loops, 0, "fake loop must NOT count as iteration: {:?}", r);
+        let f = fake_loop_spans(ts.clone());
+        assert_eq!(f.spans.len(), 1, "expected 1 fake loop, got {}: {:?}", f.spans.len(), f.spans);
+        assert_eq!(f.spans[0].1, "body is just `break;`");
+
+        // Without the trailing semicolon — still a placeholder.
+        let ts = TokenStream::from_str("pub fn outer() { loop { break } }").unwrap();
+        let r = cfg_keyword_counts(ts.clone());
+        assert_eq!(r.loops, 0, "fake loop (no semi) must NOT count: {:?}", r);
+
+        // Mixed: 2 real + 1 fake. Net count should be 2.
+        let ts = TokenStream::from_str(
+            "pub fn outer() { loop { foo(); if cond { break; } } loop { break; } \
+             loop { bar(); if other { break; } } }",
+        )
+        .unwrap();
+        let r = cfg_keyword_counts(ts.clone());
+        assert_eq!(r.loops, 2, "3 loops - 1 fake = 2: {:?}", r);
+        let f = fake_loop_spans(ts);
+        assert_eq!(f.spans.len(), 1, "exactly 1 fake in 3 loops: {:?}", f.spans);
+    }
+
+    /// Sanity: a body with NO `loop` keyword at all returns 0 loops, zero
+    /// fake loops. Guards against an over-eager walker that subtracts
+    /// from nothing.
+    #[test]
+    fn cfg_no_loop_keyword_yields_zero_loops() {
+        let ts = TokenStream::from_str("pub fn outer() { foo(); bar(); }").unwrap();
+        let r = cfg_keyword_counts(ts.clone());
+        assert_eq!(r.loops, 0, "{}", r.loops);
+        let f = fake_loop_spans(ts);
+        assert!(f.spans.is_empty(), "no fake loops: {:?}", f.spans);
+    }
+
+    /// `while` and `for` keywords are NOT checked for placeholder bodies —
+    /// they always have a controlling expression (the condition / iterator),
+    /// so they cannot be a one-shot `break;` trap the way `loop` can.
+    /// `cfg_keyword_counts` counts them as loops (real); `fake_loop_spans`
+    /// ignores them entirely.
+    #[test]
+    fn cfg_while_and_for_are_real_loops() {
+        // `while cond { ... }` always has a controlling expression. The
+        // body might `break` immediately but the loop is still iterating
+        // (the keyword counts).
+        let ts = TokenStream::from_str(
+            "pub fn outer() { while cond { break; } for x in xs { break; } }",
+        )
+        .unwrap();
+        let r = cfg_keyword_counts(ts.clone());
+        assert_eq!(r.loops, 2, "while + for = 2 real loops: {:?}", r);
+        let f = fake_loop_spans(ts);
+        assert!(f.spans.is_empty(), "while/for are never fake: {:?}", f.spans);
     }
 }
