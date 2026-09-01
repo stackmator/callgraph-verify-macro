@@ -1790,4 +1790,48 @@ let fallthrough_target = entry + 0x0E;
             fp
         );
     }
+
+    /// Real-binary pin for a function whose CFG contains BOTH a
+    /// conditional Jcc back-edge AND an unconditional JMP back-edge
+    /// to the same loop head — the case that an over-eager fix would
+    /// silently regress by treating one as "not a real loop".
+    ///
+    /// The function at 0x0071FF54 (a `ni_property_state_*` port) has:
+    ///   * an unconditional `jmp 0x0071FF54` self-loop at the entry
+    ///   * a conditional `jb 0x00720062` back-edge from 0x0072018c to
+    ///     0x00720062 (a `while (cmp dx, [ebp+0x50])` loop tail)
+    ///
+    /// Both must be counted: the textbook natural-loop definition is
+    /// `dom[source].contains(target)`, which holds for both Jcc and JMP.
+    /// A fix that only counts unconditional JMPs (or only counts
+    /// forward self-loops) would silently drop the second one and
+    /// make the porter's `r.loops >= 1` check fail spuriously.
+    #[test]
+    fn cfg_pin_noivilbo_ni_property_state_has_two_loops() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let pe_path = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("noivilbo.exe"))
+            .expect("workspace root resolves");
+        if !pe_path.exists() {
+            eprintln!(
+                "skipping: {} not found (fixture binary lives at workspace root)",
+                pe_path.display()
+            );
+            return;
+        }
+        let pe = Pe::load(pe_path.to_str().unwrap()).expect("load noivilbo.exe");
+        let fp = cfg_fingerprint(&pe, 0x0071FF54)
+            .expect("cfg_fingerprint at 0x0071FF54 (ni_property_state)");
+        assert_eq!(
+            fp.loops, 2,
+            "ni_property_state (0x0071FF54) has 2 real back-edges — a \
+             conditional `jb` back-edge and an unconditional `jmp` self-loop. \
+             The dominance-based check must count BOTH; a fix that drops \
+             either kind would let the porter silently lose a loop. \
+             Got fp = {:?}",
+            fp
+        );
+    }
 }
