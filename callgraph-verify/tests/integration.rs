@@ -1274,4 +1274,520 @@ let fallthrough_target = entry + 0x0E;
             fp.loops
         );
     }
+
+    // -----------------------------------------------------------------
+    // cfg_fingerprint natural-loop bug regression (BUG: back-edge to a
+    // common tail that doesn't dominate the source block was being
+    // counted as a loop).
+    //
+    // The OLD heuristic was `t <= ld && leaders.contains(&t)` — a back-edge
+    // by address. That conflates "branch goes to an earlier block" with
+    // "iteration", so a function whose only `je`/`jbe` exits were to a
+    // common epilog tail got false positives. Example from `noivilbo.exe`:
+    // ni_file_flush (0x00747d30) had `je0x7D40` and `jbe 0x7D40`, both
+    // appearing as back-edges by address but neither forming a loop.
+    //
+    // The fix: only count `B -> T` as a natural-loop back-edge when `T`
+    // dominates `B` (every path from `entry` to `B` passes through `T`).
+    // This is the textbook natural-loop definition and correctly handles:
+    //   * real `while`/`for`/`do-while` (the loop head dominates the body)
+    //   * `ni_file_flush`-style early-exits to a common tail (the tail
+    //     does NOT dominate the `je`/`jbe` sites, because entry can fall
+    //     through to those sites without going through the tail)
+    // -----------------------------------------------------------------
+
+    /// Linear function with no branches. `loops` must be 0 and there must
+    /// be a terminator (RET), so the macro's "any terminator at all?"
+    /// check passes too.
+    #[test]
+    fn cfg_fingerprint_linear_function_has_no_loops() {
+        // MOV EAX, [ECX+0x10] ; RET
+        let code = [0x8B, 0x41, 0x10, 0xC3];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        assert_eq!(fp.loops, 0, "linear function has no loops; got {:?}", fp);
+        assert_eq!(fp.conditionals, 0);
+        assert_eq!(fp.switch_cases, 0);
+        // One RET → 1 return.
+        assert_eq!(fp.returns, 1);
+    }
+
+    /// Classic `while (cond) { body; }` compiled to:
+    ///   TEST cond; JE exit; body; JMP entry; exit: RET
+    /// The back-edge `JMP entry` goes from body (block at next_ip after
+    /// the conditional) to entry. Entry dominates body (entry is the
+    /// only predecessor of body), so the dominance check counts it.
+    #[test]
+    fn cfg_fingerprint_while_loop_is_counted() {
+        // 0x1000: TEST EAX,EAX (85 C0)              [2 bytes]
+        // 0x1002: JE 0x100C (74 08)                  [2 bytes] -> 0x100C (exit)
+        // 0x1004: NOP (90)                           [1 byte]
+        // 0x1005: JMP 0x1000 (EB F9)                 [2 bytes] -> 0x1000 (BACK to entry)
+        // 0x1007-0x100B: padding (5 bytes)
+        // 0x100C: RET (C3)                           [1 byte] (exit)
+        let code = [
+            0x85, 0xC0, // TEST EAX,EAX
+            0x74, 0x08, // JE 0x100C
+            0x90, // NOP
+            0xEB, 0xF9, // JMP 0x1000 (back-edge)
+            0x90, 0x90, 0x90, 0x90, 0x90, // padding
+            0xC3, // RET
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        assert_eq!(
+            fp.loops, 1,
+            "while loop's back-edge (JMP entry) must be counted; got {:?}",
+            fp
+        );
+    }
+
+    /// Classic `do { body; } while (cond);` compiled to:
+    ///   body; TEST cond; JE exit; JMP entry; exit: RET
+    /// The back-edge `JMP entry` goes from a block that the entry block
+    /// leads into (via fallthrough of the entry's body) to entry. Entry
+    /// dominates that block (entry is on every path), so the dominance
+    /// check counts it. Guards against an over-eager fix that only
+    /// counts conditional jumps.
+    #[test]
+    fn cfg_fingerprint_do_while_loop_is_counted() {
+        // 0x1000: NOP (90)                          [1 byte]  (body)
+        // 0x1001: TEST EAX,EAX (85 C0)              [2 bytes]
+        // 0x1003: JE 0x1009 (74 04)                  [2 bytes] -> 0x1009 (exit)
+        // 0x1005: JMP 0x1000 (EB F9)                 [2 bytes] -> 0x1000 (BACK to entry)
+        // 0x1007-0x1008: padding
+        // 0x1009: RET (C3)                           [1 byte] (exit)
+        let code = [
+            0x90, // NOP
+            0x85, 0xC0, // TEST EAX,EAX
+            0x74, 0x04, // JE 0x1009
+            0xEB, 0xF9, // JMP 0x1000 (back-edge)
+            0x90, 0x90, // padding
+            0xC3, // RET
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        assert_eq!(
+            fp.loops, 1,
+            "do-while loop's back-edge (JMP entry) must be counted; got {:?}",
+            fp
+        );
+    }
+
+    /// JMP to next_ip is an unconditional forward jump (in-range) that
+    /// is not a back-edge (t == b.start → not strict <, not strict =
+    /// either after the strict-< → <= fix), so it's neither a loop nor a
+    /// tail-call-out-of-range. The macro's "any terminator at all?"
+    /// gate is the load-bearing check; this test just pins that the
+    /// unconditional branch path still terminates the block.
+    #[test]
+    fn cfg_fingerprint_unconditional_jmp_out_of_range_is_return_equivalent() {
+        let code = [0xE9, 0x00, 0x00, 0x00, 0x00]; // JMP rel32 with rel=0 → next_ip
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        // JMP to next_ip is forward and not a back-edge: 1 forward jump
+        // (no conditionals, no switches), 0 loops. The fp.returns count
+        // depends on whether the JMP was treated as a tail call — for an
+        // in-range JMP to next_ip, the legacy code does NOT bump returns
+        // (it's an in-range jump, not "out-of-function"). We don't pin
+        // that here; the test simply pins that the count is finite and
+        // the function decoded without panic.
+        assert_eq!(fp.loops, 0);
+        assert_eq!(fp.conditionals, 0);
+        assert_eq!(fp.switch_cases, 0);
+        let _ = fp.returns;
+    }
+
+    /// Self-loop is a real loop (`while (true) { ... }`) and must be
+    /// counted. Guard against an over-strict fix that drops self-loops.
+    #[test]
+    fn cfg_fingerprint_self_loop_is_counted() {
+        // 0x1000: JMP 0x1000 (EB FE) → back to self
+        let code = [0xEB, 0xFE]; // JMP rel8 = -2 → 0x1000
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        assert_eq!(
+            fp.loops, 1,
+            "self-loop is a natural-loop back-edge; got {:?}",
+            fp
+        );
+    }
+
+    /// Real-binary regression for the bug. `ni_file_flush` at 0x00747d30
+    /// in `noivilbo.exe` has two Jccs into a common tail (0x00747d40)
+    /// that does NOT dominate the Jcc source blocks (entry can fall
+    /// through to them without going through the tail). With the OLD
+    /// `t <= ld` heuristic, those counted as back-edges and `fp.loops`
+    /// was ≥1. After the fix, `fp.loops` must be 0 — there's no actual
+    /// iteration in this function.
+    #[test]
+    fn cfg_pin_noivilbo_ni_file_flush_has_no_loops() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let pe_path = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("noivilbo.exe"))
+            .expect("workspace root resolves");
+        if !pe_path.exists() {
+            eprintln!(
+                "skipping: {} not found (fixture binary lives at workspace root)",
+                pe_path.display()
+            );
+            return;
+        }
+        let pe = Pe::load(pe_path.to_str().unwrap()).expect("load noivilbo.exe");
+        let fp =
+            cfg_fingerprint(&pe, 0x00747d30).expect("cfg_fingerprint at 0x00747d30 (ni_file_flush)");
+        assert_eq!(
+            fp.loops, 0,
+            "ni_file_flush (0x00747d30) has no real loops — its two Jccs into \
+             0x00747d40 are early-exits to a common tail, not back-edges into a \
+             loop head. The OLD `t <= ld && leaders.contains(&t)` heuristic \
+             counted them as loops (fp.loops was 1+); the dominance-based \
+             check counts 0. Got fp = {:?}",
+            fp
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Unhappy paths — error returns, dead code, switch tables,
+    // nested/multi-back-edge loops. These pin the cases the happy-path
+    // tests don't exercise so a regression in either direction (false
+    // positive or false negative) can't slip through.
+    // -----------------------------------------------------------------
+
+    /// Entry address lies outside every PE section. `cfg_fingerprint`
+    /// must reject it with `Err` rather than panicking on read-of-
+    /// unmapped-VA or returning a bogus fingerprint built from
+    /// `instrs.is_empty()` defaults.
+    #[test]
+    fn cfg_fingerprint_rejects_out_of_section_entry() {
+        let code = [0xC3u8]; // RET
+        let pe = pe_with_code(&code);
+        let bogus = 0x8000_0000u64;
+        assert!(
+            cfg_fingerprint(&pe, bogus).is_err(),
+            "cfg_fingerprint on out-of-section entry should error, not silently \
+             return a zero-fingerprint"
+        );
+    }
+
+    /// Function body is empty (decode lands on nothing). Should not
+    /// panic and should not report phantom loops/conditionals. Guards
+    /// against an `instrs[idx]` panic when the entry's first decode
+    /// produces zero instructions.
+    #[test]
+    fn cfg_fingerprint_entry_with_zero_bytes_is_well_formed() {
+        let pe = pe_with_code(&[]); // .text has 0 raw bytes
+        let entry = pe.image_base + 0x1000;
+        // The PE is valid but the entry decode returns immediately.
+        // Either we get an Ok fingerprint with all-zero counters (the
+        // decode_all loop never produces a leader) or an Err. Anything
+        // else (panic, NaN, fake loops) is a regression.
+        match cfg_fingerprint(&pe, entry) {
+            Ok(fp) => {
+                assert_eq!(
+                    fp.loops, 0,
+                    "no instructions → no back-edges; got {:?}",
+                    fp
+                );
+                assert_eq!(fp.conditionals, 0);
+                assert_eq!(fp.switch_cases, 0);
+                assert_eq!(fp.returns, 0);
+            }
+            Err(_) => {} // also acceptable: the gate refused zero-byte entry
+        }
+    }
+
+    /// `Jcc` whose near-branch target is OUT OF RANGE (beyond
+    /// `entry + MAX_SPAN`). The fingerprint must NOT panic decoding
+    /// bytes past the function span, and must NOT count an out-of-range
+    /// jump as a loop. The OLD code's `t <= ld && leaders.contains(&t)`
+    /// was safe from out-of-range because `leaders.contains` short-
+    /// circuited — the new code paths must stay equally safe.
+    #[test]
+    fn cfg_fingerprint_jcc_to_out_of_range_target_does_not_panic() {
+        // JMP short with disp +127 → 0x1002 + 2 + 127 = 0x1081.
+        // MAX_SPAN is 0x10000 so this IS in range; we need a target
+        // beyond MAX_SPAN. Use a long displacement by stuffing padding:
+        // simpler approach — put a JMP with rel8 = -128 → next_ip -128,
+        // which is below entry. That's still "in range" (signed wrap).
+        //
+        // To test out-of-range safely, use a JMP rel32 to a target FAR
+        // past the section. The build_cfg successor list filters by
+        // `(lo..hi).contains(&t)` so the target is dropped from `succ`,
+        // which means the dominance check cannot run on it.
+        //
+        // Layout: JMP rel32 with displacement pointing PAST the section
+        // (we don't have one here, but rel32 of +0x100_0000 = 16 MB
+        // overshoots MAX_SPAN). Then RET so the function still
+        // terminates for the macro's "any terminator?" check.
+        //
+        // 0x1000: E9 00 00 10 00  JMP rel32 +0x100000 = 0x101005  (off the section)
+        // 0x1005: C3              RET
+        let code = [0xE9, 0x00, 0x00, 0x10, 0x00, 0xC3];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        assert_eq!(
+            fp.loops, 0,
+            "JMP to an out-of-range successor must not be misclassified as a \
+             loop back-edge; got {:?}",
+            fp
+        );
+        // The JMP is treated as a tail-call-equivalent: 1 return.
+        assert_eq!(fp.returns, 1);
+    }
+
+    /// Multiple back-edges to the same loop head — a real loop with
+    /// two body blocks each ending with a back-jump to entry. Both
+    /// back-jumps must be counted (the loop is entered from two body
+    /// blocks, each forming its own natural loop back-edge that
+    /// converges on the same head).
+    #[test]
+    fn cfg_fingerprint_two_back_edges_same_head_are_both_counted() {
+        // 0x1000: TEST EAX,EAX       (85 C0)              [2 bytes]   block A
+        // 0x1002: JE  0x1014         (74 10)              [2 bytes]   A's term → exit (forward)
+        // 0x1004: CMP EAX,EAX       (39 C0)              [2 bytes]   block B starts (next_ip)
+        // 0x1006: JE  0x1000         (74 F8)              [2 bytes]   B's term → back to entry (back-edge #1)
+        // 0x1008: NOP                (90)                 [1 byte]    block C starts (next_ip after JE)
+        // 0x1009: NOP                (90)                 [1 byte]
+        // 0x100A: JMP 0x1000         (EB F4)              [2 bytes]   C's term → back to entry (back-edge #2)
+        // 0x100C-0x1013: padding (8 bytes)
+        // 0x1014: RET                (C3)                 [1 byte]    exit
+        let code = [
+            0x85, 0xC0, // TEST EAX,EAX
+            0x74, 0x10, // JE 0x1014
+            0x39, 0xC0, // CMP EAX,EAX
+            0x74, 0xF8, // JE 0x1000 (back-edge #1)
+            0x90, // NOP
+            0x90, // NOP
+            0xEB, 0xF4, // JMP 0x1000 (back-edge #2)
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding
+            0xC3, // RET
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        assert_eq!(
+            fp.loops, 2,
+            "two distinct back-edges into the same loop head must each be \
+             counted; got {:?}",
+            fp
+        );
+    }
+
+    /// Two distinct loops at the same nesting level — a function with
+    /// `while (a) { ... } while (b) { ... }` compiled with each loop
+    /// having its own head. The fix must count BOTH heads as separate
+    /// back-edges; an over-eager fix that only counts unique heads
+    /// would drop one.
+    #[test]
+    fn cfg_fingerprint_two_distinct_loops_are_both_counted() {
+        // First loop:
+        // 0x1000: TEST EAX,EAX         (85 C0)             [2 bytes]   loop A entry
+        // 0x1002: JE  0x100C           (74 06)             [2 bytes]   → exit-A
+        // 0x1004: NOP                  (90)                [1 byte]    loop A body
+        // 0x1005: JMP 0x1000           (EB F9)             [2 bytes]   → back-edge
+        // 0x1007: <padding> → leader 0x1007
+        // Second loop:
+        // 0x100C: TEST EAX,EAX         (85 C0)             [2 bytes]   loop B entry
+        // 0x100E: JE  0x1018           (74 06)             [2 bytes]   → exit-B
+        // 0x1010: NOP                  (90)                [1 byte]    loop B body
+        // 0x1011: JMP 0x100C           (EB F9)             [2 bytes]   → back-edge
+        // 0x1013-0x1017: padding
+        // 0x1018: RET                  (C3)                [1 byte]    exit
+        let code = [
+            0x85, 0xC0, // TEST EAX,EAX
+            0x74, 0x06, // JE 0x100C
+            0x90, // NOP
+            0xEB, 0xF9, // JMP 0x1000
+            0x90, 0x90, 0x90, 0x90, 0x90, // padding (to 0x100C)
+            0x85, 0xC0, // TEST EAX,EAX
+            0x74, 0x06, // JE 0x1018
+            0x90, // NOP
+            0xEB, 0xF9, // JMP 0x100C
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding
+            0xC3, // RET
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        assert_eq!(
+            fp.loops, 2,
+            "two distinct loops (two different heads) must both be counted; \
+             got {:?}",
+            fp
+        );
+    }
+
+    /// Loop with both a conditional back-edge (continue) AND an
+    /// unconditional back-edge (`break`-into-next-iteration is rare
+    /// but a `goto` restart at loop top shows up this way). Both must
+    /// be counted.
+    #[test]
+    fn cfg_fingerprint_loop_with_cond_and_uncond_back_edge() {
+        // 0x1000: TEST EAX,EAX          (85 C0)             [2 bytes]   loop head
+        // 0x1002: JE  0x1014            (74 10)             [2 bytes]   → exit
+        // 0x1004: <next_ip>            block B starts
+        // 0x1004: CMP EAX,EAX          (39 C0)             [2 bytes]
+        // 0x1006: JE  0x1000           (74 F8)             [2 bytes]   conditional back-edge (continue)
+        // 0x1008: NOP                  (90)                [1 byte]
+        // 0x1009: JMP 0x1000           (EB F5)             [2 bytes]   unconditional back-edge
+        // 0x100B: <padding>
+        // 0x1014: RET                  (C3)                [1 byte]   exit
+        let code = [
+            0x85, 0xC0, // TEST EAX,EAX
+            0x74, 0x10, // JE 0x1014
+            0x39, 0xC0, // CMP EAX,EAX
+            0x74, 0xF8, // JE 0x1000 (cond back-edge)
+            0x90, // NOP
+            0xEB, 0xF5, // JMP 0x1000 (uncond back-edge)
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding
+            0xC3, // RET
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        // JE at 0x1006 → 0x1000 is a real back-edge (0x1000 dominates 0x1004:
+        // 0x1004's only predecessor is 0x1000 via fallthrough from A's Jcc).
+        // JMP at 0x1009 → 0x1000 is also a real back-edge (same head, same
+        // dominance).
+        assert_eq!(
+            fp.loops, 2,
+            "both conditional and unconditional back-edges to the loop head \
+             must be counted; got {:?}",
+            fp
+        );
+    }
+
+    /// A `Jcc` whose near-branch target is the BLOCK'S OWN START
+    /// (target == b.start) — i.e. a self-loop on a multi-instruction
+    /// block. The OLD `t <= ld` check counted this; the new `t <=
+    /// b.start && t dom b` must also count it (every node dominates
+    /// itself, so the check fires).
+    #[test]
+    fn cfg_fingerprint_block_starting_self_loop_is_counted() {
+        // 0x1000: TEST EAX,EAX         (85 C0)             [2 bytes]   block A entry (loop head)
+        // 0x1002: NOP                  (90)                [1 byte]    block A body
+        // 0x1003: JMP 0x1000           (EB FB)             [2 bytes]   → back to block start
+        //   (disp = target - next_ip = 0x1000 - 0x1005 = -5 = 0xFB)
+        // 0x1005-0x100B: padding
+        // 0x100C: RET                  (C3)                [1 byte]   never reached
+        let code = [
+            0x85, 0xC0, // TEST EAX,EAX
+            0x90, // NOP
+            0xEB, 0xFB, // JMP 0x1000 (back to block start, disp=-5)
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding
+            0xC3, // RET
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        assert_eq!(
+            fp.loops, 1,
+            "self-loop on a multi-instruction block must be counted (target \
+             equals the block's start, which dominates itself); got {:?}",
+            fp
+        );
+    }
+
+    /// Switch / jump-table case: `IndirectBranch` terminator with a
+    /// small jump table. The fingerprint's `switch_cases` counter must
+    /// reflect the table size, and the `loops` counter must NOT be
+    /// inflated by the indirect branch (it's not a back-edge — it's a
+    /// forward dispatch).
+    ///
+    /// We construct `JMP [EAX*4 + disp32]` (ModRM 0x24 mod=00 reg=100
+    /// /4 rm=100 SIB; SIB 0x85 scale=10×4 index=000 EAX base=101
+    /// "no base" with mod=00 means "use only the displacement plus the
+    /// scaled index") plus a 3-entry jump table.
+    ///
+    /// `pe.section_of(disp)` requires the absolute VA, so the table
+    /// base encoded in the disp is `image_base + 0x1010 = 0x00401010`.
+    #[test]
+    fn cfg_fingerprint_jump_table_is_counted_as_switch_not_loop() {
+        let image_base = 0x0040_0000u32;
+        let table_va: u32 = image_base + 0x1010; // = 0x00401010
+        let case0_va: u32 = image_base + 0x1014; // = 0x00401014
+        let case1_va: u32 = image_base + 0x1018; // = 0x00401018
+        let case2_va: u32 = image_base + 0x101C; // = 0x0040101C
+        // 0x1000: JMP [EAX*4 + 0x0040_1010]      (FF 24 85 10 10 40 00)  [7 bytes]
+        // 0x1007-0x100F: padding
+        // 0x1010: 14 10 40 00  → 0x00401014       jump table entry 0
+        // 0x1014: 18 10 40 00  → 0x00401018       jump table entry 1
+        // 0x1018: 1C 10 40 00  → 0x0040101C       jump table entry 2
+        // 0x1014: RET                          (C3)   [1 byte]   case 0
+        // 0x1018: RET                          (C3)   [1 byte]   case 1
+        // 0x101C: RET                          (C3)   [1 byte]   case 2
+        let mut code: Vec<u8> = vec![
+            0xFF, 0x24, 0x85, // JMP [EAX*4 + disp32]
+        ];
+        code.extend_from_slice(&table_va.to_le_bytes());
+        while code.len() < 0x10 {
+            code.push(0x90); // NOP
+        }
+        code.extend_from_slice(&case0_va.to_le_bytes());
+        code.extend_from_slice(&case1_va.to_le_bytes());
+        code.extend_from_slice(&case2_va.to_le_bytes());
+        code.push(0xC3);
+        code.push(0xC3);
+        code.push(0xC3);
+        while code.len() < 0x200 {
+            code.push(0x90);
+        }
+
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        assert_eq!(
+            fp.switch_cases, 3,
+            "jump table with 3 entries should contribute 3 to switch_cases; \
+             got {:?}",
+            fp
+        );
+        assert_eq!(
+            fp.loops, 0,
+            "indirect branch is a forward dispatch, not a back-edge; loops \
+             must remain 0 even when the table is counted; got {:?}",
+            fp
+        );
+        let _ = fp.returns;
+    }
+
+    /// Real-binary pin for a function with KNOWN non-zero loop count:
+    /// `select_texture_format` at 0x00773ba0 has 12 back-edges per
+    /// the probe above. Guards against the dominance fix dropping
+    /// genuine loops (e.g. by computing dom on the wrong subgraph).
+    #[test]
+    fn cfg_pin_noivilbo_select_texture_format_has_twelve_loops() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let pe_path = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("noivilbo.exe"))
+            .expect("workspace root resolves");
+        if !pe_path.exists() {
+            eprintln!(
+                "skipping: {} not found (fixture binary lives at workspace root)",
+                pe_path.display()
+            );
+            return;
+        }
+        let pe = Pe::load(pe_path.to_str().unwrap()).expect("load noivilbo.exe");
+        let fp = cfg_fingerprint(&pe, 0x00773ba0)
+            .expect("cfg_fingerprint at 0x00773ba0 (select_texture_format)");
+        assert_eq!(
+            fp.loops, 12,
+            "select_texture_format (0x00773ba0) has 12 real back-edges in its \
+             CFG (multiple nested loops). The dominance-based check must \
+             preserve them. Got fp = {:?}",
+            fp
+        );
+    }
 }

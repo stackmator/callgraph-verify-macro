@@ -86,109 +86,45 @@ fn decode_all(pe: &Pe, entry: u64) -> (BTreeMap<u64, Instruction>, BTreeSet<u64>
 /// A coarse, optimization-tolerant control-flow signature of a function, from its CFG.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CfgFingerprint {
-    /// Back-edges (a branch to a block at/under its own start) — natural loops.
+    /// Natural-loop back-edges: a branch from block B to block T where T
+    /// dominates B (every path from entry to B passes through T). The
+    /// dominance check is what stops a function that has several
+    /// `if (cond) goto epilog;` exits to a common tail from being reported
+    /// as having multiple "loops" — those are forward jumps in source layout
+    /// that look like back-edges once the compiler lays the tail at a lower
+    /// address, but the tail doesn't dominate the `goto` sites, so they
+    /// aren't iteration.
     pub loops: usize,
     /// Total case count across jump-table switches.
     pub switch_cases: usize,
     /// Conditional-branch terminators.
     pub conditionals: usize,
-    /// Return / interrupt terminators.
+    /// Return / interrupt / tail-call terminators.
     pub returns: usize,
 }
 
-/// Compute the coarse CFG fingerprint of the function at `entry`. Counts what is reasonably stable
-/// across optimization (loops, jump-table switches) plus raw conditional/return counts; the caller
-/// should compare these tolerantly (optimized CFGs do not map 1:1 to source).
-pub fn cfg_fingerprint(pe: &Pe, entry: u64) -> Result<CfgFingerprint, String> {
-    if !pe.is_executable_va(entry) {
-        return Err(format!("{entry:#010x} is not inside any PE section"));
-    }
-    let (lo, hi) = (entry, entry.saturating_add(MAX_SPAN));
-    let (instrs, leaders) = decode_all(pe, entry);
-    let addrs: Vec<u64> = instrs.keys().copied().collect();
-    let mut fp = CfgFingerprint::default();
-    for &ld in &leaders {
-        let mut idx = match addrs.binary_search(&ld) {
-            Ok(i) => i,
-            Err(_) => continue,
-        };
-        loop {
-            let instr = instrs[&addrs[idx]];
-            // A terminator ends the basic block. IndirectCall is NOT one: the
-            // callee returns and execution continues at the next IP (the call
-            // is "synchronous" from a CFG perspective). Counting IndirectCall
-            // as a terminator used to make functions that consist of a few
-            // indirect calls followed by a RET (e.g. CRT thunks that fan-out
-            // via the IAT) report zero terminators — a regression in the
-            // "any terminator at all?" check used by the macro's CFG diff.
-            let is_term = !matches!(
-                instr.flow_control(),
-                FlowControl::Next
-                    | FlowControl::Call
-                    | FlowControl::IndirectCall
-                    | FlowControl::XbeginXabortXend
-            );
-            if is_term {
-                match instr.flow_control() {
-                    FlowControl::ConditionalBranch => {
-                        fp.conditionals += 1;
-                        let t = instr.near_branch_target();
-                        if t <= ld && leaders.contains(&t) {
-                            fp.loops += 1;
-                        }
-                    }
-                    FlowControl::UnconditionalBranch => {
-                        let t = instr.near_branch_target();
-                        if t <= ld && leaders.contains(&t) {
-                            fp.loops += 1;
-                        } else {
-                            // Out-of-function JMP — a tail call (the callee
-                            // will RET for us). Count it as a return-equivalent
-                            // so functions that consist entirely of tail calls
-                            // (e.g. `return foo();` after inlining) aren't
-                            // reported as terminator-less. The macro's CFG
-                            // check keys off "any terminator at all"; missing
-                            // tail-call JMPs would let it fire false positives
-                            // for legitimate delegation. (BUG: tail-call JMP
-                            // didn't contribute to any fingerprint counter.)
-                            fp.returns += 1;
-                        }
-                    }
-                    FlowControl::Return | FlowControl::Interrupt => fp.returns += 1,
-                    FlowControl::IndirectBranch => {
-                        let mut cases = Vec::new();
-                        follow_jump_table(&instr, pe, lo, hi, &mut cases);
-                        fp.switch_cases += cases.len();
-                    }
-                    _ => {}
-                }
-                break;
-            }
-            idx += 1;
-            if idx >= addrs.len() || leaders.contains(&addrs[idx]) {
-                break; // fell through into the next block (no own terminator)
-            }
-        }
-    }
-    Ok(fp)
+/// One basic block in the local CFG of a function: a leader plus all
+/// instructions until the next leader or terminator, plus successors that
+/// stay in-range. Used by both [`cfg_fingerprint`] (for the natural-loop
+/// count) and [`emit_skeleton`] (for the labeled-block outline).
+struct Block {
+    start: u64,
+    body: Vec<Instruction>,
+    term: Option<Instruction>,
+    /// In-range successor block starts. Out-of-range JMPs (tail calls) and
+    /// the fall-through into the next leader are included so dominance can
+    /// see the whole local flow graph.
+    succ: Vec<u64>,
 }
 
-/// Emit the reference skeleton for the function at `entry`.
-pub fn emit_skeleton(pe: &Pe, entry: u64) -> Result<String, String> {
-    if !pe.is_executable_va(entry) {
-        return Err(format!("{entry:#010x} is not inside any PE section"));
-    }
+/// Build the local CFG of the function at `entry`: ordered blocks with
+/// successors, restricted to VAs in `[entry, entry + MAX_SPAN)`.
+fn build_cfg(pe: &Pe, entry: u64) -> (BTreeMap<u64, Instruction>, Vec<Block>) {
+    let (_, _) = (entry, entry.saturating_add(MAX_SPAN));
     let (instrs, leaders) = decode_all(pe, entry);
     let addrs: Vec<u64> = instrs.keys().copied().collect();
-
-    // Build basic blocks: from each leader, consecutive instructions until the next leader or a
-    // terminator. Record successors so we can spot back-edges (loops).
-    struct Block {
-        start: u64,
-        body: Vec<Instruction>, // non-terminator instructions
-        term: Option<Instruction>,
-        succ: Vec<u64>, // in-range successor block starts
-    }
+    let lo = entry;
+    let hi = entry.saturating_add(MAX_SPAN);
     let mut blocks: Vec<Block> = Vec::new();
     for &ld in &leaders {
         let mut idx = match addrs.binary_search(&ld) {
@@ -201,17 +137,48 @@ pub fn emit_skeleton(pe: &Pe, entry: u64) -> Result<String, String> {
         loop {
             let a = addrs[idx];
             let instr = instrs[&a];
+            // IndirectCall is NOT a terminator: the callee returns and
+            // execution continues at the next IP, so the call is
+            // "synchronous" from a CFG perspective.
             let is_term = !matches!(
                 instr.flow_control(),
-                FlowControl::Next | FlowControl::Call | FlowControl::XbeginXabortXend
+                FlowControl::Next
+                    | FlowControl::Call
+                    | FlowControl::IndirectCall
+                    | FlowControl::XbeginXabortXend
             );
             if is_term {
                 match instr.flow_control() {
                     FlowControl::ConditionalBranch => {
-                        succ.push(instr.near_branch_target());
-                        succ.push(instr.next_ip());
+                        let t = instr.near_branch_target();
+                        if (lo..hi).contains(&t) {
+                            succ.push(t);
+                        }
+                        let n = instr.next_ip();
+                        if (lo..hi).contains(&n) {
+                            succ.push(n);
+                        }
                     }
-                    FlowControl::UnconditionalBranch => succ.push(instr.near_branch_target()),
+                    FlowControl::UnconditionalBranch => {
+                        let t = instr.near_branch_target();
+                        if (lo..hi).contains(&t) {
+                            succ.push(t);
+                        }
+                    }
+                    FlowControl::IndirectBranch => {
+                        // Switch / jump-table dispatch: every in-range
+                        // case is a successor of this block. The
+                        // dominator set can then see the indirect
+                        // dispatch as a forward fan-out (no back-edge
+                        // through a switch).
+                        let mut cases = Vec::new();
+                        follow_jump_table(&instr, pe, lo, hi, &mut cases);
+                        for c in cases {
+                            if (lo..hi).contains(&c) {
+                                succ.push(c);
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 term = Some(instr);
@@ -223,7 +190,7 @@ pub fn emit_skeleton(pe: &Pe, entry: u64) -> Result<String, String> {
                 break;
             }
             if leaders.contains(&addrs[idx]) {
-                succ.push(addrs[idx]); // falls through into the next block
+                succ.push(addrs[idx]);
                 break;
             }
         }
@@ -235,12 +202,147 @@ pub fn emit_skeleton(pe: &Pe, entry: u64) -> Result<String, String> {
         });
     }
     blocks.sort_by_key(|b| b.start);
+    (instrs, blocks)
+}
 
-    // Loop heads = targets of a back-edge (successor addr <= the block's own start).
+/// Iterative dominator set computation on the local CFG: for each block `n`,
+/// `dom[n]` is the set of blocks that appear on EVERY path from `entry` to
+/// `n` (including `n` itself). Standard textbook algorithm — small enough
+/// for the size of CFG we deal with here (max ~64KB). Blocks unreachable
+/// from `entry` are kept in the map with an empty set so callers can detect
+/// them, but in practice `decode_all` only follows reachable leaders so
+/// unreachable blocks shouldn't appear.
+fn dominators(entry: u64, blocks: &[Block]) -> BTreeMap<u64, BTreeSet<u64>> {
+    let starts: BTreeSet<u64> = blocks.iter().map(|b| b.start).collect();
+    let mut preds: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    for b in blocks {
+        for &s in &b.succ {
+            if starts.contains(&s) {
+                preds.entry(s).or_default().insert(b.start);
+            }
+        }
+    }
+    let mut dom: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    if !starts.contains(&entry) {
+        return dom;
+    }
+    let mut entry_set: BTreeSet<u64> = BTreeSet::new();
+    entry_set.insert(entry);
+    dom.insert(entry, entry_set.clone());
+    for &s in &starts {
+        if s != entry {
+            dom.insert(s, starts.clone());
+        }
+    }
+    let order: Vec<u64> = blocks.iter().map(|b| b.start).collect();
+    loop {
+        let mut changed = false;
+        for &n in &order {
+            if n == entry {
+                continue;
+            }
+            let empty: BTreeSet<u64> = BTreeSet::new();
+            let ps = preds.get(&n).unwrap_or(&empty);
+            if ps.is_empty() {
+                continue;
+            }
+            let first = ps.iter().next().unwrap();
+            let mut new_dom = dom.get(first).cloned().unwrap_or_else(|| starts.clone());
+            for &p in ps {
+                let pd = dom.get(&p).cloned().unwrap_or_else(|| starts.clone());
+                new_dom = new_dom.intersection(&pd).copied().collect();
+            }
+            new_dom.insert(n);
+            if dom.get(&n) != Some(&new_dom) {
+                dom.insert(n, new_dom);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    dom
+}
+
+/// Compute the coarse CFG fingerprint of the function at `entry`. Counts what is reasonably stable
+/// across optimization (loops, jump-table switches) plus raw conditional/return counts; the caller
+/// should compare these tolerantly (optimized CFGs do not map 1:1 to source).
+pub fn cfg_fingerprint(pe: &Pe, entry: u64) -> Result<CfgFingerprint, String> {
+    if !pe.is_executable_va(entry) {
+        return Err(format!("{entry:#010x} is not inside any PE section"));
+    }
+    let (lo, hi) = (entry, entry.saturating_add(MAX_SPAN));
+    let (instrs, blocks) = build_cfg(pe, entry);
+    let dom = dominators(entry, &blocks);
+    let mut fp = CfgFingerprint::default();
+    for b in &blocks {
+        let Some(instr) = b.term else {
+            continue;
+        };
+        match instr.flow_control() {
+            FlowControl::ConditionalBranch => {
+                fp.conditionals += 1;
+                let t = instr.near_branch_target();
+                // Natural-loop back-edge: `t -> b.start` is a back-edge iff
+                // `t` dominates `b.start` — every path from `entry` to
+                // `b.start` passes through `t`. The textbook definition
+                // gives "target dominates source", which is exactly
+                // `dom[source].contains(target)`.
+                if t <= b.start
+                    && dom.get(&b.start).is_some_and(|d| d.contains(&t))
+                {
+                    fp.loops += 1;
+                }
+            }
+            FlowControl::UnconditionalBranch => {
+                let t = instr.near_branch_target();
+                if t <= b.start && dom.get(&b.start).is_some_and(|d| d.contains(&t))
+                {
+                    fp.loops += 1;
+                } else {
+                    // Out-of-function JMP — a tail call (the callee will RET
+                    // for us). Count it as a return-equivalent so functions
+                    // that consist entirely of tail calls (e.g. `return
+                    // foo();` after inlining) aren't reported as
+                    // terminator-less. The macro's CFG check keys off "any
+                    // terminator at all"; missing tail-call JMPs would let
+                    // it fire false positives for legitimate delegation.
+                    fp.returns += 1;
+                }
+            }
+            FlowControl::Return | FlowControl::Interrupt => fp.returns += 1,
+            FlowControl::IndirectBranch => {
+                let mut cases = Vec::new();
+                follow_jump_table(&instr, pe, lo, hi, &mut cases);
+                fp.switch_cases += cases.len();
+            }
+            _ => {}
+        }
+        let _ = &instrs;
+    }
+    Ok(fp)
+}
+
+/// Emit the reference skeleton for the function at `entry`.
+pub fn emit_skeleton(pe: &Pe, entry: u64) -> Result<String, String> {
+    if !pe.is_executable_va(entry) {
+        return Err(format!("{entry:#010x} is not inside any PE section"));
+    }
+    let (instrs, blocks) = build_cfg(pe, entry);
+    let _ = &instrs;
+
+    // Loop heads = targets of a natural-loop back-edge (a branch from B to T
+    // where T strictly precedes B AND T dominates B). The dominance test is
+    // what excludes the false positives that the older `succ <= start` test
+    // used to flag: an `if (cond) goto epilog;` that the compiler laid out
+    // below its `if`s looks like a back-edge by address, but the epilog
+    // doesn't dominate the `if` site, so it isn't a loop.
+    let dom = dominators(entry, &blocks);
     let mut loop_heads: BTreeSet<u64> = BTreeSet::new();
     for b in &blocks {
         for &s in &b.succ {
-            if s <= b.start && leaders.contains(&s) {
+            if s <= b.start && dom.get(&b.start).is_some_and(|d| d.contains(&s)) {
                 loop_heads.insert(s);
             }
         }
