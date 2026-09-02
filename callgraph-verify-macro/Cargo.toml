@@ -18,6 +18,6 @@ proc-macro = true
 
 [dependencies]
 callgraph-verify = { path = "../callgraph-verify" }
-syn = { version = "2", features = ["full"] }
+syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
 proc-macro2 = "1"

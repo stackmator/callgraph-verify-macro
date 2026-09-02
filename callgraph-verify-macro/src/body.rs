@@ -9,6 +9,8 @@
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use std::collections::HashSet;
+use syn::visit::{self, Visit};
+use syn::{Block, Expr, ExprCall, ExprLit, ExprMethodCall, ImplItemFn, ItemFn, Lit};
 
 /// Common std/core/trait method names that collide with generically-named ported
 /// fns; resolving them by bare name is unreliable, so they're excluded (same list
@@ -75,65 +77,151 @@ pub struct BodyCalls {
     pub method: HashSet<String>,
 }
 
-/// Walks the WHOLE token stream (attributes, fn head, body) collecting call
-/// idents. Retained as a public API for callers that want the full inventory;
-/// the macro's own verifier uses [`collect_body_calls_only`] which excludes
-/// leading attributes and the fn head.
-#[allow(dead_code)]
-pub fn collect_call_idents(ts: TokenStream) -> BodyCalls {
-    let mut out = BodyCalls::default();
-    walk(ts, &mut out);
-    out
+/// Everything the verifier harvests from one function body in a single syn
+/// pass: call NAMES (for the corpus diff), per-site call EXPRESSIONS with
+/// classified args (for the ARG-SHAPE diff), and MACRO invocations — whose
+/// bodies are opaque token streams the verifier cannot see (surfaced as a
+/// NOTE by the macro, never silently skipped).
+pub struct FnBodyFacts {
+    pub names: BodyCalls,
+    pub exprs: Vec<CallExpr>,
+    pub macros: Vec<String>,
 }
 
-/// Walk only the function body (the `{ ... }` block), skipping the function
-/// name itself, its parameters, AND any `#[attribute(...)]` on the item. The
-/// raw `walk` over the entire item conflated three things that look like
-/// calls but aren't: the function's own name (`fn outer() { … }` matches
-/// `outer()` because `outer` is an Ident followed by a parenthesized group),
-/// the attribute macro name (`#[serde(...)]` matches `serde(...)`), and any
-/// call embedded inside an attribute (`#[some_attr(default = helper())]`).
-/// All three polluted the corpus diff with bogus names. (BUG #13 / #14)
-pub fn collect_body_calls_only(ts: TokenStream) -> BodyCalls {
-    let mut out = BodyCalls::default();
-    if let Some(body) = find_body_group(ts) {
-        walk(body, &mut out);
+struct FnBodyVisitor {
+    facts: FnBodyFacts,
+}
+
+impl<'ast> Visit<'ast> for FnBodyVisitor {
+    fn visit_expr_call(&mut self, e: &'ast ExprCall) {
+        if let Expr::Path(p) = &*e.func {
+            if let Some(seg) = p.path.segments.last() {
+                let name = seg.ident.to_string();
+                self.facts.exprs.push(CallExpr {
+                    name: name.clone(),
+                    is_method: false,
+                    // Turbofish (`foo::<u32>(..)`) lives in the path segment's
+                    // generic arguments; the callee name is still the segment
+                    // ident, so explicit generics resolve like plain calls.
+                    args: e.args.iter().map(classify_expr).collect(),
+                });
+                self.facts.names.plain.insert(name);
+            }
+        }
+        visit::visit_expr_call(self, e);
     }
-    out
+
+    fn visit_expr_method_call(&mut self, m: &'ast ExprMethodCall) {
+        let name = m.method.to_string();
+        self.facts.exprs.push(CallExpr {
+            name: name.clone(),
+            is_method: true,
+            args: m.args.iter().map(classify_expr).collect(),
+        });
+        self.facts.names.method.insert(name);
+        visit::visit_expr_method_call(self, m);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if let Some(seg) = mac.path.segments.last() {
+            self.facts.macros.push(seg.ident.to_string());
+        }
+        // No recursion into `mac.tokens`: a macro body is an opaque token
+        // stream — calls/loops inside it cannot be statically verified. The
+        // macro surfaces `macros` as an OPAQUE-MACRO note instead.
+    }
 }
 
-fn find_body_group(ts: TokenStream) -> Option<TokenStream> {
-    // Walk the token tree at the top level; the first `{...}` group at the
-    // SHALLOWEST depth that follows `fn <name>(...)` is the body. Any earlier
-    // `{...}` belongs to something else (struct literals, blocks in attribute
-    // args, etc.) — but those aren't reached from a top-level `fn`, so the
-    // first brace group we see AFTER we've seen the parameter parens is the
-    // body. To handle attributes (each `[...]` group) and nested generics
-    // cleanly, we just track a small state machine: ignore tokens until we
-    // see `fn <ident>` followed by a `(...)` group, then the next `{...}` group
-    // is the body.
-    let tts: Vec<TokenTree> = ts.into_iter().collect();
-    let mut i = 0;
-    while i < tts.len() {
-        match &tts[i] {
-            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => {
-                return Some(g.stream());
-            }
-            TokenTree::Ident(id) if id.to_string() == "fn" => {
-                // Skip `fn`, then the name (one Ident), then the `(...)` group.
-                i += 1;
-                // Optional name (could be path with `::` — consume up to `(`).
-                while i < tts.len() && !matches!(&tts[i], TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis) {
-                    i += 1;
-                }
-                if i < tts.len() {
-                    i += 1; // past `(...)`
-                }
-            }
-            _ => i += 1,
+/// Harvest [`FnBodyFacts`] from a parsed block. Syn-based on purpose: the
+/// token-tree walker mis-classified turbofish calls (`foo::<u32>(x)` — an
+/// Ident followed by `::`/`<` puncts, not a paren group) as "not a call",
+/// counted tuple-pattern destructures (`let Foo(a) = y;`) as calls, and could
+/// not distinguish a macro invocation from anything else.
+pub fn collect_block_facts(block: &Block) -> FnBodyFacts {
+    let mut v = FnBodyVisitor {
+        facts: FnBodyFacts {
+            names: BodyCalls::default(),
+            exprs: Vec::new(),
+            macros: Vec::new(),
+        },
+    };
+    v.visit_block(block);
+    v.facts
+}
+
+/// A `#[origin]`-attributed item: a free fn or an impl/trait method (attribute
+/// macros receive both as `attrs + fn-head + block` token streams).
+pub enum FnLike {
+    Free(ItemFn),
+    Method(ImplItemFn),
+}
+
+impl FnLike {
+    pub fn block(&self) -> &Block {
+        match self {
+            FnLike::Free(f) => &f.block,
+            FnLike::Method(m) => &m.block,
         }
     }
-    None
+}
+
+/// Parse the attribute's item as a function (free or method). `Err` means the
+/// macro was applied to a non-fn item — the caller turns that into a
+/// `compile_error!` instead of walking e.g. a struct's field list as a "body".
+pub fn parse_fn_like(ts: &TokenStream) -> syn::Result<FnLike> {
+    if let Ok(f) = syn::parse2::<ItemFn>(ts.clone()) {
+        return Ok(FnLike::Free(f));
+    }
+    syn::parse2::<ImplItemFn>(ts.clone()).map(FnLike::Method)
+}
+
+/// Classify a parsed argument expression into a [`RustArg`], mirroring the
+/// binary-side `ArgKind`. Only confidently-classifiable forms are concrete:
+/// integer literals (`Imm`, any base, suffix tolerated), the byte-helper
+/// idioms `rd*(base, 0xNN)` (`Field`) and `g*(addr)` (`Global`). Floats,
+/// negatives, paths, arithmetic and macro output are `Other` — the ARG-SHAPE
+/// diff skips non-concrete positions.
+pub fn classify_expr(e: &Expr) -> RustArg {
+    match e {
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(li), ..
+        }) => li
+            .base10_parse::<u64>()
+            .map(RustArg::Imm)
+            .unwrap_or(RustArg::Other),
+        Expr::Call(c) => {
+            let Expr::Path(p) = &*c.func else {
+                return RustArg::Other;
+            };
+            if p.path.segments.len() != 1 {
+                return RustArg::Other;
+            }
+            let name = p.path.segments[0].ident.to_string();
+            let args: Vec<&Expr> = c.args.iter().collect();
+            if matches!(
+                name.as_str(),
+                "rd8" | "rd16" | "rd32" | "rd64" | "rdf32" | "rdf64"
+            ) && args.len() >= 2
+            {
+                if let RustArg::Imm(off) = classify_expr(args[1]) {
+                    return RustArg::Field(off);
+                }
+                return RustArg::Other;
+            }
+            if matches!(
+                name.as_str(),
+                "g8" | "g16" | "g32" | "g64" | "gf32" | "gf64"
+            ) && !args.is_empty()
+            {
+                return match classify_expr(args[0]) {
+                    RustArg::Imm(a) | RustArg::Global(a) => RustArg::Global(a),
+                    _ => RustArg::Other,
+                };
+            }
+            RustArg::Other
+        }
+        _ => RustArg::Other,
+    }
 }
 
 /// A recovered Rust argument, classified to mirror the binary-side `callgraph_verify::ArgKind`
@@ -148,105 +236,11 @@ pub enum RustArg {
 
 /// One call expression in the body: the callee name, whether it was a method call (`x.f(..)`),
 /// and its classified positional arguments.
+#[derive(Debug)]
 pub struct CallExpr {
     pub name: String,
     pub is_method: bool,
     pub args: Vec<RustArg>,
-}
-
-/// Parse a hex/decimal integer literal token string (suffix and `_` separators tolerated).
-fn parse_int(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        let hex: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_hexdigit() || *c == '_')
-            .filter(|c| *c != '_')
-            .collect();
-        return u64::from_str_radix(&hex, 16).ok();
-    }
-    let dec: String = s
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '_')
-        .filter(|c| *c != '_')
-        .collect();
-    if dec.is_empty() {
-        None
-    } else {
-        dec.parse().ok()
-    }
-}
-
-/// Split a parenthesized token stream into its top-level (comma-separated) argument token lists.
-fn split_args(ts: TokenStream) -> Vec<Vec<TokenTree>> {
-    let mut out = vec![Vec::new()];
-    for tt in ts {
-        if let TokenTree::Punct(p) = &tt {
-            if p.as_char() == ',' {
-                out.push(Vec::new());
-                continue;
-            }
-        }
-        out.last_mut().unwrap().push(tt);
-    }
-    if out.last().map(|v| v.is_empty()).unwrap_or(false) {
-        out.pop();
-    }
-    out
-}
-
-/// Classify one argument's token slice into a `RustArg`. Recognizes integer literals
-/// (`Imm`), the project byte-helper idioms `rd*(base, 0xNN)` (`Field`) and `g*(0xNN)`
-/// (`Global`), and a bare in-image address literal (`Global`); everything else is `Other`.
-fn classify_arg(toks: &[TokenTree]) -> RustArg {
-    // Bare integer literal.
-    if toks.len() == 1 {
-        if let TokenTree::Literal(l) = &toks[0] {
-            if let Some(v) = parse_int(&l.to_string()) {
-                // A bare literal is an immediate (even a raw address literal — the binary `PUSH`es
-                // it as an immediate too); `g*(addr)` below is what reads a global's contents.
-                return RustArg::Imm(v);
-            }
-        }
-    }
-    // `name(...)` / `path::name(...)` — find the callee name + its argument group.
-    let grp_idx = toks
-        .iter()
-        .position(|t| matches!(t, TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis));
-    if let Some(gi) = grp_idx {
-        if gi > 0 {
-            if let (TokenTree::Ident(name), TokenTree::Group(g)) = (&toks[gi - 1], &toks[gi]) {
-                let name = name.to_string();
-                let inner = split_args(g.stream());
-                // rd8/rd16/rd32/rdf32/... (base, offset) → field access at `offset`. Use an
-                // explicit list (mirroring the `g*` arm below) so that names like `read`
-                // or `rdata` aren't mis-classified as struct-field helpers just because
-                // they happen to start with `rd`. (BUG #7) Extend this list when new
-                // byte-helper width variants are introduced.
-                if matches!(
-                    name.as_str(),
-                    "rd8" | "rd16" | "rd32" | "rd64" | "rdf32" | "rdf64"
-                ) && inner.len() >= 2
-                {
-                    if let RustArg::Imm(off) = classify_arg(&inner[1]) {
-                        return RustArg::Field(off);
-                    }
-                    return RustArg::Other;
-                }
-                // g8/g16/g32/gf32/... (addr) → global at `addr`.
-                if matches!(
-                    name.as_str(),
-                    "g8" | "g16" | "g32" | "g64" | "gf32" | "gf64"
-                ) && !inner.is_empty()
-                {
-                    if let RustArg::Global(a) | RustArg::Imm(a) = classify_arg(&inner[0]) {
-                        return RustArg::Global(a);
-                    }
-                }
-            }
-        }
-    }
-    RustArg::Other
 }
 
 /// Coarse control-flow keyword counts of a body, for the CFG-fingerprint diff. Counts keyword
@@ -330,7 +324,7 @@ fn walk_for_fake_loops(ts: TokenStream, f: &mut FakeLoops) {
             // is structurally different (iterator expression matters even if
             // the body breaks immediately).
             if let Some(TokenTree::Ident(prev)) = tts.get(i.wrapping_sub(1)) {
-                if prev.to_string() == "for" {
+                if prev == "for" {
                     continue;
                 }
             }
@@ -396,8 +390,7 @@ fn is_placeholder_break_body(body: TokenStream) -> bool {
     for tt in body {
         match tt {
             TokenTree::Ident(id) => {
-                let s = id.to_string();
-                if s == "break" && !seen_break {
+                if id == "break" && !seen_break {
                     seen_break = true;
                 } else {
                     return false;
@@ -427,42 +420,6 @@ fn count_kw(ts: TokenStream, c: &mut RustCfg) {
     }
 }
 
-pub fn collect_call_exprs(ts: TokenStream) -> Vec<CallExpr> {
-    let mut out = Vec::new();
-    if let Some(body) = find_body_group(ts.clone()) {
-        walk_calls(body, &mut out);
-    } else {
-        walk_calls(ts, &mut out);
-    }
-    out
-}
-
-fn walk_calls(ts: TokenStream, out: &mut Vec<CallExpr>) {
-    let tts: Vec<TokenTree> = ts.into_iter().collect();
-    for (i, tt) in tts.iter().enumerate() {
-        if let TokenTree::Group(g) = tt {
-            walk_calls(g.stream(), out); // recurse into every group, incl. argument groups
-        }
-        if let TokenTree::Ident(id) = tt {
-            if let Some(TokenTree::Group(g)) = tts.get(i + 1) {
-                if g.delimiter() == Delimiter::Parenthesis {
-                    let is_method =
-                        i > 0 && matches!(&tts[i - 1], TokenTree::Punct(p) if p.as_char() == '.');
-                    let args = split_args(g.stream())
-                        .iter()
-                        .map(|a| classify_arg(a))
-                        .collect();
-                    out.push(CallExpr {
-                        name: id.to_string(),
-                        is_method,
-                        args,
-                    });
-                }
-            }
-        }
-    }
-}
-
 /// Collect every **hex** integer literal (`0x...`) appearing anywhere in a token
 /// stream, type-suffix and `_` separators tolerated (`0x00b333b0u32`, `0xa7_e38c`).
 /// Used by the opt-in operand-fact check to harvest the in-image ADDRESS constants
@@ -471,11 +428,7 @@ fn walk_calls(ts: TokenStream, out: &mut Vec<CallExpr>) {
 /// literal that coincidentally lands in a PE section would be a false positive.
 pub fn collect_hex_literals(ts: TokenStream) -> Vec<u64> {
     let mut out = Vec::new();
-    if let Some(body) = find_body_group(ts.clone()) {
-        walk_hex(body, &mut out);
-    } else {
-        walk_hex(ts, &mut out);
-    }
+    walk_hex(ts, &mut out);
     out
 }
 
@@ -505,191 +458,162 @@ fn walk_hex(ts: TokenStream, out: &mut Vec<u64>) {
     }
 }
 
-fn walk(ts: TokenStream, out: &mut BodyCalls) {
-    let tts: Vec<TokenTree> = ts.into_iter().collect();
-    for (i, tt) in tts.iter().enumerate() {
-        if let TokenTree::Group(g) = tt {
-            walk(g.stream(), out); // recurse into every group (incl. the body block)
-        }
-        if let TokenTree::Ident(id) = tt {
-            let followed_by_parens = matches!(
-                tts.get(i + 1),
-                Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis
-            );
-            if !followed_by_parens {
-                continue;
-            }
-            let is_method =
-                i > 0 && matches!(&tts[i - 1], TokenTree::Punct(p) if p.as_char() == '.');
-            if is_method {
-                out.method.insert(id.to_string());
-            } else {
-                out.plain.insert(id.to_string());
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::body::{collect_call_idents, collect_hex_literals};
-    use proc_macro2::{Delimiter, Group, Ident, Span, TokenStream, TokenTree};
+    use proc_macro2::TokenStream;
+    use quote::ToTokens;
     use std::str::FromStr;
 
-    /// Parse `s` as a TokenStream and return its token-tree slice — this is the
-    /// shape `classify_arg` expects.
-    fn toks(s: &str) -> Vec<TokenTree> {
-        TokenStream::from_str(s)
-            .expect("parse")
-            .into_iter()
-            .collect()
+    /// Parse a full `fn` source and harvest facts from its body block — the
+    /// exact path `verify_impl` takes (`parse_fn_like` -> `collect_block_facts`).
+    fn facts_of(src: &str) -> FnBodyFacts {
+        let f: ItemFn = syn::parse_str(src).expect("parse fn");
+        collect_block_facts(&f.block)
     }
 
-    /// Build `name(arg1, arg2, ...)` as a token slice by parsing each piece
-    /// individually and stitching.
-    fn call_toks(name: &str, args: &[&str]) -> Vec<TokenTree> {
-        let mut v = vec![TokenTree::Ident(Ident::new(name, Span::call_site()))];
-        let mut inner: TokenStream = TokenStream::new();
-        for (i, a) in args.iter().enumerate() {
-            if i > 0 {
-                inner.extend(TokenStream::from_str(",").unwrap());
-            }
-            inner.extend(TokenStream::from_str(a).unwrap());
-        }
-        v.push(TokenTree::Group(Group::new(Delimiter::Parenthesis, inner)));
-        v
+    fn hex_of_body(src: &str) -> Vec<u64> {
+        let f: ItemFn = syn::parse_str(src).expect("parse fn");
+        let ts = f.block.to_token_stream();
+        collect_hex_literals(ts)
     }
 
-    // --- classify_arg (BUG #7) --------------------------------------------
+    // --- syn visitor: turbofish / patterns / macros -------------------------
 
-    /// Regression: the old `starts_with("rd")` over-matched every name that
-    /// started with `rd` (`read`, `rdata`, …) and classified it as a struct-field
-    /// access. With an explicit list, only the canonical byte helpers count.
+    /// Regression (audit probe): `foo::<u32>(1)` was INVISIBLE to the old
+    /// token walker (an Ident followed by `::`/`<` puncts, not a paren group)
+    /// — a real call missed -> false MISSING; a hallucinated call missed ->
+    /// false pass. The syn visitor sees `ExprCall` regardless of turbofish.
     #[test]
-    fn classify_arg_rd_helpers_are_field() {
+    fn turbofish_call_is_collected() {
+        let facts = facts_of("fn f() { foo::<u32>(1); }");
+        assert!(facts.names.plain.contains("foo"), "{:?}", facts.names.plain);
+        assert_eq!(facts.exprs.len(), 1, "{:?}", facts.exprs);
+        assert_eq!(facts.exprs[0].name, "foo");
+        assert!(!facts.exprs[0].is_method);
+    }
+
+    #[test]
+    fn turbofish_method_call_is_collected_as_method() {
+        let facts = facts_of("fn f() { x.foo::<u32>(1); }");
+        assert!(facts.names.method.contains("foo"), "{:?}", facts.names.method);
+        assert!(facts.names.plain.is_empty(), "{:?}", facts.names.plain);
+        assert!(facts.exprs.len() == 1 && facts.exprs[0].is_method, "{:?}", facts.exprs);
+    }
+
+    /// A tuple-struct pattern `let Foo(a) = y;` is a PATTERN, not a call
+    /// expression — the token walker counted `Foo` as a call (noise in the
+    /// corpus diff); the syn visitor must not.
+    #[test]
+    fn tuple_struct_pattern_is_not_a_call() {
+        let facts = facts_of("fn f(y: Foo) { let Foo(_a) = y; }");
+        assert!(facts.names.plain.is_empty(), "{:?}", facts.names.plain);
+        assert!(facts.exprs.is_empty(), "{:?}", facts.exprs);
+    }
+
+    /// Macro invocations are OPAQUE: captured by name in `facts.macros` (the
+    /// macro emits an OPAQUE-MACRO note) and NOT recursed — `all_work!(x)`
+    /// inside the body must not contribute call names or CFG keywords.
+    #[test]
+    fn macro_invocations_are_captured_and_not_recursed() {
+        let facts = facts_of("fn f() { my_macro!(); other!(1, 2); }");
+        assert!(facts.macros.contains(&"my_macro".to_string()), "{:?}", facts.macros);
+        assert!(facts.macros.contains(&"other".to_string()), "{:?}", facts.macros);
+        assert!(facts.names.plain.is_empty(), "{:?}", facts.names.plain);
+        assert!(facts.exprs.is_empty(), "{:?}", facts.exprs);
+    }
+
+    /// Path-qualified calls record just the trailing segment (B-04).
+    #[test]
+    fn path_qualified_call_records_trailing_segment() {
+        let facts = facts_of("fn f() { crate::module::func(1, 2); }");
+        assert!(facts.names.plain.contains("func"), "{:?}", facts.names.plain);
+        assert!(!facts.names.plain.contains("crate"), "{:?}", facts.names.plain);
+        assert!(!facts.names.plain.contains("module"), "{:?}", facts.names.plain);
+    }
+
+    /// The fn's own name and anything inside attributes are not body calls —
+    /// `collect_block_facts` only sees the parsed Block. (BUG #13 / #14)
+    #[test]
+    fn fn_name_and_attrs_are_not_body_calls() {
+        let src = "#[some_attr(default = attribute_fn())] fn outer() { real_fn(); }";
+        let f: ItemFn = syn::parse_str(src).expect("parse fn");
+        let facts = collect_block_facts(&f.block);
+        assert!(facts.names.plain.contains("real_fn"), "{:?}", facts.names.plain);
+        assert!(!facts.names.plain.contains("attribute_fn"), "{:?}", facts.names.plain);
+        assert!(!facts.names.plain.contains("outer"), "{:?}", facts.names.plain);
+    }
+
+    // --- classify_expr (ARG-SHAPE argument classification) ------------------
+
+    /// Only the canonical byte-helper names classify as field accesses; the
+    /// old `starts_with("rd")` over-matched `read`/`rdata`. (BUG #7)
+    #[test]
+    fn classify_expr_rd_helpers_are_field() {
         for name in ["rd8", "rd16", "rd32", "rd64", "rdf32", "rdf64"] {
-            let toks = call_toks(name, &["base", "0x10"]);
-            assert!(
-                matches!(classify_arg(&toks), RustArg::Field(0x10)),
-                "{name}(base, 0x10) should be Field(0x10), got {:?}",
-                classify_arg(&toks)
-            );
+            let e: Expr = syn::parse_str(&format!("{name}(base, 0x10)")).unwrap();
+            assert!(matches!(classify_expr(&e), RustArg::Field(0x10)), "{name}");
         }
-    }
-
-    #[test]
-    fn classify_arg_non_rd_helpers_are_other() {
-        // `read` and `rdata` start with `rd` but are NOT byte-helper idioms.
-        // They must classify as Other, not Field — otherwise a call like
-        // `read(p, 0x10)` would be reported as a field access at 0x10.
         for name in ["read", "rdata", "rdb", "rdr"] {
-            let toks = call_toks(name, &["base", "0x10"]);
-            assert!(
-                matches!(classify_arg(&toks), RustArg::Other),
-                "{name}(base, 0x10) should be Other (not a byte helper), got {:?}",
-                classify_arg(&toks)
-            );
+            let e: Expr = syn::parse_str(&format!("{name}(base, 0x10)")).unwrap();
+            assert!(matches!(classify_expr(&e), RustArg::Other), "{name}");
         }
     }
 
     #[test]
-    fn classify_arg_g_helpers_are_global() {
+    fn classify_expr_g_helpers_are_global() {
         for name in ["g8", "g16", "g32", "g64", "gf32", "gf64"] {
-            let toks = call_toks(name, &["0x00BEEF"]);
-            assert!(
-                matches!(classify_arg(&toks), RustArg::Global(0xBEEF)),
-                "{name}(0xBEEF) should be Global(0xBEEF), got {:?}",
-                classify_arg(&toks)
-            );
+            let e: Expr = syn::parse_str(&format!("{name}(0x00BEEF)")).unwrap();
+            assert!(matches!(classify_expr(&e), RustArg::Global(0xBEEF)), "{name}");
         }
     }
 
     #[test]
-    fn classify_arg_bare_literal_is_immediate() {
-        let toks = toks("0x10");
-        assert!(matches!(classify_arg(&toks), RustArg::Imm(0x10)));
+    fn classify_expr_int_literal_is_imm() {
+        for lit in ["0x10", "16", "16u32", "0x10_u32"] {
+            let e: Expr = syn::parse_str(lit).unwrap();
+            assert!(matches!(classify_expr(&e), RustArg::Imm(0x10)), "{lit}");
+        }
+    }
+
+    /// A float literal must NOT classify as a concrete immediate — the old
+    /// token parse of "1.5" yielded Imm(1) and fed ARG-SHAPE a fabricated
+    /// constant to mismatch against.
+    #[test]
+    fn classify_expr_float_is_other() {
+        for lit in ["1.5", "1.5f32", "2e3"] {
+            let e: Expr = syn::parse_str(lit).unwrap();
+            assert!(matches!(classify_expr(&e), RustArg::Other), "{lit}");
+        }
     }
 
     #[test]
-    fn classify_arg_rd_with_non_literal_offset_is_other() {
-        // The offset must be a literal int to be classified as Field; anything
-        // else falls through to Other. Guards against classifying a variable
-        // offset as a known field.
-        let toks = call_toks("rd32", &["base", "offset"]);
-        assert!(matches!(classify_arg(&toks), RustArg::Other));
+    fn classify_expr_rd_with_non_literal_offset_is_other() {
+        let e: Expr = syn::parse_str("rd32(base, offset)").unwrap();
+        assert!(matches!(classify_expr(&e), RustArg::Other));
     }
 
-    // --- collect_call_idents / collect_call_exprs / collect_hex_literals ---
+    // --- collect_hex_literals (operand-fact check input) --------------------
 
-    /// `collect_body_calls_only` walks only the function body's `{ ... }`
-    /// group, skipping leading `#[attribute(...)]` and the `fn name(...)`
-    /// head. A function call embedded in an attribute
-    /// (e.g. `#[serde(default = some_fn())]`) must NOT pollute the corpus
-    /// diff, and the function's own name (`fn outer() { … }`) must not be
-    /// counted as a self-call. (BUG #13 / #14)
-    #[test]
-    fn collect_body_calls_only_skips_attributes_and_fn_name() {
-        // Simulate an item: an attribute group with a call, the fn head, and a
-        // real body call. Real body has `real_fn()`. Attribute contains
-        // `attribute_fn()`. The fn name itself is `outer`.
-        let ts = TokenStream::from_str(
-            "#[some_attr(default = attribute_fn())] pub fn outer() { real_fn(); }",
-        )
-        .unwrap();
-        let calls = collect_body_calls_only(ts);
-        assert!(
-            calls.plain.contains("real_fn"),
-            "real_fn (in body) should be picked up: {:?}",
-            calls.plain
-        );
-        assert!(
-            !calls.plain.contains("attribute_fn"),
-            "attribute_fn (inside #[..]) should NOT be picked up as a body call: {:?}",
-            calls.plain
-        );
-        assert!(
-            !calls.plain.contains("outer"),
-            "fn name `outer` should NOT be counted as a self-call: {:?}",
-            calls.plain
-        );
-    }
-
-    /// `collect_hex_literals` also walks only the body — hex literals inside
-    /// `#[origin(0xA, calls = [0xB, 0xC])]` are NOT included. The macro
-    /// itself applies `v == args.addr` to skip the function's own address,
-    /// and the operand check should only see addresses the BODY actually
-    /// bakes in (global reads, vtable VAs, fn pointers pushed as immediates),
-    /// not the declared `calls = [..]` / `globals = [..]` lists which are
-    /// already validated by the explicit `Spec` clauses. (BUG #13)
+    /// The caller passes ONLY the body block (`parse_fn_like` -> block), so
+    /// hex inside `#[origin(0xA, calls = [0xB, 0xC])]` structurally cannot
+    /// leak into the operand check. (BUG #13)
     #[test]
     fn collect_hex_literals_excludes_attribute_addresses() {
-        let ts = TokenStream::from_str(
-            "#[origin(0x004028d0, calls = [0x00401f00, 0x00401f20])] pub fn outer() {}",
-        )
-        .unwrap();
-        let lits = collect_hex_literals(ts);
-        // The body is empty, so no hex literals are emitted.
+        let lits = hex_of_body(
+            "#[origin(0x004028d0, calls = [0x00401f00, 0x00401f20])] fn outer() {}",
+        );
         assert!(!lits.contains(&0x004028d0), "attr hex leaked: {:?}", lits);
         assert!(!lits.contains(&0x00401f00), "attr hex leaked: {:?}", lits);
         assert!(!lits.contains(&0x00401f20), "attr hex leaked: {:?}", lits);
     }
 
-/// Sanity: hex literals INSIDE the body ARE included.
+    /// Hex literals INSIDE the body ARE included.
     #[test]
     fn collect_hex_literals_includes_body_literals() {
-        let ts = TokenStream::from_str(
-            "#[origin(0x004028d0)] pub fn outer() { let g = 0x00401f00u32; }",
-        )
-        .unwrap();
-        let lits = collect_hex_literals(ts);
+        let lits = hex_of_body("#[origin(0x004028d0)] fn outer() { let g = 0x00401f00u32; }");
         assert!(lits.contains(&0x00401f00), "{:?}", lits);
-        // The attribute's own address is NOT included — it's outside the body.
-        assert!(
-            !lits.contains(&0x004028d0),
-            "attr 0x004028d0 leaked into body hex: {:?}",
-            lits
-        );
+        assert!(!lits.contains(&0x004028d0), "attr leaked: {:?}", lits);
     }
 
     // --- cfg_keyword_counts / fake_loop_spans (fake-loop placeholder guard) -

@@ -238,11 +238,10 @@ fn scan_attrs_and_record(
         record_fn_addresses(&addrs, name, is_method, cginlined, disp_path, c);
     } else if inline_body {
         // Untagged inline helper: capture the calls in its body so callers
-        // can fold them in.
+        // can fold them in. Same syn-visitor path as the verifier itself.
         if let Some(block) = body {
-            let ts = quote::quote!(#block);
             if c.inline_fns
-                .insert(name.to_string(), crate::body::collect_body_calls_only(ts))
+                .insert(name.to_string(), crate::body::collect_block_facts(block).names)
                 .is_some()
             {
                 c.inline_ambiguous.insert(name.to_string());
@@ -345,7 +344,7 @@ fn rust_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_cached, parse_inline_addr, scan_item, Corpus, Item};
+    use super::{build_cached, parse_inline_addr, scan_item, Corpus};
 
     /// Build a Corpus and run every item in `text` through `scan_item` (the
     /// syn-based walker). Mirrors what `build()` does for one file.
@@ -366,6 +365,13 @@ mod tests {
             scan_item(item, "test.rs", &mut c);
         }
         c
+    }
+
+    /// Parse a statement list as a Block and harvest its body facts — the
+    /// same visitor the verifier runs over `#[origin]` fn bodies.
+    fn block_facts_of(stmts: &str) -> crate::body::FnBodyFacts {
+        let block: syn::Block = syn::parse_str(&format!("{{ {stmts} }}")).expect("parse block");
+        crate::body::collect_block_facts(&block)
     }
 
     // --- parse_inline_addr -------------------------------------------------
@@ -679,49 +685,49 @@ pub unsafe fn foo_b() {}
     // records just `func`, not `crate` and not `module`.
     #[test]
     fn b04_path_qualified_calls_strip_the_path() {
-        use crate::body::collect_call_idents;
-        let calls = collect_call_idents(quote::quote!(crate::module::func(1, 2);));
-        // The walker records just the trailing ident.
+        let facts = block_facts_of("crate::module::func(1, 2);");
         assert!(
-            calls.plain.contains("func"),
+            facts.names.plain.contains("func"),
             "path-qualified `crate::module::func()` should record just `func`, got: {:?}",
-            calls.plain
+            facts.names.plain
         );
         assert!(
-            !calls.plain.contains("crate"),
+            !facts.names.plain.contains("crate"),
             "leading path segment `crate` leaked into plain: {:?}",
-            calls.plain
+            facts.names.plain
         );
         assert!(
-            !calls.plain.contains("module"),
+            !facts.names.plain.contains("module"),
             "middle path segment `module` leaked into plain: {:?}",
-            calls.plain
+            facts.names.plain
         );
     }
 
     // B-04 (method): `obj.method()` is a method call, not a plain call.
     #[test]
     fn b04_method_call_via_dot_is_classified_as_method() {
-        use crate::body::collect_call_idents;
-        let calls = collect_call_idents(quote::quote!(obj.method(1, 2);));
-        assert!(calls.plain.is_empty(), "method leaked to plain: {:?}", calls.plain);
-        assert!(calls.method.contains("method"), "method not captured: {:?}", calls.method);
+        let facts = block_facts_of("obj.method(1, 2);");
+        assert!(facts.names.plain.is_empty(), "method leaked to plain: {:?}", facts.names.plain);
+        assert!(
+            facts.names.method.contains("method"),
+            "method not captured: {:?}",
+            facts.names.method
+        );
     }
 
     // B-04 (multi-line call): a call split across lines is one call.
     #[test]
     fn b04_multiline_call_is_one_call() {
-        use crate::body::collect_call_idents;
-        let calls = collect_call_idents(quote::quote!(foo(
-            1,
-            2,
-        );));
+        let facts = block_facts_of("foo(
+    1,
+    2,
+);");
         assert!(
-            calls.plain.contains("foo"),
+            facts.names.plain.contains("foo"),
             "multi-line call should record `foo` once, got: {:?}",
-            calls.plain
+            facts.names.plain
         );
-        assert_eq!(calls.plain.len(), 1, "expected exactly 1 call, got: {:?}", calls.plain);
+        assert_eq!(facts.names.plain.len(), 1, "expected exactly 1 call, got: {:?}", facts.names.plain);
     }
 
     // B-09: A function defined in two modules with the same name → the
@@ -837,13 +843,12 @@ mod b {
     // then fail to resolve.
     #[test]
     fn b02_body_call_idents_records_unknown_names() {
-        use crate::body::collect_call_idents;
         // `some_random_helper` is not a built-in and not in any corpus.
-        let calls = collect_call_idents(quote::quote!(some_random_helper();));
+        let facts = block_facts_of("some_random_helper();");
         assert!(
-            calls.plain.contains("some_random_helper"),
+            facts.names.plain.contains("some_random_helper"),
             "the body call should be captured: {:?}",
-            calls.plain
+            facts.names.plain
         );
         // (The verifier's diff_body_calls then fails to resolve it and
         // reports it as HALLUCINATED — this test pins the body side.)

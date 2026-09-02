@@ -153,6 +153,18 @@ impl Pe {
         self.section_of(va).is_some()
     }
 
+    /// True if `va` lies inside a section whose PE32 `Characteristics` mark it
+    /// as code (`CNT_CODE` or `MEM_EXECUTE`) — the STRICT counterpart of
+    /// [`Pe::is_executable_va`]. Use this when deciding whether an immediate /
+    /// stored dword plausibly denotes a FUNCTION (it lives in `.text`), as
+    /// opposed to data (a `.rdata` vtable VA, a string address) that merely
+    /// happens to sit inside the image.
+    pub fn is_executable_section_va(&self, va: u64) -> bool {
+        self.section_of(va)
+            .map(|s| s.is_executable())
+            .unwrap_or(false)
+    }
+
     /// The image's VA range `[image_base, end)` (end = highest section end).
     pub fn image_range(&self) -> (u64, u64) {
         let end = self

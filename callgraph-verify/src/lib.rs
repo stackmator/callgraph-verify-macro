@@ -36,23 +36,16 @@ pub struct Spec {
     iat: Vec<u64>,
 }
 
-/// Process-wide cache of decoded `.text` instruction-start sets, keyed by
+/// The cached `.text` instruction-start sets, keyed by
 /// `(image_base, text_rva, text_vsize)`. Each entry holds an `Arc` so the
 /// cached set can be cloned out without holding the MutexGuard.
-fn text_starts_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<
-        (u64, u32, u32),
-        std::sync::OnceLock<std::sync::Arc<std::collections::BTreeSet<u64>>>,
-    >,
-> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<
-                (u64, u32, u32),
-                std::sync::OnceLock<std::sync::Arc<std::collections::BTreeSet<u64>>>,
-            >,
-        >,
-    > = std::sync::OnceLock::new();
+type TextStartsCache = std::sync::Mutex<
+    std::collections::HashMap<(u64, u32, u32), std::sync::OnceLock<TextStarts>>,
+>;
+type TextStarts = std::sync::Arc<std::collections::BTreeSet<u64>>;
+
+fn text_starts_cache() -> &'static TextStartsCache {
+    static CACHE: std::sync::OnceLock<TextStartsCache> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -66,9 +59,7 @@ fn text_starts_cache() -> &'static std::sync::Mutex<
 /// once `get_or_init` has populated one, repeated `get()` calls return
 /// `&'static BTreeSet`s without touching the mutex. The mutex is only acquired
 /// on the very first request per `(image_base, text_rva, text_vsize)` triple.
-fn text_instruction_starts<'a>(
-    pe: &'a Pe,
-) -> std::sync::Arc<std::collections::BTreeSet<u64>> {
+fn text_instruction_starts(pe: &Pe) -> TextStarts {
     let key = || -> Option<(u64, u32, u32)> {
         let text = pe.sections().iter().find(|s| s.name == ".text")?;
         Some((pe.image_base, text.virtual_address, text.virtual_size))
@@ -77,8 +68,7 @@ fn text_instruction_starts<'a>(
         Some(k) => k,
         None => {
             // No .text section: return an empty Arc.
-            static EMPTY: std::sync::OnceLock<std::sync::Arc<std::collections::BTreeSet<u64>>> =
-                std::sync::OnceLock::new();
+            static EMPTY: std::sync::OnceLock<TextStarts> = std::sync::OnceLock::new();
             return EMPTY
                 .get_or_init(|| std::sync::Arc::new(std::collections::BTreeSet::new()))
                 .clone();
@@ -89,7 +79,7 @@ fn text_instruction_starts<'a>(
     // `LockResult<MutexGuard>`; we ignore poisoning — `OnceLock::get_or_init`
     // never panics inside the closure.
     let mut lock = cache.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = lock.entry(key).or_insert_with(std::sync::OnceLock::new);
+    let entry = lock.entry(key).or_default();
     let once = entry.get_or_init(|| {
         use iced_x86::{Decoder, DecoderOptions};
         let text = pe
@@ -333,7 +323,14 @@ fn is_inlined_into(pe: &Pe, callee: u64, caller_fp: &BTreeSet<u64>) -> bool {
     match analyze(pe, callee) {
         Ok(cg) => {
             let fp = cg.footprint();
-            !fp.is_empty() && fp.is_subset(caller_fp)
+            // Footprint-subset is only meaningful evidence with >= 2 distinct
+            // in-image references. A SINGLE shared global (an inlined refcount
+            // accessor) or a single shared call target is a subset of almost any
+            // caller that touches the same thing — that's coincidence, not
+            // inlining, and accepting it would excuse an invented call. Trivial
+            // single-element callees that really were inlined need an explicit
+            // `/// inline: 0xADDR` marker instead of footprint evidence.
+            fp.len() >= 2 && fp.is_subset(caller_fp)
         }
         Err(_) => false,
     }
@@ -364,19 +361,21 @@ pub fn diff_body_calls(
         // a faithful port spells it as an ordinary call.
         bin_calls.extend(&cg.tail_calls);
         tail_targets.extend(&cg.tail_calls);
-        // A code-pointer immediate (`PUSH 0xADDR` / `MOV reg,0xADDR` with ADDR in an EXECUTABLE
-        // section) is a function the binary hands to a higher-order helper that then INVOKES it —
-        // a CRT `_EH_vector_constructor_iterator` over an element array, a `qsort` comparator, a
-        // registered callback, etc. So it is reached as part of this function's execution, and a
-        // faithful port that spells the per-element / callback work as a direct call to that
-        // function is not a hallucination. The executable filter excludes `.rdata` vtable VAs and
-        // string addresses (those are data, not call targets); like the tail-call fold above this
-        // only WIDENS the accepted set, so it can never make a passing function fail.
+        // A code-pointer immediate (`PUSH 0xADDR` / `MOV reg,0xADDR` with ADDR in a
+        // section flagged EXECUTE/CODE) is a function the binary hands to a higher-order
+        // helper that then INVOKES it — a CRT `_EH_vector_constructor_iterator` over an
+        // element array, a `qsort` comparator, a registered callback, etc. So it is
+        // reached as part of this function's execution, and a faithful port that spells
+        // the per-element / callback work as a direct call to that function is not a
+        // hallucination. The characteristics-based filter (`is_executable_section_va`,
+        // NOT the permissive `is_executable_va`) excludes `.rdata` vtable VAs and string
+        // addresses — those are data, not call targets; like the tail-call fold above
+        // this only WIDENS the accepted set, so it can never make a passing function fail.
         bin_calls.extend(
             cg.imm_addrs
                 .iter()
                 .copied()
-                .filter(|&x| pe.is_executable_va(x)),
+                .filter(|&x| pe.is_executable_section_va(x)),
         );
         footprint.extend(cg.footprint());
         indirect += cg.indirect_calls;

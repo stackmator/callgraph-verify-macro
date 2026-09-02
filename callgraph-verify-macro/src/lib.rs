@@ -32,7 +32,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Expr, ExprArray, Ident, Lit, LitInt, Token};
@@ -144,8 +144,14 @@ impl Parse for Args {
     }
 }
 
+/// Cache type aliases — clippy `very_complex_type` lint hates the full form.
+type PeCache = Mutex<HashMap<String, Option<Arc<Pe>>>>;
+type AddrsCache = Mutex<HashMap<(String, u64), Arc<HashSet<u32>>>>;
+type VTableMap = HashMap<u64, (u64, usize)>;
+type VTableCache = Mutex<HashMap<CacheKey, OnceLock<Arc<VTableMap>>>>;
+
 fn load_pe_cached(path: &str) -> Option<Arc<Pe>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<Pe>>>>> = OnceLock::new();
+    static CACHE: OnceLock<PeCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut m = cache.lock().unwrap();
     if let Some(v) = m.get(path) {
@@ -157,25 +163,46 @@ fn load_pe_cached(path: &str) -> Option<Arc<Pe>> {
 }
 
 /// Every VA the binary references (rel32 branch targets + in-image dwords at every
-/// byte offset). Built once per compiler process (~one linear pass over the 8 MB
-/// image); used by the ORIGIN-UNREFERENCED check. See `Pe::referenced_addrs`.
-fn referenced_addrs_cached(pe: &Pe) -> &'static std::collections::HashSet<u32> {
-    static SET: OnceLock<std::collections::HashSet<u32>> = OnceLock::new();
-    SET.get_or_init(|| pe.referenced_addrs())
+/// byte offset). Built once per `(exe path, image_base)` pair per compiler process
+/// (~one linear pass over the 8 MB image); used by the ORIGIN-UNREFERENCED check.
+/// Keyed per binary — a bare `static OnceLock` would return the FIRST PE's set for
+/// every subsequent PE (the same input-ignoring-cache class as BUG #9).
+fn referenced_addrs_cached(
+    exe: &str,
+    pe: &Pe,
+) -> std::sync::Arc<std::collections::HashSet<u32>> {
+    static CACHE: OnceLock<AddrsCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (exe.to_string(), pe.image_base);
+    let mut m = cache.lock().unwrap_or_else(|e| e.into_inner());
+    m.entry(key)
+        .or_insert_with(|| std::sync::Arc::new(pe.referenced_addrs()))
+        .clone()
 }
 
-/// One-time stderr note when verification is silently disabled, so a bad
-/// `TARGET_EXE` path can't masquerade as a clean build forever.
-fn warn_once(msg: &str) {
-    static DONE: OnceLock<()> = OnceLock::new();
-    DONE.get_or_init(|| {
+/// Print a NOTE to stderr, deduplicated by full message text per compiler
+/// process. The previous implementation used a single `OnceLock<()>`, which
+/// printed only the FIRST note of the whole build and silently dropped every
+/// later one (FAKE-LOOP for the 2nd+ fn, VTABLE-ONLY DISPATCH, INLINE-MARKER
+/// MISMATCH, …) — a diagnostic channel 90% dead.
+///
+/// Notes go to stderr because a proc-macro cannot emit `#[warn]` diagnostics;
+/// they are visible with `cargo build -vv` / `cargo check -vv`.
+fn note(msg: &str) {
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(msg.to_string())
+    {
         eprintln!("callgraph_verify_macro: {msg}");
-    });
+    }
 }
 
 /// Compute the set of inlined-marker addresses that the binary still
 /// CALL/JMP/Jccs into from .text. Each is returned as a one-line note
-/// suitable for `warn_once`. Extracted from the macro body so it can be
+/// suitable for `note`. Extracted from the macro body so it can be
 /// unit-tested without a proc-macro harness.
 pub(crate) fn inline_marker_mismatches(
     pe: &callgraph_verify::Pe,
@@ -193,27 +220,6 @@ pub(crate) fn inline_marker_mismatches(
         }
     }
     out
-}
-
-/// Pull the `0xADDR` out of an inline-marker note. Used by the macro's
-/// per-build de-dup so a corpus with many `#[origin]` tags doesn't repeat
-/// the same address's note on every expansion.
-fn addr_of_msg(msg: &str) -> u64 {
-    // The note always starts with `INLINE-MARKER MISMATCH: 0xADDR …`. Scan
-    // the first whitespace-delimited hex literal.
-    let mut chars = msg.chars();
-    while let Some(c) = chars.next() {
-        if c == '0' {
-            // Peek next char: if it's 'x' or 'X', parse the hex literal.
-            let rest: String = chars.clone().take_while(|c| *c != ' ' && *c != ',').collect();
-            if let Some(hex) = rest.strip_prefix('x').or_else(|| rest.strip_prefix('X')) {
-                if let Ok(v) = u64::from_str_radix(hex, 16) {
-                    return v;
-                }
-            }
-        }
-    }
-    0
 }
 
 /// `#[origin(0xADDR)]` — provenance tag + compile-time call-graph verifier.
@@ -242,26 +248,24 @@ fn vtable_method_map<'a>(
     // each (image_base, declared fingerprint) gets its own OnceLock. Steady
     // state is a lock-free `OnceLock::get()` returning the cached Arc; the
     // mutex is only held on the very first request per key.
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<
-                CacheKey,
-                std::sync::OnceLock<std::sync::Arc<HashMap<u64, (u64, usize)>>>,
-            >,
-        >,
-    > = std::sync::OnceLock::new();
+    static CACHE: OnceLock<VTableCache> = OnceLock::new();
     let key = CacheKey::new(pe, declared);
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut lock = cache.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = lock
-        .entry(key)
-        .or_insert_with(std::sync::OnceLock::new);
+    let entry = lock.entry(key).or_default();
     entry
         .get_or_init(|| {
             let mut m = HashMap::new();
             for &(va, slots) in declared {
                 for slot in 0..slots {
+                    // `read` clamps to the section's raw bytes, so a slot at the
+                    // tail can legally return 1..3 bytes — index those and the
+                    // proc-macro panics (cryptic "proc macro panicked" build
+                    // failure). A short read is not a readable slot.
                     if let Some(b) = pe.read(va + (slot as u64) * 4, 4) {
+                        if b.len() < 4 {
+                            continue;
+                        }
                         let a = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64;
                         if a != 0 {
                             m.entry(a).or_insert((va, slot));
@@ -342,7 +346,7 @@ fn arg_shape_check(
     pe: &Pe,
     addr: u64,
     map: &corpus::Corpus,
-    item: proc_macro2::TokenStream,
+    call_exprs: &[body::CallExpr],
     errors: &mut Vec<String>,
 ) {
     // CRT allocator/free targets: their decompiled arg lists are unreliable (the project notes
@@ -350,7 +354,7 @@ fn arg_shape_check(
     const SKIP_TARGETS: &[u64] = &[0x0040_1f00, 0x0040_1f20];
 
     let Ok(cg) = analyze(pe, addr) else { return };
-    for ce in body::collect_call_exprs(item) {
+    for ce in call_exprs {
         // Skip calls with no concrete argument and names we can't resolve uniquely.
         if ce.args.iter().all(|a| matches!(a, body::RustArg::Other))
             || body::DENY.contains(&ce.name.as_str())
@@ -391,15 +395,15 @@ fn arg_shape_check(
         // positive). A method call's receiver is the ECX `this`, so it is always skipped.
         let (ecx_param, edx_param) = reg_params(pe, target);
         let mut bin: Vec<ArgKind> = Vec::new();
+        // A parameter position the callee declares but whose setup wasn't recovered in-block
+        // still OCCUPIES its slot: pushing `Other` (never skipped) keeps the stack args
+        // positionally aligned — skipping used to shift every stack arg left into the register
+        // positions and compare the Rust receiver against an unrelated binary stack arg.
         if !ce.is_method && ecx_param {
-            if let Some(a) = site.ecx {
-                bin.push(a);
-            }
+            bin.push(site.ecx.unwrap_or(ArgKind::Other));
         }
         if edx_param {
-            if let Some(a) = site.edx {
-                bin.push(a);
-            }
+            bin.push(site.edx.unwrap_or(ArgKind::Other));
         }
         bin.extend(site.stack.iter().copied());
 
@@ -417,30 +421,74 @@ fn arg_shape_check(
 
 fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as Args);
-    // Walk the function BODY only (skip leading attributes and the
-    // `fn name(...)` head) so attribute-internal calls and the function's
-    // own name don't pollute the corpus diff. (BUG #13 / #14)
-    let body_calls = body::collect_body_calls_only(item.clone().into());
     let item2 = proc_macro2::TokenStream::from(item);
 
-    let Ok(exe) = std::env::var("TARGET_EXE") else {
-        warn_once("TARGET_EXE not set — origin verification is DISABLED for this build");
-        return quote! { #item2 }.into(); // no binary configured → no-op
-    };
-    let Some(pe) = load_pe_cached(&exe) else {
-        // Distinguish "binary absent" (gitignored checkout — legitimate no-op)
-        // from "binary present but unloadable" (corrupt / wrong file): a broken
-        // file must not silently disable every check with a green build.
-        if std::path::Path::new(&exe).exists() {
+    // The attribute only makes sense on a function. Parse the item AS a fn
+    // (free or impl-method) and harvest the body from the syn AST — the old
+    // token-walker grabbed the first `{...}` group after the fn head, which
+    // misfired on const-generic defaults (`fn f<const N: usize = { 4 }>()`),
+    // `where`-clause braces, and non-fn items (a struct's field list walked
+    // as a "body"). A parse failure here is a hard error, never a silent
+    // skip of every body-derived check.
+    let fn_like = match body::parse_fn_like(&item2) {
+        Ok(f) => f,
+        Err(e) => {
             let msg = format!(
-                "TARGET_EXE={exe} exists but failed to load as a PE32 image — \
-                 origin verification would be silently disabled; fix or unset it"
+                "#[origin] requires a function item (free fn or impl/trait method): {e}"
             );
             let err = syn::Error::new(proc_macro2::Span::call_site(), msg).to_compile_error();
             return quote! { #err #item2 }.into();
         }
-        warn_once("TARGET_EXE points to a missing file — origin verification is DISABLED for this build");
-        return quote! { #item2 }.into();
+    };
+    let facts = body::collect_block_facts(fn_like.block());
+    let body_calls = &facts.names;
+    // Token view of JUST the body block: hex-literal and CFG-keyword harvest
+    // operate on tokens, and scoping them to the block keeps attribute
+    // internals (`#[origin(0xA, calls = [0xB])]`) out of both.
+    let block_ts = quote::quote!(#(fn_like.block()));
+
+    // A macro invocation's body is an opaque token stream — calls and loops
+    // inside it are INVISIBLE to every check below. Silent invisibility is
+    // exactly the escape hatch this macro exists to close, so surface it as
+    // a loud (non-fatal) note; the build stays green but the note is impossible
+    // to miss in -vv output / CI logs.
+    if !facts.macros.is_empty() {
+        let mut names: Vec<String> = facts.macros.clone();
+        names.sort();
+        names.dedup();
+        note(&format!(
+            "OPAQUE-MACRO: body of the fn at {:#010x} invokes macro(s) {} — their \
+             expansion is not visible to the verifier, so calls/loops inside them \
+             escape the HALLUCINATED / MISSING / CFG checks. Inline the work (or \
+             add an explicit `calls = [...]` pin) if it touches ported fns.",
+            args.addr,
+            names.iter().map(|n| format!("`{n}!`")).collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    let Ok(exe) = std::env::var("TARGET_EXE") else {
+        note("TARGET_EXE not set — origin verification is DISABLED for this build");
+        return quote! { #item2 }.into(); // no binary configured → no-op
+    };
+    let Some(pe) = load_pe_cached(&exe) else {
+        // A configured-but-unloadable TARGET_EXE must never silently disable
+        // every check with a green build — that is the "AI flips the switch"
+        // failure mode with the switch left invisible. Both "exists but corrupt"
+        // and "points at a missing file" are hard errors: if the env var is
+        // set, the build is meant to be verified.
+        let msg = if std::path::Path::new(&exe).exists() {
+            format!(
+                "TARGET_EXE={exe} exists but failed to load as a PE32 image — \
+                 refusing to build unverified; fix or unset it"
+            )
+        } else {
+            format!(
+                "TARGET_EXE={exe} does not exist — refusing to build unverified; \
+                 fix the path or unset the variable"
+            )
+        };
+        let err = syn::Error::new(proc_macro2::Span::call_site(), msg).to_compile_error();
+        return quote! { #err #item2 }.into();
     };
 
     let mut errors: Vec<String> = Vec::new();
@@ -457,7 +505,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                 "ORIGIN-UNREFERENCED: {:#010x} is outside every PE section — not a function address",
                 args.addr
             ));
-        } else if !referenced_addrs_cached(&pe).contains(&(args.addr as u32)) {
+        } else if !referenced_addrs_cached(&exe, &pe).contains(&(args.addr as u32)) {
             errors.push(format!(
                 "ORIGIN-UNREFERENCED: {:#010x} is never called, jumped to, or stored as a \
                  pointer anywhere in the binary — misattributed or invented origin address? \
@@ -490,6 +538,23 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     if let Ok(root) = std::env::var("REBUILD_ROOT") {
         let map = corpus::corpus_map(&root);
 
+        // CORPUS-GAP self-check: this very function carries `#[origin(addr)]`,
+        // so the scan of a correctly-configured REBUILD_ROOT MUST contain
+        // `addr` — the scanner reads the same source tree this attribute
+        // lives in. If it doesn't, the corpus is silently WRONG (root points
+        // elsewhere, dir missing, every file failed to parse) and every
+        // body-diff below would pass trivially: no rust_idents resolve, no
+        // MISSING can fire, DUP-ADDR has no owners. Fail loudly instead.
+        if !map.corpus.contains(&args.addr) {
+            errors.push(format!(
+                "CORPUS-GAP: origin {:#010x} is not in the corpus scanned from \
+                 REBUILD_ROOT={root} — wrong root, empty/missing directory, or the \
+                 owning file failed to parse. Body-call verification cannot run; \
+                 fix REBUILD_ROOT so it contains the source with this #[origin] tag.",
+                args.addr
+            ));
+        }
+
         // Inline-marker sanity (always on, non-fatal): every address in
         // `inlined_markers` was claimed by the porter as "the engine inlined
         // this" via an `/// inline: 0xADDR` or `/// callgraph-inlined`
@@ -501,17 +566,11 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         // NOTE rather than a fatal error: agents were flipping off similar
         // fatal warnings to silence builds, and a mixed inlining strategy
         // (header guards, debug builds, hot/cold paths) is a real pattern.
-        // De-duped by address so a build with 200 `#[origin]` tags on a
-        // 200-address corpus still prints at most N notes.
-        static INLINE_NOTED: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
-        let noted = INLINE_NOTED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-        let mut noted = noted.lock().unwrap();
+        // `note` dedups by full message (which embeds the address), so a
+        // corpus with many markers prints each distinct address at most once.
         for msg in inline_marker_mismatches(&pe, &map.inlined_markers) {
-            if noted.insert(addr_of_msg(&msg)) {
-                warn_once(&msg);
-            }
+            note(&msg);
         }
-        drop(noted);
 
         // Duplicate-origin check (always on, no escape hatch): a binary fn
         // may be implemented by exactly ONE Rust fn. Mirrors
@@ -629,7 +688,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             && !callgraph_verify::has_direct_branch_target(&pe, args.addr)
         {
             let (vt_va, slot) = vtm.get(&args.addr).copied().unwrap_or((0, 0));
-            warn_once(&vtable_only_dispatch_msg(args.addr, vt_va, slot));
+            note(&vtable_only_dispatch_msg(args.addr, vt_va, slot));
         }
         match diff_body_calls(
             &pe,
@@ -697,7 +756,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         // `STRICT_ARGS=0` escape hatch (ICF-folded stubs, free-call ABI
         // ambiguity). Same story as DUP_STRICT — if the check is wrong,
         // fix it.
-        arg_shape_check(&pe, args.addr, &map, item2.clone(), &mut errors);
+        arg_shape_check(&pe, args.addr, &map, &facts.exprs, &mut errors);
     }
 
     // (3) Operand-fact diff (always on). Every in-image ADDRESS literal
@@ -723,7 +782,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             referenced.extend(&cg.iat_calls);
             let mut reported: std::collections::BTreeSet<u64> =
                 std::collections::BTreeSet::new();
-            for v in body::collect_hex_literals(item2.clone()) {
+            for v in body::collect_hex_literals(block_ts.clone()) {
                 // Skip the function's own address (recursion / self-reference), dups,
                 // and any literal that isn't an in-image address (counts, masks, sizes).
                 if v == args.addr || !reported.insert(v) || pe.section_of(v).is_none() {
@@ -750,7 +809,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     // story as the others, removed.
     match cfg_fingerprint(&pe, args.addr) {
         Ok(fp) => {
-            let r = body::cfg_keyword_counts(item2.clone());
+            let r = body::cfg_keyword_counts(block_ts.clone());
             // Thresholds chosen to suppress the dominant noise: a SINGLE back-edge is usually
             // an inlined memcpy/strlen/refcount loop, not a source loop, so require ≥2.
             if fp.loops >= 2 && r.loops == 0 {
@@ -783,10 +842,10 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             // review. The check above already subtracted them from r.loops,
             // so a body that's ONLY fake loops still gets caught by the
             // `fp.loops >= 2 && r.loops == 0` gate.
-            let fakes = body::fake_loop_spans(item2.clone());
+            let fakes = body::fake_loop_spans(block_ts.clone());
             if !fakes.spans.is_empty() {
-                warn_once(&format!(
-                    "FAKE-LOOP PLACEHOLDER: {} `loop {{ break; }}` block(s) detected at \
+                note(&format!(
+                    "FAKE-LOOP PLACEHOLDER: {} placeholder loop block(s) detected at \
                      {:#010x} — these satisfy the keyword counter without iterating. \
                      Replace with the real iteration (or remove the placeholder) before merging.",
                     fakes.spans.len(),
@@ -934,6 +993,16 @@ pub fn vtable_table(input: TokenStream) -> TokenStream {
                     ));
                     continue;
                 };
+                // A clamped short read (section tail) is not a readable slot.
+                if bytes.len() < 4 {
+                    errors.push(format!(
+                        "slot {slot}: engine VA {:#010x} has only {} readable byte(s) \
+                         (section tail) — not a verifiable slot",
+                        t.va + (*slot as u64) * 4,
+                        bytes.len()
+                    ));
+                    continue;
+                }
                 let eng = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
                 let addrs: Vec<u64> = map
                     .free_fns
@@ -982,7 +1051,7 @@ mod tests {
         inline_marker_mismatches, vtable_only_dispatch_msg, vtable_method_map, CacheKey,
     };
     use crate::Pe;
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::BTreeSet;
 
     #[test]
     fn vtable_only_dispatch_msg_includes_addr_vt_and_slot() {

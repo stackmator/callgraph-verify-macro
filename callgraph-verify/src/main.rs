@@ -83,7 +83,7 @@ fn main() {
     if args.len() < 3 {
         print_usage(args.first().map(String::as_str).unwrap_or("callgraph_verify"));
     }
-    let prog = args.first().cloned().unwrap_or_else(|| "callgraph_verify".into());
+    let _prog = args.first().cloned().unwrap_or_else(|| "callgraph_verify".into());
     let exe = &args[1];
 
     // Mode dispatch: positional <addr> = per-function detail (existing);
@@ -102,7 +102,7 @@ fn main() {
             let pe = Pe::load(exe).unwrap_or_else(|e| fatal(&e));
             let entries = enumerate_functions(&pe, u32::MAX);
             let stats = summarise(&entries);
-            print_summary(&prog, &pe, &stats);
+            print_summary(exe, &stats);
             return;
         }
         "--list" => {
@@ -277,8 +277,9 @@ fn summarise(entries: &[(u64, u64, callgraph_verify::CallGraph)]) -> FnStats {
     s
 }
 
-fn print_summary(prog: &str, _pe: &Pe, s: &FnStats) {
-    println!("{} {} ({} functions)", prog, pe_path_label(prog), s.entries);
+fn print_summary(exe: &str, s: &FnStats) {
+    // Header names the ANALYZED binary (argv[1]), not this tool's own path.
+    println!("{} ({} functions)", pe_path_label(exe), s.entries);
     println!(
         "  total extent:        {} bytes ({:.1} KB)",
         s.total_extent,
