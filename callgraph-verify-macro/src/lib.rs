@@ -1051,7 +1051,29 @@ mod tests {
         inline_marker_mismatches, vtable_only_dispatch_msg, vtable_method_map, CacheKey,
     };
     use crate::Pe;
+    use quote::{quote, ToTokens};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn function_body_token_stream_preserves_cfg_keywords() {
+        // Regression: quote!(#(fn_like.block())) treats the parenthesized
+        // expression as repetition and expands to an empty stream. The
+        // verifier must serialize the parsed block itself so loops and
+        // conditionals remain visible to the CFG checks.
+        let item = quote! {
+            fn sample() {
+                while condition {
+                    if other_condition {
+                        break;
+                    }
+                }
+            }
+        };
+        let fn_like = crate::body::parse_fn_like(&item).expect("parse function");
+        let facts = crate::body::cfg_keyword_counts(fn_like.block().to_token_stream());
+        assert!(facts.loops >= 1, "function body loop was not preserved");
+        assert!(facts.ifs >= 1, "function body conditional was not preserved");
+    }
 
     #[test]
     fn vtable_only_dispatch_msg_includes_addr_vt_and_slot() {
