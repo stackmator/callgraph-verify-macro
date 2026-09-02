@@ -290,11 +290,23 @@ pub fn cfg_keyword_counts(ts: TokenStream) -> RustCfg {
     c
 }
 
-/// Detect `loop {}` blocks whose body is a single immediate `break;` (with
-/// at most leading punctuation / comments). Returns the spans so the macro
-/// can attach a span to a NOTE. Other patterns — `loop { let x = foo();
-/// break; }`, `loop { if cond { break; } ... }` — are NOT flagged: those
-/// have real structure even if they don't match the binary.
+/// Detect placeholder loops whose body is a single immediate `break;` (with
+/// at most leading punctuation / comments). Catches two shapes:
+///
+///   * `loop { break; }` — bare `loop` keyword, no condition.
+///   * `while <expr> { break; }` — `while` with an unconditional `break;`
+///     on iteration 1. The condition expression may contain real code (the
+///     call you wanted to invoke), but the LOOP does not iterate. A body
+///     that uses `let _ = while !cond { break; };` would otherwise count
+///     as a real loop and slip past the CFG gate.
+///
+/// `for x in xs { break; }` is NOT flagged: the iterator expression is
+/// meaningful and the loop body is non-trivial even if it breaks
+/// immediately — `for` has no analogous fake shape.
+///
+/// Other patterns — `loop { let x = foo(); break; }`, `loop { if cond {
+/// break; } ... }`, `while cond { ... real work ...; break; }` — are NOT
+/// flagged: those have real structure even if they don't match the binary.
 pub fn fake_loop_spans(ts: TokenStream) -> FakeLoops {
     let mut f = FakeLoops::default();
     walk_for_fake_loops(ts, &mut f);
@@ -307,28 +319,71 @@ fn walk_for_fake_loops(ts: TokenStream, f: &mut FakeLoops) {
         if let TokenTree::Group(g) = tt {
             walk_for_fake_loops(g.stream(), f);
         }
-        // Look for the pattern: `loop` ident followed by a `{ ... }` group
-        // whose entire body is `break;` (with optional leading trivia).
+        // Look for the pattern: `loop` or `while` ident followed by a
+        // `{ ... }` group whose entire body is `break;`.
         if let TokenTree::Ident(id) = tt {
-            if id.to_string() != "loop" {
+            let kw = id.to_string();
+            if kw != "loop" && kw != "while" {
                 continue;
             }
-            // Skip `for` / `while` — they have a condition, so `loop` is the
-            // only keyword whose body can be a placeholder.
+            // Skip `for ... { ... }` — `for` has its own dedicated shape and
+            // is structurally different (iterator expression matters even if
+            // the body breaks immediately).
             if let Some(TokenTree::Ident(prev)) = tts.get(i.wrapping_sub(1)) {
                 if prev.to_string() == "for" {
                     continue;
                 }
             }
-            let Some(TokenTree::Group(g)) = tts.get(i + 1) else { continue };
+            // For `loop`, the body group is the very next token. For
+            // `while`, the body group follows the condition expression
+            // (`!cond`, `foo()`, `let x = …`); scan forward until we find
+            // the first `{ ... }` group, ignoring any other groups (parens
+            // around the condition) and Puncts/Idents in between.
+            let body_group = if kw == "loop" {
+                tts.get(i + 1)
+            } else {
+                scan_for_body_group(&tts, i + 1)
+            };
+            let Some(TokenTree::Group(g)) = body_group else { continue };
             if g.delimiter() != Delimiter::Brace {
                 continue;
             }
             if is_placeholder_break_body(g.stream()) {
-                f.spans.push((id.span(), "body is just `break;`"));
+                let reason: &'static str = if kw == "while" {
+                    "body is just `break;` under `while`"
+                } else {
+                    "body is just `break;`"
+                };
+                f.spans.push((id.span(), reason));
             }
         }
     }
+}
+
+/// Walk forward from `start` looking for the `{ ... }` group that follows
+/// a `while` keyword's condition expression. The condition may be a single
+/// identifier (`while cond`), a unary prefix (`while !cond`), a function
+/// call (`while cond()`), a parenthesised expression (`while (a && b)`),
+/// or a `let` binding (`while let Some(x) = foo.next()`). All of those
+/// surface as Puncts / Idents / paren-groups between the `while` and the
+/// body brace — none of them are themselves the body brace.
+///
+/// We step past everything except the first `{ ... }` Brace group we see;
+/// that group is the loop body. Paren groups (`( ... )`) are skipped past
+/// in one step (their contents may contain unrelated braces from nested
+/// generics — `while let Some(HashMap<K, V>) = …`). A `[ ... ]` Bracket
+/// group inside a `while let` pattern (e.g. `while let [a, b] = arr`) is
+/// similarly stepped past.
+fn scan_for_body_group<'a>(tts: &'a [TokenTree], start: usize) -> Option<&'a TokenTree> {
+    let mut j = start;
+    while let Some(tt) = tts.get(j) {
+        match tt {
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => return Some(tt),
+            TokenTree::Group(_) => j += 1,
+            _ => j += 1,
+        }
+    }
+    None
 }
 
 fn is_placeholder_break_body(body: TokenStream) -> bool {
@@ -696,23 +751,95 @@ mod tests {
         assert!(f.spans.is_empty(), "no fake loops: {:?}", f.spans);
     }
 
-    /// `while` and `for` keywords are NOT checked for placeholder bodies —
-    /// they always have a controlling expression (the condition / iterator),
-    /// so they cannot be a one-shot `break;` trap the way `loop` can.
-    /// `cfg_keyword_counts` counts them as loops (real); `fake_loop_spans`
-    /// ignores them entirely.
+/// `for` is NOT a placeholder: it always carries an iterator expression
+    /// and the loop body's first break being immediate doesn't make the
+    /// loop fake. `cfg_keyword_counts` counts it as a real loop;
+    /// `fake_loop_spans` ignores it.
+    ///
+    /// `while cond { break; }` IS a placeholder: the LOOP never iterates
+    /// (it breaks on entry 1), so it satisfies `c.loops` without doing
+    /// real work. `fake_loop_spans` flags it; `cfg_keyword_counts`
+    /// subtracts it.
     #[test]
-    fn cfg_while_and_for_are_real_loops() {
-        // `while cond { ... }` always has a controlling expression. The
-        // body might `break` immediately but the loop is still iterating
-        // (the keyword counts).
+    fn cfg_for_is_real_loop_while_with_break_is_fake() {
+        // `for x in xs { break; }` — real loop, not a placeholder.
+        let ts = TokenStream::from_str(
+            "pub fn outer() { for x in xs { break; } }",
+        )
+        .unwrap();
+        let r = cfg_keyword_counts(ts.clone());
+        assert_eq!(r.loops, 1, "`for` counts as a real loop: {:?}", r);
+        let f = fake_loop_spans(ts);
+        assert!(f.spans.is_empty(), "`for` is never fake: {:?}", f);
+
+        // `while cond { break; }` — fake: the loop never iterates.
+        let ts = TokenStream::from_str(
+            "pub fn outer() { while cond { break; } }",
+        )
+        .unwrap();
+        let r = cfg_keyword_counts(ts.clone());
+        assert_eq!(r.loops, 0, "fake `while` must NOT count as iteration: {:?}", r);
+        let f = fake_loop_spans(ts);
+        assert_eq!(f.spans.len(), 1, "expected 1 fake `while`: {:?}", f);
+        assert_eq!(f.spans[0].1, "body is just `break;` under `while`");
+
+        // `while cond { real_work(); break; }` — NOT a placeholder: the body
+        // has real work before the break, so it counts as a real loop.
+        let ts = TokenStream::from_str(
+            "pub fn outer() { while cond { foo(); break; } }",
+        )
+        .unwrap();
+        let r = cfg_keyword_counts(ts.clone());
+        assert_eq!(r.loops, 1, "real `while` body counts: {:?}", r);
+        let f = fake_loop_spans(ts);
+        assert!(f.spans.is_empty(), "real `while` body is not fake: {:?}", f);
+
+        // Mixed: 1 fake `while` + 1 real `for`. Net count = 1.
         let ts = TokenStream::from_str(
             "pub fn outer() { while cond { break; } for x in xs { break; } }",
         )
         .unwrap();
         let r = cfg_keyword_counts(ts.clone());
-        assert_eq!(r.loops, 2, "while + for = 2 real loops: {:?}", r);
+        assert_eq!(r.loops, 1, "fake `while` subtracted: {:?}", r);
         let f = fake_loop_spans(ts);
-        assert!(f.spans.is_empty(), "while/for are never fake: {:?}", f.spans);
+        assert_eq!(f.spans.len(), 1, "exactly 1 fake: {:?}", f);
+    }
+
+    /// Regression: the exact shape from the `ni_source_texture_load_binary`
+    /// bug report. `let _x = while !cond { break; };` is invalid Rust AND
+    /// a fake-loop placeholder — it adds nothing to `r.loops` because the
+    /// loop never iterates. Without this, the rebuild body containing two
+    /// such placeholders silently passed the CFG gate (binary has 2
+    /// loops, body "has" 2 loops — both fake).
+    #[test]
+    fn cfg_fake_while_with_negation_is_subtracted() {
+        // The exact bug-report shape: `let _buf = while !cond { break; };`
+        let ts = TokenStream::from_str(
+            "pub fn outer() { let _buf = while !cond { break; }; }",
+        )
+        .unwrap();
+        let r = cfg_keyword_counts(ts.clone());
+        assert_eq!(r.loops, 0, "fake `while !cond {{ break; }}` must not count: {:?}", r);
+        let f = fake_loop_spans(ts.clone());
+        assert_eq!(f.spans.len(), 1, "expected 1 fake: {:?}", f);
+        assert_eq!(f.spans[0].1, "body is just `break;` under `while`");
+
+        // Full ni_source_texture_load_binary shape: two fake whiles + a
+        // real `for` in the middle. Net count = 1 (the real `for`).
+        let ts = TokenStream::from_str(
+            "pub fn outer() { \
+                 let _a = while !mgr_dispatch(this) { break; }; \
+                 for i in 0..n { wr16(buf, i, read_u16(s)); } \
+                 let _b = while !mgr_state_init(this) { break; }; \
+             }",
+        )
+        .unwrap();
+        let r = cfg_keyword_counts(ts.clone());
+        assert_eq!(r.loops, 1, "2 fake whiles + 1 real for = 1: {:?}", r);
+        let f = fake_loop_spans(ts);
+        assert_eq!(f.spans.len(), 2, "exactly 2 fakes: {:?}", f);
+        for (sp, reason) in &f.spans {
+            assert_eq!(*reason, "body is just `break;` under `while`", "span: {:?}", sp);
+        }
     }
 }
