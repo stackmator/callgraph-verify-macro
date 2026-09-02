@@ -1834,4 +1834,79 @@ let fallthrough_target = entry + 0x0E;
             fp
         );
     }
+
+    /// BUGFIX regression: a thunk / tail-jmp that targets another in-range
+    /// function (within 64KB of the entry) must NOT cause the callee's
+    /// loops, switches, and conditionals to be counted against the
+    /// caller's CFG fingerprint. Real-binary instance: `0x579210: jmp
+    /// 0x5821f0` reports `fp.loops = 11, switch_cases = 8, conditionals =
+    /// 187` because the old `decode_all` followed the unconditional jmp
+    /// (the `(lo..hi).contains(&t)` check accepts anything within 64KB of
+    /// the entry, and the callee `0x5821f0` lands at `entry + 0x8FE0`).
+    /// The fingerprint should describe a 1-instruction thunk, not the
+    /// callee's body.
+    ///
+    /// We synthesize a 1-instruction thunk at `entry` whose JMP target
+    /// lands on a multi-instruction "callee" body (loop + RET) at
+    /// `entry + 0x100`. Both fit within the 64KB window so the bug is
+    /// reproducible on a synthetic PE. The fix is conservative: only
+    /// follow a JMP whose target is BEFORE the JMP's own IP (a
+    /// backward JMP is a back-edge within the same function; a forward
+    /// JMP is either a fall-through already handled by the next-leader
+    /// check, or — the bug case — a tail-call into another function).
+    #[test]
+    fn cfg_fingerprint_thunk_does_not_follow_unconditional_jmp() {
+        // Thunk at image_base+0x1000: JMP rel32 -> image_base+0x1100.
+        // E9 is JMP rel32; rel32 = 0x100 - 5 (instruction length).
+        let mut code = Vec::new();
+        // 0x1000: E9 F6 00 00 00   JMP 0x1100
+        code.extend_from_slice(&[0xE9, 0xF6, 0x00, 0x00, 0x00]);
+        // Pad to 0x100 bytes with NOPs so .text raw size covers the thunk
+        // unambiguously.
+        while code.len() < 0x100 {
+            code.push(0x90);
+        }
+        // 0x1100: loop body the OLD code would mistakenly count.
+        // 0x1100: TEST EAX,EAX (85 C0) [2 bytes]
+        // 0x1102: JE 0x110C (74 08)     [2 bytes]
+        // 0x1104: NOP (90)              [1 byte]
+        // 0x1105: JMP 0x1100 (EB F9)    [2 bytes] -- back-edge
+        // 0x1107..0x110B: padding
+        // 0x110C: RET (C3)              [1 byte]
+        code.extend_from_slice(&[0x85, 0xC0, 0x74, 0x08, 0x90, 0xEB, 0xF9, 0x90]);
+        // Pad to a 0x200 boundary so the raw_size layout is normal.
+        while code.len() < 0x200 {
+            code.push(0x90);
+        }
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        // The thunk is a 1-instruction unconditional JMP out of the
+        // function. It's NOT a back-edge (t > b.start) so loops must be
+        // 0; it's NOT a conditional so conditionals must be 0; it
+        // doesn't reference a jump table so switch_cases must be 0.
+        // The JMP is treated as a return-equivalent, so returns >= 1.
+        assert_eq!(
+            fp.loops, 0,
+            "thunk's JMP target is out-of-function; callee's loop must NOT \
+             be counted against the thunk. Got fp = {:?}",
+            fp
+        );
+        assert_eq!(
+            fp.conditionals, 0,
+            "thunk has no conditionals. Got fp = {:?}",
+            fp
+        );
+        assert_eq!(
+            fp.switch_cases, 0,
+            "thunk has no switch. Got fp = {:?}",
+            fp
+        );
+        assert!(
+            fp.returns >= 1,
+            "thunk's JMP must be counted as a return-equivalent terminator. \
+             Got fp = {:?}",
+            fp
+        );
+    }
 }

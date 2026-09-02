@@ -60,7 +60,34 @@ fn decode_all(pe: &Pe, entry: u64) -> (BTreeMap<u64, Instruction>, BTreeSet<u64>
                 }
                 FlowControl::UnconditionalBranch => {
                     let t = instr.near_branch_target();
-                    if (lo..hi).contains(&t) {
+                    // Only follow JMPs whose target is BEFORE the JMP
+                    // itself. A backward JMP within a structured function
+                    // is a real back-edge (loop tail jumping to loop head);
+                    // its target must be a leader so the dominance-based
+                    // back-edge check at cfg_fingerprint:303-307 has a
+                    // chance to count it (`dom[source].contains(target)`
+                    // requires `target` to be in `starts`). A FORWARD JMP
+                    // is either a fall-through to the next leader (already
+                    // handled by `build_cfg`'s `leaders.contains(&addrs[idx])`
+                    // check at line 203) or — the bug case — a tail-call
+                    // into another function. Real-world instance: thunk
+                    // `0x579210: jmp 0x5821f0` in noivilbo.exe, where
+                    // 0x5821f0 is 36KB past the entry and the OLD
+                    // `(lo..hi).contains(&t)` check followed it and
+                    // counted the callee's loops, switches, and
+                    // conditionals against the caller's CFG fingerprint
+                    // (`fp.loops = 11` for a 1-instruction thunk). A
+                    // forward JMP that the inner decoder hasn't already
+                    // advanced past via fall-through is a tail-call, not
+                    // intra-function control flow, and must NOT be
+                    // decoded into this function's CFG.
+                    //
+                    // `cfg_fingerprint` itself counts the JMP as a
+                    // back-edge iff `t <= b.start && dom[b].contains(t)`
+                    // and as a return-equivalent otherwise, so a thunk
+                    // (forward JMP, target not in dom) is correctly
+                    // classified as a return-equivalent terminator.
+                    if t < ip {
                         leaders.insert(t);
                         work.push(t);
                     }
