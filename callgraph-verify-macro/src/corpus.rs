@@ -201,7 +201,14 @@ fn scan_attrs_and_record(
                 let _ = p;
             }
             Meta::List(m) => {
-                if !attr.path().is_ident("origin") && !attr.path().is_ident("callgraph_verify") {
+                // Match on the LAST segment of the path: the macro is typically
+                // invoked as `#[callgraph_verify_macro::origin(VA)]` (3 segments),
+                // not bare `#[origin(VA)]`. `is_ident` returns true ONLY for a
+                // single-segment path — using it here silently rejected every
+                // qualified `#[origin]` tag in the workspace, then the
+                // CORPUS-GAP self-check fired for every fn (it looked like the
+                // scanner saw zero origins). Same helper as vtable_table below.
+                if !path_is(attr.path(), "origin") && !path_is(attr.path(), "callgraph_verify") {
                     continue;
                 }
                 // The token stream between the parens — `parse_origin_attr`
@@ -487,6 +494,37 @@ impl S {
         let c = scan_text("#[callgraph_verify(0x004028d0)] pub unsafe fn foo() {}");
         assert!(c.free_fns.contains_key("foo"));
         assert!(c.corpus.contains(&0x004028d0));
+    }
+
+    /// Regression: `#[callgraph_verify_macro::origin(VA)]` (the FULL path the
+    /// macro is actually invoked with, three segments, not one) was silently
+    /// dropped because the scanner checked `attr.path().is_ident("origin")`
+    /// — `is_ident` is true only for a single-segment path. With the bug,
+    /// every qualified `#[origin]` tag in the workspace was rejected and the
+    /// CORPUS-GAP self-check fired for every tagged fn. Match on the last
+    /// segment (`path_is` helper, same as `vtable_table!`).
+    #[test]
+    fn syn_scan_picks_up_qualified_origin_path() {
+        let c = scan_text("#[callgraph_verify_macro::origin(0x004028d0)] pub unsafe fn foo() {}");
+        assert!(
+            c.free_fns.contains_key("foo"),
+            "qualified `#[callgraph_verify_macro::origin(...)]` was dropped: {:?}",
+            c.free_fns
+        );
+        assert!(
+            c.corpus.contains(&0x004028d0),
+            "qualified origin addr missing from corpus: {:?}",
+            c.corpus
+        );
+    }
+
+    #[test]
+    fn syn_scan_picks_up_qualified_callgraph_verify_alias_path() {
+        let c = scan_text(
+            "#[callgraph_verify_macro::callgraph_verify(0x004028d1)] pub unsafe fn bar() {}",
+        );
+        assert!(c.free_fns.contains_key("bar"), "{:?}", c.free_fns);
+        assert!(c.corpus.contains(&0x004028d1), "{:?}", c.corpus);
     }
 
     /// `/// inline: 0xA …` doc-comment with an address → records the addr,
