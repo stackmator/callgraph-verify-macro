@@ -31,7 +31,7 @@
 //! configurable knob.
 
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{quote, ToTokens};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use syn::parse::{Parse, ParseStream};
@@ -445,7 +445,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Token view of JUST the body block: hex-literal and CFG-keyword harvest
     // operate on tokens, and scoping them to the block keeps attribute
     // internals (`#[origin(0xA, calls = [0xB])]`) out of both.
-    let block_ts = quote::quote!(#(fn_like.block()));
+    let block_ts = fn_like.block().to_token_stream();
 
     // A macro invocation's body is an opaque token stream — calls and loops
     // inside it are INVISIBLE to every check below. Silent invisibility is
