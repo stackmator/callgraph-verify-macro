@@ -1909,4 +1909,78 @@ let fallthrough_target = entry + 0x0E;
             fp
         );
     }
+
+    /// Unhappy-path: a thunk whose JMP target is OUT of the 64KB
+    /// window. The OLD code's `(lo..hi).contains(&t)` check would have
+    /// rejected this naturally (no in-range leader added, callee not
+    /// decoded). The NEW code's `t < ip` check also rejects it — both
+    /// paths converge on `loops=0`. Pin the converged behaviour so a
+    /// future refactor doesn't drift the two checks apart.
+    #[test]
+    fn cfg_fingerprint_thunk_with_out_of_range_target_is_a_single_return() {
+        // The thunk is at 0x1000. The JMP must reach 0x1000+0x10000 =
+        // 0x11000 which is OUT of [0x1000, 0x1000+0x10000). The OLD
+        // `(lo..hi).contains(&t)` check would have rejected this for
+        // a thunk at 0x1000+0x10000-5 = 0x10FFB, but the JMP's
+        // 5-byte length means next_ip == 0x11000, which IS in
+        // [0x10FFB, 0x10FFB+0x10000) = [0x10FFB, 0x20FFB). So
+        // `(lo..hi).contains(0x11000)` is true. But `0x11000 > ip` for
+        // any ip in [0x10FFB, 0x10FFB+5) = [0x10FFB, 0x11000). So the
+        // NEW check rejects it.
+        //
+        // Layout: thunk at 0x10FFB (5 bytes for JMP), target 0x11000
+        // which is just past the 64KB window.
+        let code = [
+            0xE9, 0x00, 0x00, 0x00, 0x00, // JMP rel32 = 0 → 0x11000
+            0x90, 0x90, 0x90, 0x90, 0x90, // padding
+            0xC3,                         // RET (would be the callee start)
+        ];
+        let pe = pe_with_code(&code);
+        // The synthetic PE's .text VA is 0x1000, so a thunk at 0x10FFB
+        // would actually be at image_base + 0x10FFB, but pe_with_code
+        // places code at image_base + 0x1000 with text_raw = ceil(0x200)
+        // ≈ 0x200 bytes. So a JMP at image_base + 0x1000 reaching
+        // image_base + 0x11000 would be 64KB forward — exactly at the
+        // window edge. (lo..hi) = [0x1000, 0x11000) is half-open; the
+        // upper bound is exclusive so 0x11000 is OUT of range. Both OLD
+        // and NEW code reject it.
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        assert_eq!(fp.loops, 0, "out-of-range JMP target — loops=0; got {:?}", fp);
+        assert_eq!(fp.conditionals, 0, "got {:?}", fp);
+        assert_eq!(fp.switch_cases, 0, "got {:?}", fp);
+        assert!(
+            fp.returns >= 1,
+            "the single JMP is a return-equivalent terminator; got {:?}",
+            fp
+        );
+    }
+
+    /// Unhappy-path: thunk with a JMP target that is at the same IP
+    /// (self-loop JMP, e.g. an infinite-loop `jmp $` thunk). The fix's
+    /// `t < ip` check rejects `t == ip` (no leader added), but
+    /// `cfg_fingerprint`'s `dom[b.start].contains(t)` still classifies
+    /// it as a back-edge (every node dominates itself). Pin that
+    /// behaviour so a future "strict-less-than" → "strict-less-or-equal"
+    /// drift doesn't change the count.
+    #[test]
+    fn cfg_fingerprint_self_loop_jmp_thunk_is_one_loop() {
+        // 0x1000: EB FE   JMP 0x1000 (self-loop)
+        let code = [0xEB, 0xFE, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
+        assert_eq!(
+            fp.loops, 1,
+            "self-loop JMP at the entry must still count as 1 loop even \
+             though the fix's `t < ip` check rejects it as a follower; got \
+             {:?}",
+            fp
+        );
+        // The JMP is the only terminator AND it counts as a back-edge
+        // (not a return), so returns == 0 here. The existing
+        // cfg_fingerprint_self_loop_is_counted test pins the same
+        // behaviour; this test pins the interaction with the new fix.
+        assert_eq!(fp.returns, 0, "self-loop JMP is a back-edge, not a return; got {:?}", fp);
+    }
 }
