@@ -6,40 +6,40 @@ mod tests {
     };
     use std::process::Command;
 
-/// Build the test-bin binary if needed.
-fn ensure_test_binary_built() {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let test_bin_dir = manifest_dir.join("test-bin");
-    let exe_path = test_bin_dir
-        .join("target")
-        .join("i686-pc-windows-msvc")
-        .join("debug")
-        .join("test-bin.exe");
-    if !exe_path.exists() {
-        let status = Command::new("cargo")
-            .args(["build", "--target", "i686-pc-windows-msvc"])
-            .current_dir(&test_bin_dir)
-            .status()
-            .expect("failed to run cargo build for test-bin");
-        assert!(status.success(), "test-bin build failed");
+    /// Build the test-bin binary if needed.
+    fn ensure_test_binary_built() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let test_bin_dir = manifest_dir.join("test-bin");
+        let exe_path = test_bin_dir
+            .join("target")
+            .join("i686-pc-windows-msvc")
+            .join("debug")
+            .join("test-bin.exe");
+        if !exe_path.exists() {
+            let status = Command::new("cargo")
+                .args(["build", "--target", "i686-pc-windows-msvc"])
+                .current_dir(&test_bin_dir)
+                .status()
+                .expect("failed to run cargo build for test-bin");
+            assert!(status.success(), "test-bin build failed");
+        }
     }
-}
 
-fn get_test_binary_path() -> std::path::PathBuf {
-    ensure_test_binary_built();
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let test_bin_dir = manifest_dir.join("test-bin");
-    test_bin_dir
-        .join("target")
-        .join("i686-pc-windows-msvc")
-        .join("debug")
-        .join("test-bin.exe")
-}
+    fn get_test_binary_path() -> std::path::PathBuf {
+        ensure_test_binary_built();
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let test_bin_dir = manifest_dir.join("test-bin");
+        test_bin_dir
+            .join("target")
+            .join("i686-pc-windows-msvc")
+            .join("debug")
+            .join("test-bin.exe")
+    }
 
-fn load_test_pe() -> Pe {
-    let path = get_test_binary_path();
-    Pe::load(path.to_str().unwrap()).expect("load test binary")
-}
+    fn load_test_pe() -> Pe {
+        let path = get_test_binary_path();
+        Pe::load(path.to_str().unwrap()).expect("load test binary")
+    }
 
     /// Find a function address by scanning the .text section for valid functions
     fn find_function_addresses(pe: &Pe) -> Vec<u64> {
@@ -495,7 +495,8 @@ fn load_test_pe() -> Pe {
         // We can't easily pick one without symbols, so use a far-future placeholder: the
         // highest VA in .text plus a gap. If .text is empty this returns false trivially.
         if let Some(text) = pe.sections().iter().find(|s| s.name == ".text") {
-            let far = pe.image_base + text.virtual_address as u64 + text.virtual_size as u64 + 0x1000;
+            let far =
+                pe.image_base + text.virtual_address as u64 + text.virtual_size as u64 + 0x1000;
             // far might be outside .text — that's fine, the function should still return false.
             assert!(
                 !has_direct_branch_target(&pe, far),
@@ -573,13 +574,13 @@ fn load_test_pe() -> Pe {
         let coff = pe_off + 4;
         data[coff..coff + 2].copy_from_slice(&0x014cu16.to_le_bytes()); // machine = i386
         data[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections
-        // SizeOfOptionalHeader
+                                                                       // SizeOfOptionalHeader
         data[coff + 16..coff + 18].copy_from_slice(&0x60u16.to_le_bytes());
 
         // PE32 optional header (96 bytes for size 0x60)
         let opt = coff + 20;
         data[opt..opt + 2].copy_from_slice(&0x010bu16.to_le_bytes()); // Magic = PE32
-        // ImageBase at offset 28 from optional header
+                                                                      // ImageBase at offset 28 from optional header
         let image_base: u32 = 0x0040_0000;
         data[opt + 28..opt + 32].copy_from_slice(&image_base.to_le_bytes());
 
@@ -926,7 +927,7 @@ fn load_test_pe() -> Pe {
         let entry = pe.image_base + 0x1000;
         let cg = analyze(&pe, entry).expect("analyze");
 
-let fallthrough_target = entry + 0x0E;
+        let fallthrough_target = entry + 0x0E;
         let ft = cg
             .call_sites
             .iter()
@@ -996,10 +997,7 @@ let fallthrough_target = entry + 0x0E;
                 }
             }
         }
-        assert!(
-            checked > 0,
-            "scan found no analyzable functions"
-        );
+        assert!(checked > 0, "scan found no analyzable functions");
         assert!(
             disagreements.is_empty(),
             "{} of {} analyze()-reported CALL targets have no matching \
@@ -1023,9 +1021,8 @@ let fallthrough_target = entry + 0x0E;
         for caller in &addrs {
             if let Ok(cg) = analyze(&pe, *caller) {
                 let real: Vec<u64> = cg.call_targets().into_iter().collect();
-                let d = diff_calls(&pe, *caller, &real, true).unwrap_or_else(|e| {
-                    panic!("diff_calls at {:#x} failed: {e}", caller)
-                });
+                let d = diff_calls(&pe, *caller, &real, true)
+                    .unwrap_or_else(|e| panic!("diff_calls at {:#x} failed: {e}", caller));
                 total += 1;
                 assert!(
                     d.hallucinated.is_empty() && d.missing.is_empty(),
@@ -1096,7 +1093,11 @@ let fallthrough_target = entry + 0x0E;
                 total_field += cg.field_offsets.len();
                 total_imm += cg.imm_addrs.len();
                 for &f in &cg.field_offsets {
-                    assert!(f <= 0x8000, "field_offset {:#x} exceeds MAX_FIELD_OFFSET", f);
+                    assert!(
+                        f <= 0x8000,
+                        "field_offset {:#x} exceeds MAX_FIELD_OFFSET",
+                        f
+                    );
                 }
                 for &a in &cg.imm_addrs {
                     assert!(
@@ -1217,7 +1218,10 @@ let fallthrough_target = entry + 0x0E;
         assert_eq!(cg.entry, entry);
         assert_eq!(cg.max_end - cg.entry, 1, "extent should be 1 (just RET)");
         assert!(cg.direct_calls.is_empty(), "RET-only function has no calls");
-        assert!(cg.tail_calls.is_empty(), "RET-only function has no tail calls");
+        assert!(
+            cg.tail_calls.is_empty(),
+            "RET-only function has no tail calls"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1441,8 +1445,8 @@ let fallthrough_target = entry + 0x0E;
             return;
         }
         let pe = Pe::load(pe_path.to_str().unwrap()).expect("load noivilbo.exe");
-        let fp =
-            cfg_fingerprint(&pe, 0x00747d30).expect("cfg_fingerprint at 0x00747d30 (ni_file_flush)");
+        let fp = cfg_fingerprint(&pe, 0x00747d30)
+            .expect("cfg_fingerprint at 0x00747d30 (ni_file_flush)");
         assert_eq!(
             fp.loops, 0,
             "ni_file_flush (0x00747d30) has no real loops — its two Jccs into \
@@ -1489,18 +1493,11 @@ let fallthrough_target = entry + 0x0E;
         // Either we get an Ok fingerprint with all-zero counters (the
         // decode_all loop never produces a leader) or an Err. Anything
         // else (panic, NaN, fake loops) is a regression.
-        match cfg_fingerprint(&pe, entry) {
-            Ok(fp) => {
-                assert_eq!(
-                    fp.loops, 0,
-                    "no instructions → no back-edges; got {:?}",
-                    fp
-                );
-                assert_eq!(fp.conditionals, 0);
-                assert_eq!(fp.switch_cases, 0);
-                assert_eq!(fp.returns, 0);
-            }
-            Err(_) => {} // also acceptable: the gate refused zero-byte entry
+        if let Ok(fp) = cfg_fingerprint(&pe, entry) {
+            assert_eq!(fp.loops, 0, "no instructions → no back-edges; got {:?}", fp);
+            assert_eq!(fp.conditionals, 0);
+            assert_eq!(fp.switch_cases, 0);
+            assert_eq!(fp.returns, 0);
         }
     }
 
@@ -1717,14 +1714,14 @@ let fallthrough_target = entry + 0x0E;
         let case0_va: u32 = image_base + 0x1014; // = 0x00401014
         let case1_va: u32 = image_base + 0x1018; // = 0x00401018
         let case2_va: u32 = image_base + 0x101C; // = 0x0040101C
-        // 0x1000: JMP [EAX*4 + 0x0040_1010]      (FF 24 85 10 10 40 00)  [7 bytes]
-        // 0x1007-0x100F: padding
-        // 0x1010: 14 10 40 00  → 0x00401014       jump table entry 0
-        // 0x1014: 18 10 40 00  → 0x00401018       jump table entry 1
-        // 0x1018: 1C 10 40 00  → 0x0040101C       jump table entry 2
-        // 0x1014: RET                          (C3)   [1 byte]   case 0
-        // 0x1018: RET                          (C3)   [1 byte]   case 1
-        // 0x101C: RET                          (C3)   [1 byte]   case 2
+                                                 // 0x1000: JMP [EAX*4 + 0x0040_1010]      (FF 24 85 10 10 40 00)  [7 bytes]
+                                                 // 0x1007-0x100F: padding
+                                                 // 0x1010: 14 10 40 00  → 0x00401014       jump table entry 0
+                                                 // 0x1014: 18 10 40 00  → 0x00401018       jump table entry 1
+                                                 // 0x1018: 1C 10 40 00  → 0x0040101C       jump table entry 2
+                                                 // 0x1014: RET                          (C3)   [1 byte]   case 0
+                                                 // 0x1018: RET                          (C3)   [1 byte]   case 1
+                                                 // 0x101C: RET                          (C3)   [1 byte]   case 2
         let mut code: Vec<u8> = vec![
             0xFF, 0x24, 0x85, // JMP [EAX*4 + disp32]
         ];
@@ -1897,11 +1894,7 @@ let fallthrough_target = entry + 0x0E;
             "thunk has no conditionals. Got fp = {:?}",
             fp
         );
-        assert_eq!(
-            fp.switch_cases, 0,
-            "thunk has no switch. Got fp = {:?}",
-            fp
-        );
+        assert_eq!(fp.switch_cases, 0, "thunk has no switch. Got fp = {:?}", fp);
         assert!(
             fp.returns >= 1,
             "thunk's JMP must be counted as a return-equivalent terminator. \
@@ -1933,7 +1926,7 @@ let fallthrough_target = entry + 0x0E;
         let code = [
             0xE9, 0x00, 0x00, 0x00, 0x00, // JMP rel32 = 0 → 0x11000
             0x90, 0x90, 0x90, 0x90, 0x90, // padding
-            0xC3,                         // RET (would be the callee start)
+            0xC3, // RET (would be the callee start)
         ];
         let pe = pe_with_code(&code);
         // The synthetic PE's .text VA is 0x1000, so a thunk at 0x10FFB
@@ -1946,7 +1939,11 @@ let fallthrough_target = entry + 0x0E;
         // and NEW code reject it.
         let entry = pe.image_base + 0x1000;
         let fp = cfg_fingerprint(&pe, entry).expect("cfg_fingerprint");
-        assert_eq!(fp.loops, 0, "out-of-range JMP target — loops=0; got {:?}", fp);
+        assert_eq!(
+            fp.loops, 0,
+            "out-of-range JMP target — loops=0; got {:?}",
+            fp
+        );
         assert_eq!(fp.conditionals, 0, "got {:?}", fp);
         assert_eq!(fp.switch_cases, 0, "got {:?}", fp);
         assert!(
@@ -1981,6 +1978,10 @@ let fallthrough_target = entry + 0x0E;
         // (not a return), so returns == 0 here. The existing
         // cfg_fingerprint_self_loop_is_counted test pins the same
         // behaviour; this test pins the interaction with the new fix.
-        assert_eq!(fp.returns, 0, "self-loop JMP is a back-edge, not a return; got {:?}", fp);
+        assert_eq!(
+            fp.returns, 0,
+            "self-loop JMP is a back-edge, not a return; got {:?}",
+            fp
+        );
     }
 }

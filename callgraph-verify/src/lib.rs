@@ -36,13 +36,34 @@ pub struct Spec {
     iat: Vec<u64>,
 }
 
-/// The cached `.text` instruction-start sets, keyed by
-/// `(image_base, text_rva, text_vsize)`. Each entry holds an `Arc` so the
-/// cached set can be cloned out without holding the MutexGuard.
+/// The cached `.text` instruction-start sets, keyed by the PE's unique id
+/// plus `(image_base, text_rva, text_vsize)`. Each entry holds an `Arc` so the
+/// cached set can be cloned out without holding the MutexGuard. The id (not
+/// layout alone) is the key because two same-layout PEs with different bytes
+/// must never share a set — the input-ignoring-cache class of BUG #9.
 type TextStartsCache = std::sync::Mutex<
-    std::collections::HashMap<(u64, u32, u32), std::sync::OnceLock<TextStarts>>,
+    std::collections::HashMap<(u64, u64, u32, u32), std::sync::OnceLock<TextStarts>>,
 >;
 type TextStarts = std::sync::Arc<std::collections::BTreeSet<u64>>;
+
+/// The cached set of EVERY rel32 branch target (CALL/JMP/Jcc) whose opcode sits
+/// at a real instruction start in `.text`, keyed by PE id + layout. Built in
+/// ONE linear pass per PE instance so [`has_direct_branch_target`] is a hash
+/// lookup — the per-target scan it replaced walked the whole (multi-MB)
+/// `.text` blob on every call, making the macro's inline-marker and
+/// vtable-dispatch checks O(fns × markers × |.text|) per build. NOTE: the
+/// steady-state path must not touch the `.text` bytes at all — a content
+/// fingerprint per call (an earlier draft hashed 4 MB every lookup) is just a
+/// cheaper rescan and reproduces the same quadratic build time.
+type BranchTargetsCache = std::sync::Mutex<
+    std::collections::HashMap<(u64, u64, u32, u32), std::sync::OnceLock<BranchTargets>>,
+>;
+type BranchTargets = std::sync::Arc<std::collections::HashSet<u32>>;
+
+fn branch_targets_cache() -> &'static BranchTargetsCache {
+    static CACHE: std::sync::OnceLock<BranchTargetsCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
 
 fn text_starts_cache() -> &'static TextStartsCache {
     static CACHE: std::sync::OnceLock<TextStartsCache> = std::sync::OnceLock::new();
@@ -60,9 +81,14 @@ fn text_starts_cache() -> &'static TextStartsCache {
 /// `&'static BTreeSet`s without touching the mutex. The mutex is only acquired
 /// on the very first request per `(image_base, text_rva, text_vsize)` triple.
 fn text_instruction_starts(pe: &Pe) -> TextStarts {
-    let key = || -> Option<(u64, u32, u32)> {
+    let key = || -> Option<(u64, u64, u32, u32)> {
         let text = pe.sections().iter().find(|s| s.name == ".text")?;
-        Some((pe.image_base, text.virtual_address, text.virtual_size))
+        Some((
+            pe.id(),
+            pe.image_base,
+            text.virtual_address,
+            text.virtual_size,
+        ))
     };
     let key = match key() {
         Some(k) => k,
@@ -108,58 +134,84 @@ fn text_instruction_starts(pe: &Pe) -> TextStarts {
 /// Does ANY instruction in `.text` statically target `target` via a relative branch
 /// (CALL/JMP/Jcc rel32)? Used by the macro to warn on vtable-only dispatch.
 ///
-/// Implementation: decode `.text` once (cached) to learn every valid instruction
-/// start, then byte-scan for `0xE8`/`0xE9`/`0x0F 0x8x` and only treat a hit as
-/// a real branch if its `0xE8`/`0xE9` byte sits AT an instruction start. Without
-/// the gate (BUG #3), a `0xE8` byte anywhere inside another instruction's
-/// encoding was treated as a CALL, computing a junk rel32 target that could
-/// coincidentally equal `target` — a false positive that suppressed legitimate
-/// VTABLE-ONLY DISPATCH warnings.
+/// Implementation: the set of all such targets is built in ONE pass over `.text`
+/// (cached per PE — see [`branch_targets_cache`]) and this call is a hash lookup.
+/// The one-pass walk decodes `.text` once (also cached) to learn every valid
+/// instruction start, then byte-scans for `0xE8`/`0xE9`/`0x0F 0x8x` and only
+/// records a hit as a real branch if its opcode byte sits AT an instruction
+/// start. Without that gate (BUG #3), a `0xE8` byte anywhere inside another
+/// instruction's encoding was treated as a CALL, computing a junk rel32 target
+/// that could coincidentally equal `target` — a false positive that suppressed
+/// legitimate VTABLE-ONLY DISPATCH warnings.
 pub fn has_direct_branch_target(pe: &Pe, target: u64) -> bool {
+    all_branch_targets(pe).contains(&(target as u32))
+}
+
+/// Every rel32 branch target of `.text`, computed once per PE instance.
+/// Accept-set identical to the per-target scan this replaces: rel32
+/// CALL/JMP/Jcc opcodes gated on real instruction starts. Keyed by the PE's
+/// unique id — the steady-state lookup never touches the `.text` bytes.
+fn all_branch_targets(pe: &Pe) -> BranchTargets {
     let Some(text) = pe.sections().iter().find(|s| s.name == ".text") else {
-        return false;
+        // No .text section: every lookup misses against an empty set.
+        static EMPTY: std::sync::OnceLock<BranchTargets> = std::sync::OnceLock::new();
+        return EMPTY
+            .get_or_init(|| std::sync::Arc::new(std::collections::HashSet::new()))
+            .clone();
     };
     let text_va = pe.image_base + text.virtual_address as u64;
-    let blob = match pe.read(text_va, text.virtual_size as usize) {
-        Some(b) => b,
-        None => return false,
-    };
-    let starts = text_instruction_starts(pe);
-    let target = target as u32;
-    let mut i = 0;
-    while i + 4 < blob.len() {
-        let (rel_at, _take) = match blob[i] {
-            0xE8 | 0xE9 => (i + 1, 4), // CALL rel32 / JMP rel32
-            0x0F if i + 6 <= blob.len() && (0x80..=0x8F).contains(&blob[i + 1]) => (i + 2, 4),
-            _ => {
+    let key = (
+        pe.id(),
+        pe.image_base,
+        text.virtual_address,
+        text.virtual_size,
+    );
+    let cache = branch_targets_cache();
+    let mut lock = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = lock.entry(key).or_default();
+    entry
+        .get_or_init(|| {
+            let blob = match pe.read(text_va, text.virtual_size as usize) {
+                Some(b) => b,
+                None => return std::sync::Arc::new(std::collections::HashSet::new()),
+            };
+            let starts = text_instruction_starts(pe);
+            let mut targets = std::collections::HashSet::new();
+            let mut i = 0;
+            while i + 4 < blob.len() {
+                let rel_at = match blob[i] {
+                    0xE8 | 0xE9 => i + 1, // CALL rel32 / JMP rel32
+                    0x0F if i + 6 <= blob.len() && (0x80..=0x8F).contains(&blob[i + 1]) => i + 2,
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                // Gate: the branch opcode must sit at a real instruction start.
+                // Spurious `0xE8` bytes inside other instructions are ignored.
+                // (BUG #3 fix.)
+                let ip_va = text_va + i as u64;
+                if !starts.contains(&ip_va) {
+                    i += 1;
+                    continue;
+                }
+                if rel_at + 4 > blob.len() {
+                    i += 1;
+                    continue;
+                }
+                let rel = i32::from_le_bytes([
+                    blob[rel_at],
+                    blob[rel_at + 1],
+                    blob[rel_at + 2],
+                    blob[rel_at + 3],
+                ]) as i64;
+                let t = (text_va + (rel_at as u64 + 4)).wrapping_add(rel as u64) as u32;
+                targets.insert(t);
                 i += 1;
-                continue;
             }
-        };
-        // Gate: the branch opcode must sit at a real instruction start. Spurious
-        // `0xE8` bytes inside other instructions are ignored. (BUG #3 fix.)
-        let ip_va = text_va + i as u64;
-        if !starts.contains(&ip_va) {
-            i += 1;
-            continue;
-        }
-        if rel_at + 4 > blob.len() {
-            i += 1;
-            continue;
-        }
-        let rel = i32::from_le_bytes([
-            blob[rel_at],
-            blob[rel_at + 1],
-            blob[rel_at + 2],
-            blob[rel_at + 3],
-        ]) as i64;
-        let t = (text_va + (rel_at as u64 + 4)).wrapping_add(rel as u64) as u32;
-        if t == target {
-            return true;
-        }
-        i += 1;
-    }
-    false
+            std::sync::Arc::new(targets)
+        })
+        .clone()
 }
 
 impl Spec {

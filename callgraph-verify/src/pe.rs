@@ -3,11 +3,26 @@
 //! in `goblin`/`object`: the contract is "pure byte", and the only thing the
 //! disassembler needs is `va -> &[machine code bytes]`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 /// A loaded PE image: the raw file plus the parsed section table.
 pub struct Pe {
     data: Vec<u8>,
     pub image_base: u64,
     sections: Vec<Section>,
+    /// Process-unique identity assigned at parse time. Whole-image derived
+    /// caches (instruction starts, branch targets) key on this so two
+    /// same-layout PEs with different bytes can never share an entry — the
+    /// layout-only key they used before was the input-ignoring-cache class
+    /// of BUG #9. In production the macro holds ONE `Arc<Pe>` per exe path,
+    /// so one id per binary; tests that build many synthetic PEs each get
+    /// their own entries.
+    id: u64,
+}
+
+fn next_pe_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Clone, Debug)]
@@ -103,7 +118,13 @@ impl Pe {
             data,
             image_base,
             sections,
+            id: next_pe_id(),
         })
+    }
+
+    /// Process-unique id assigned at parse time (see the field docs).
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// The section containing `va`, if any.

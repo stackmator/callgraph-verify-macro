@@ -167,10 +167,7 @@ fn load_pe_cached(path: &str) -> Option<Arc<Pe>> {
 /// (~one linear pass over the 8 MB image); used by the ORIGIN-UNREFERENCED check.
 /// Keyed per binary — a bare `static OnceLock` would return the FIRST PE's set for
 /// every subsequent PE (the same input-ignoring-cache class as BUG #9).
-fn referenced_addrs_cached(
-    exe: &str,
-    pe: &Pe,
-) -> std::sync::Arc<std::collections::HashSet<u32>> {
+fn referenced_addrs_cached(exe: &str, pe: &Pe) -> std::sync::Arc<std::collections::HashSet<u32>> {
     static CACHE: OnceLock<AddrsCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (exe.to_string(), pe.image_base);
@@ -433,9 +430,8 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_like = match body::parse_fn_like(&item2) {
         Ok(f) => f,
         Err(e) => {
-            let msg = format!(
-                "#[origin] requires a function item (free fn or impl/trait method): {e}"
-            );
+            let msg =
+                format!("#[origin] requires a function item (free fn or impl/trait method): {e}");
             let err = syn::Error::new(proc_macro2::Span::call_site(), msg).to_compile_error();
             return quote! { #err #item2 }.into();
         }
@@ -462,7 +458,11 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
              escape the HALLUCINATED / MISSING / CFG checks. Inline the work (or \
              add an explicit `calls = [...]` pin) if it touches ported fns.",
             args.addr,
-            names.iter().map(|n| format!("`{n}!`")).collect::<Vec<_>>().join(", ")
+            names
+                .iter()
+                .map(|n| format!("`{n}!`"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
 
@@ -773,15 +773,13 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     // declaration.
     match analyze(&pe, args.addr) {
         Ok(cg) => {
-            let mut referenced: std::collections::BTreeSet<u64> =
-                std::collections::BTreeSet::new();
+            let mut referenced: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
             referenced.extend(cg.direct_calls.keys().copied());
             referenced.extend(&cg.tail_calls);
             referenced.extend(&cg.globals);
             referenced.extend(&cg.imm_addrs);
             referenced.extend(&cg.iat_calls);
-            let mut reported: std::collections::BTreeSet<u64> =
-                std::collections::BTreeSet::new();
+            let mut reported: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
             for v in body::collect_hex_literals(block_ts.clone()) {
                 // Skip the function's own address (recursion / self-reference), dups,
                 // and any literal that isn't an in-image address (counts, masks, sizes).
@@ -971,10 +969,7 @@ pub fn vtable_table(input: TokenStream) -> TokenStream {
 
     // Compile-time verification (no-op if the binary / corpus aren't configured).
     let mut errors: Vec<String> = Vec::new();
-    if let (Ok(exe), Ok(root)) = (
-        std::env::var("TARGET_EXE"),
-        std::env::var("REBUILD_ROOT"),
-    ) {
+    if let (Ok(exe), Ok(root)) = (std::env::var("TARGET_EXE"), std::env::var("REBUILD_ROOT")) {
         if let Some(pe) = load_pe_cached(&exe) {
             let map = corpus::corpus_map(&root);
             for (slot, _span, path) in &t.entries {
@@ -1047,9 +1042,7 @@ pub fn vtable_table(input: TokenStream) -> TokenStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        inline_marker_mismatches, vtable_only_dispatch_msg, vtable_method_map, CacheKey,
-    };
+    use super::{inline_marker_mismatches, vtable_method_map, vtable_only_dispatch_msg, CacheKey};
     use crate::Pe;
     use quote::{quote, ToTokens};
     use std::collections::BTreeSet;
@@ -1072,7 +1065,10 @@ mod tests {
         let fn_like = crate::body::parse_fn_like(&item).expect("parse function");
         let facts = crate::body::cfg_keyword_counts(fn_like.block().to_token_stream());
         assert!(facts.loops >= 1, "function body loop was not preserved");
-        assert!(facts.ifs >= 1, "function body conditional was not preserved");
+        assert!(
+            facts.ifs >= 1,
+            "function body conditional was not preserved"
+        );
     }
 
     #[test]
@@ -1127,7 +1123,10 @@ mod tests {
     fn cache_key_distinguishes_declared_lists() {
         let a = CacheKey::new_for_test(0x0040_0000, &[(0x1000, 2)]);
         let b = CacheKey::new_for_test(0x0040_0000, &[(0x1000, 3)]);
-        assert_ne!(a, b, "different declared lists should produce different keys");
+        assert_ne!(
+            a, b,
+            "different declared lists should produce different keys"
+        );
     }
 
     #[test]
@@ -1226,11 +1225,23 @@ mod tests {
     /// `.text` section containing `code` at offset 0x1000. Returns the PE
     /// and the entry VA (image_base + 0x1000).
     fn build_pe_with_code(code: &[u8]) -> (Pe, u64) {
+        build_pe_with_text_len(code, code.len())
+    }
+
+    /// Same builder with `.text` padded to `text_len` bytes (zeros beyond
+    /// `code`) — used by the perf-regression guards below to model a
+    /// multi-MB target image like noivilbo.exe's 6.4 MB `.text`.
+    fn build_pe_with_text_len(code: &[u8], text_len: usize) -> (Pe, u64) {
+        assert!(text_len >= code.len());
         let image_base: u32 = 0x0040_0000;
         let text_va: u32 = 0x1000;
         let e_lfanew: u32 = 0x40;
-        let text_raw: u32 = ((code.len() + 0x1ff) & !0x1ff).max(0x200) as u32;
-        let mut data: Vec<u8> = vec![0; 0x4000];
+        let text_raw: u32 = ((text_len + 0x1ff) & !0x1ff).max(0x200) as u32;
+        // Section raw data lives at file offset `text_raw` and spans
+        // `text_raw` bytes (raw_offset == raw_size == text_raw), so the file
+        // must be ~2× text_raw long — a shorter buffer truncates every
+        // `Pe::read` at EOF.
+        let mut data: Vec<u8> = vec![0; 0x400 + text_raw as usize * 2];
         data[0..2].copy_from_slice(b"MZ");
         data[0x3c..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
         let pe_off = e_lfanew as usize;
@@ -1244,13 +1255,16 @@ mod tests {
         data[opt + 28..opt + 32].copy_from_slice(&image_base.to_le_bytes());
         let sec_off = opt + 0x60;
         data[sec_off..sec_off + 8].copy_from_slice(b".text\0\0\0");
-        data[sec_off + 8..sec_off + 12].copy_from_slice(&(code.len().max(text_raw as usize) as u32).to_le_bytes());
+        data[sec_off + 8..sec_off + 12].copy_from_slice(&text_raw.to_le_bytes());
         data[sec_off + 12..sec_off + 16].copy_from_slice(&text_va.to_le_bytes());
         data[sec_off + 16..sec_off + 20].copy_from_slice(&text_raw.to_le_bytes());
         data[sec_off + 20..sec_off + 24].copy_from_slice(&text_raw.to_le_bytes());
         let code_off = text_raw as usize;
         data[code_off..code_off + code.len()].copy_from_slice(code);
-        (Pe::parse(data).expect("parse"), image_base as u64 + text_va as u64)
+        (
+            Pe::parse(data).expect("parse"),
+            image_base as u64 + text_va as u64,
+        )
     }
 
     /// `inline_marker_mismatches` returns a note for any `inlined_markers`
@@ -1324,7 +1338,10 @@ mod tests {
     fn inline_marker_empty_set_produces_no_notes() {
         let (pe, _entry) = build_pe_with_code(&[0xC3]);
         let notes = inline_marker_mismatches(&pe, &BTreeSet::new());
-        assert!(notes.is_empty(), "empty set must yield zero notes: {notes:?}");
+        assert!(
+            notes.is_empty(),
+            "empty set must yield zero notes: {notes:?}"
+        );
     }
 
     /// Mixed set: one address with a real CALL, one without. Only the
@@ -1361,6 +1378,73 @@ mod tests {
             !notes[0].contains(&format!("{target_b:#010x}")),
             "note should NOT name target_b: {}",
             notes[0]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Performance-regression guards (the disasm-layer twins live in
+    // callgraph-verify/tests/perf.rs). inline_marker_mismatches used to
+    // trigger a full .text byte-scan PER MARKER per #[origin] expansion —
+    // ~77 markers × 6.4 MB on every tagged fn, which turned elder-engine-rs
+    // builds into a ~30-minute scan-fest. The one-pass all-branch-targets
+    // cache fixed it; these tests fail if per-call rescanning ever returns.
+    //
+    // The timing assertion is SELF-CALIBRATING: it compares one
+    // inline_marker_mismatches call (100 markers) against the measured
+    // one-time warmup cost (first .text decode + one scan) on the same PE.
+    // A cached implementation runs the 100-marker call in microseconds
+    // (~1000× margin); a rescan-per-marker implementation costs ~100 scans
+    // and exceeds the warmup cost ~100× in both debug and release.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn inline_marker_mismatches_many_markers_on_large_text_are_not_rescans() {
+        // One real `CALL rel32 ; RET` at the start of .text (rel 0 → the CALL
+        // targets its own next_ip, entry+5) → the marker at entry+5 must be
+        // flagged; the other 99 markers are misses (worst case for the old
+        // scanner, which walked all of .text to conclude a miss).
+        let (pe, entry) =
+            build_pe_with_text_len(&[0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3], 4 * 1024 * 1024);
+        let hit = entry + 5;
+
+        // Measure the one-time warmup (decode + first scan) on a miss.
+        let t0 = std::time::Instant::now();
+        assert!(!callgraph_verify::has_direct_branch_target(
+            &pe,
+            entry + 0x400
+        ));
+        let warmup = t0.elapsed();
+        assert!(
+            warmup.as_millis() > 0,
+            "warmup did no measurable work — test PE too small to calibrate against"
+        );
+
+        let mut inlined = BTreeSet::new();
+        inlined.insert(hit);
+        for k in 1..100u64 {
+            inlined.insert(entry + 0x400 + k * 8);
+        }
+        let t1 = std::time::Instant::now();
+        let notes = inline_marker_mismatches(&pe, &inlined);
+        let elapsed = t1.elapsed();
+
+        // Correctness must hold at this scale too: exactly the targeted
+        // marker is flagged.
+        assert_eq!(
+            notes.len(),
+            1,
+            "exactly the targeted marker fires: {notes:?}"
+        );
+        assert!(
+            notes[0].contains(&format!("{hit:#010x}")),
+            "note names the targeted marker: {}",
+            notes[0]
+        );
+        assert!(
+            elapsed * 10 < warmup,
+            "inline_marker_mismatches over 100 markers took {elapsed:?} vs {warmup:?} \
+             warmup — has_direct_branch_target is rescanning .text per marker; \
+             the all-branch-targets cache was dropped or its key stopped matching"
         );
     }
 }

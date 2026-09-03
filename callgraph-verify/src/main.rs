@@ -81,9 +81,16 @@ fn print_usage(prog: &str) -> ! {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        print_usage(args.first().map(String::as_str).unwrap_or("callgraph_verify"));
+        print_usage(
+            args.first()
+                .map(String::as_str)
+                .unwrap_or("callgraph_verify"),
+        );
     }
-    let _prog = args.first().cloned().unwrap_or_else(|| "callgraph_verify".into());
+    let _prog = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "callgraph_verify".into());
     let exe = &args[1];
 
     // Mode dispatch: positional <addr> = per-function detail (existing);
@@ -285,22 +292,10 @@ fn print_summary(exe: &str, s: &FnStats) {
         s.total_extent,
         s.total_extent as f64 / 1024.0
     );
-    println!(
-        "  total direct calls:  {}",
-        s.total_direct_calls
-    );
-    println!(
-        "  total tail calls:    {}",
-        s.total_tail_calls
-    );
-    println!(
-        "  total indirect calls: {}",
-        s.total_indirect_calls
-    );
-    println!(
-        "  total indirect jumps: {}",
-        s.total_indirect_jumps
-    );
+    println!("  total direct calls:  {}", s.total_direct_calls);
+    println!("  total tail calls:    {}", s.total_tail_calls);
+    println!("  total indirect calls: {}", s.total_indirect_calls);
+    println!("  total indirect jumps: {}", s.total_indirect_jumps);
     println!(
         "  with any outgoing call: {} ({:.1}%)",
         s.with_calls,
@@ -360,11 +355,7 @@ fn print_json(pe: &Pe, entries: &[(u64, u64, callgraph_verify::CallGraph)]) {
     println!("  \"functions\": [");
     for (i, (va, extent, cg)) in entries.iter().enumerate() {
         let comma = if i + 1 < entries.len() { "," } else { "" };
-        let targets: Vec<String> = cg
-            .direct_calls
-            .keys()
-            .map(|t| format!("{t:#x}"))
-            .collect();
+        let targets: Vec<String> = cg.direct_calls.keys().map(|t| format!("{t:#x}")).collect();
         let tails: Vec<String> = cg.tail_calls.iter().map(|t| format!("{t:#x}")).collect();
         println!(
             "    {{\"entry\": \"{va:#x}\", \"extent\": {extent}, \

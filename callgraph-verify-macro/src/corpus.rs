@@ -13,8 +13,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use syn::{
-    parse_file as syn_parse_file, Attribute, Expr, FnArg, ImplItem, ImplItemFn, Item, ItemFn,
-    Lit, Meta, Signature, TraitItem, TraitItemFn,
+    parse_file as syn_parse_file, Attribute, Expr, FnArg, ImplItem, ImplItemFn, Item, ItemFn, Lit,
+    Meta, Signature, TraitItem, TraitItemFn,
 };
 
 use crate::body::BodyCalls;
@@ -248,7 +248,10 @@ fn scan_attrs_and_record(
         // can fold them in. Same syn-visitor path as the verifier itself.
         if let Some(block) = body {
             if c.inline_fns
-                .insert(name.to_string(), crate::body::collect_block_facts(block).names)
+                .insert(
+                    name.to_string(),
+                    crate::body::collect_block_facts(block).names,
+                )
                 .is_some()
             {
                 c.inline_ambiguous.insert(name.to_string());
@@ -385,8 +388,14 @@ mod tests {
 
     #[test]
     fn parse_inline_addr_basic() {
-        assert_eq!(parse_inline_addr("inline: 0x004028d0 (foo)").unwrap(), 0x004028d0);
-        assert_eq!(parse_inline_addr("inline: 0xAFFE_BABE").unwrap(), 0xAFFEBABE);
+        assert_eq!(
+            parse_inline_addr("inline: 0x004028d0 (foo)").unwrap(),
+            0x004028d0
+        );
+        assert_eq!(
+            parse_inline_addr("inline: 0xAFFE_BABE").unwrap(),
+            0xAFFEBABE
+        );
     }
 
     #[test]
@@ -745,7 +754,11 @@ pub unsafe fn foo_b() {}
     #[test]
     fn b04_method_call_via_dot_is_classified_as_method() {
         let facts = block_facts_of("obj.method(1, 2);");
-        assert!(facts.names.plain.is_empty(), "method leaked to plain: {:?}", facts.names.plain);
+        assert!(
+            facts.names.plain.is_empty(),
+            "method leaked to plain: {:?}",
+            facts.names.plain
+        );
         assert!(
             facts.names.method.contains("method"),
             "method not captured: {:?}",
@@ -756,16 +769,23 @@ pub unsafe fn foo_b() {}
     // B-04 (multi-line call): a call split across lines is one call.
     #[test]
     fn b04_multiline_call_is_one_call() {
-        let facts = block_facts_of("foo(
+        let facts = block_facts_of(
+            "foo(
     1,
     2,
-);");
+);",
+        );
         assert!(
             facts.names.plain.contains("foo"),
             "multi-line call should record `foo` once, got: {:?}",
             facts.names.plain
         );
-        assert_eq!(facts.names.plain.len(), 1, "expected exactly 1 call, got: {:?}", facts.names.plain);
+        assert_eq!(
+            facts.names.plain.len(),
+            1,
+            "expected exactly 1 call, got: {:?}",
+            facts.names.plain
+        );
     }
 
     // B-09: A function defined in two modules with the same name → the
@@ -797,14 +817,18 @@ mod b {
         assert!(c.corpus.contains(&0x004028d1));
         // Both functions are recorded as owners of their respective
         // addresses.
-        assert!(c.addr_owners.get(&0x004028d0).is_some());
-        assert!(c.addr_owners.get(&0x004028d1).is_some());
+        assert!(c.addr_owners.contains_key(&0x004028d0));
+        assert!(c.addr_owners.contains_key(&0x004028d1));
         // The free_fns map (HashMap<String, HashSet<u64>>) has the name
         // registered with BOTH addresses — last-wins is at the per-name
         // level only when the addresses are different but stored as the
         // same set. Both addresses survive.
         let free_inner = c.free_fns.get("inner").expect("`inner` recorded");
-        assert_eq!(free_inner.len(), 2, "free_fns['inner'] should have both addresses, got {free_inner:?}");
+        assert_eq!(
+            free_inner.len(),
+            2,
+            "free_fns['inner'] should have both addresses, got {free_inner:?}"
+        );
     }
 
     // B-05: A `.rs` file with a syntax error is silently skipped — the
@@ -864,7 +888,11 @@ mod b {
         std::fs::create_dir_all(&dir).unwrap();
 
         let c = build_cached(dir.to_str().unwrap());
-        assert!(c.corpus.is_empty(), "empty dir should have empty corpus: {:?}", c.corpus);
+        assert!(
+            c.corpus.is_empty(),
+            "empty dir should have empty corpus: {:?}",
+            c.corpus
+        );
         assert!(c.free_fns.is_empty());
         assert!(c.methods.is_empty());
         assert!(c.addr_owners.is_empty());
@@ -909,7 +937,11 @@ mod b {
         .unwrap();
         let c = build_cached(dir.to_str().unwrap());
         // No `#[origin]` attributes anywhere, so the corpus is empty.
-        assert!(c.corpus.is_empty(), "corpus should be empty, got: {:?}", c.corpus);
+        assert!(
+            c.corpus.is_empty(),
+            "corpus should be empty, got: {:?}",
+            c.corpus
+        );
         assert!(c.free_fns.is_empty());
     }
 
@@ -936,10 +968,9 @@ mod b {
         data[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes()); // x86_64
         data[0x46..0x48].copy_from_slice(&1u16.to_le_bytes()); // num sections
         data[0x50..0x52].copy_from_slice(&0x60u16.to_le_bytes()); // size of optional header
-        // OptHdr magic (PE32 = 0x10b)
+                                                                  // OptHdr magic (PE32 = 0x10b)
         data[0x58..0x5a].copy_from_slice(&0x10bu16.to_le_bytes());
-        assert!(matches!(Pe::parse(data), Err(_)),
-            "x64 PE should be rejected");
+        assert!(Pe::parse(data).is_err(), "x64 PE should be rejected");
     }
 
     // B-10: an empty function (just `RET`) doesn't crash `analyze`.

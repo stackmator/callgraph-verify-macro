@@ -316,16 +316,13 @@ pub fn cfg_fingerprint(pe: &Pe, entry: u64) -> Result<CfgFingerprint, String> {
                 // `b.start` passes through `t`. The textbook definition
                 // gives "target dominates source", which is exactly
                 // `dom[source].contains(target)`.
-                if t <= b.start
-                    && dom.get(&b.start).is_some_and(|d| d.contains(&t))
-                {
+                if t <= b.start && dom.get(&b.start).is_some_and(|d| d.contains(&t)) {
                     fp.loops += 1;
                 }
             }
             FlowControl::UnconditionalBranch => {
                 let t = instr.near_branch_target();
-                if t <= b.start && dom.get(&b.start).is_some_and(|d| d.contains(&t))
-                {
+                if t <= b.start && dom.get(&b.start).is_some_and(|d| d.contains(&t)) {
                     fp.loops += 1;
                 } else {
                     // Out-of-function JMP — a tail call (the callee will RET

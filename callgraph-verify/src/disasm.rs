@@ -117,9 +117,7 @@ fn scan_operands(pe: &Pe, instr: &Instruction, cg: &mut CallGraph) {
                     // absolute `[0x...]` — a global/static data reference.
                     // Skip LEA: it computes an address without dereferencing, so
                     // the operand isn't a memory reference. (BUG #14)
-                    if pe.section_of(disp).is_some()
-                        && instr.mnemonic() != Mnemonic::Lea
-                    {
+                    if pe.section_of(disp).is_some() && instr.mnemonic() != Mnemonic::Lea {
                         cg.globals.insert(disp);
                     }
                 } else if base != Register::None
@@ -328,6 +326,22 @@ pub fn reg_params(pe: &Pe, addr: u64) -> (bool, bool) {
                 Register::ECX => ecx_written = true,
                 Register::EDX => edx_written = true,
                 _ => {}
+            }
+        }
+        // A leaf that immediately forwards its incoming registers to another call is still
+        // thiscall/fastcall even though iced-x86 cannot represent the implicit register use on
+        // the CALL itself. Preserve untouched ECX/EDX on the first instruction so constructors
+        // such as BSScissorTriShape (which forwards both registers to its base ctor) align stack
+        // arguments correctly. Later calls retain the caller-saved rule below.
+        if n == 0
+            && matches!(instr.flow_control(), FlowControl::Call)
+            && instr.near_branch_target() != instr.next_ip()
+        {
+            if !ecx_written {
+                ecx_param = true;
+            }
+            if !edx_written {
+                edx_param = true;
             }
         }
         // Per the x86 cdecl/fastcall/thiscall conventions, ECX and EDX are caller-saved:

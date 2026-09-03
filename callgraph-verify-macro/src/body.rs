@@ -338,7 +338,9 @@ fn walk_for_fake_loops(ts: TokenStream, f: &mut FakeLoops) {
             } else {
                 scan_for_body_group(&tts, i + 1)
             };
-            let Some(TokenTree::Group(g)) = body_group else { continue };
+            let Some(TokenTree::Group(g)) = body_group else {
+                continue;
+            };
             if g.delimiter() != Delimiter::Brace {
                 continue;
             }
@@ -368,7 +370,7 @@ fn walk_for_fake_loops(ts: TokenStream, f: &mut FakeLoops) {
 /// generics — `while let Some(HashMap<K, V>) = …`). A `[ ... ]` Bracket
 /// group inside a `while let` pattern (e.g. `while let [a, b] = arr`) is
 /// similarly stepped past.
-fn scan_for_body_group<'a>(tts: &'a [TokenTree], start: usize) -> Option<&'a TokenTree> {
+fn scan_for_body_group(tts: &[TokenTree], start: usize) -> Option<&TokenTree> {
     let mut j = start;
     while let Some(tt) = tts.get(j) {
         match tt {
@@ -496,9 +498,17 @@ mod tests {
     #[test]
     fn turbofish_method_call_is_collected_as_method() {
         let facts = facts_of("fn f() { x.foo::<u32>(1); }");
-        assert!(facts.names.method.contains("foo"), "{:?}", facts.names.method);
+        assert!(
+            facts.names.method.contains("foo"),
+            "{:?}",
+            facts.names.method
+        );
         assert!(facts.names.plain.is_empty(), "{:?}", facts.names.plain);
-        assert!(facts.exprs.len() == 1 && facts.exprs[0].is_method, "{:?}", facts.exprs);
+        assert!(
+            facts.exprs.len() == 1 && facts.exprs[0].is_method,
+            "{:?}",
+            facts.exprs
+        );
     }
 
     /// A tuple-struct pattern `let Foo(a) = y;` is a PATTERN, not a call
@@ -517,8 +527,16 @@ mod tests {
     #[test]
     fn macro_invocations_are_captured_and_not_recursed() {
         let facts = facts_of("fn f() { my_macro!(); other!(1, 2); }");
-        assert!(facts.macros.contains(&"my_macro".to_string()), "{:?}", facts.macros);
-        assert!(facts.macros.contains(&"other".to_string()), "{:?}", facts.macros);
+        assert!(
+            facts.macros.contains(&"my_macro".to_string()),
+            "{:?}",
+            facts.macros
+        );
+        assert!(
+            facts.macros.contains(&"other".to_string()),
+            "{:?}",
+            facts.macros
+        );
         assert!(facts.names.plain.is_empty(), "{:?}", facts.names.plain);
         assert!(facts.exprs.is_empty(), "{:?}", facts.exprs);
     }
@@ -527,9 +545,21 @@ mod tests {
     #[test]
     fn path_qualified_call_records_trailing_segment() {
         let facts = facts_of("fn f() { crate::module::func(1, 2); }");
-        assert!(facts.names.plain.contains("func"), "{:?}", facts.names.plain);
-        assert!(!facts.names.plain.contains("crate"), "{:?}", facts.names.plain);
-        assert!(!facts.names.plain.contains("module"), "{:?}", facts.names.plain);
+        assert!(
+            facts.names.plain.contains("func"),
+            "{:?}",
+            facts.names.plain
+        );
+        assert!(
+            !facts.names.plain.contains("crate"),
+            "{:?}",
+            facts.names.plain
+        );
+        assert!(
+            !facts.names.plain.contains("module"),
+            "{:?}",
+            facts.names.plain
+        );
     }
 
     /// The fn's own name and anything inside attributes are not body calls —
@@ -539,9 +569,21 @@ mod tests {
         let src = "#[some_attr(default = attribute_fn())] fn outer() { real_fn(); }";
         let f: ItemFn = syn::parse_str(src).expect("parse fn");
         let facts = collect_block_facts(&f.block);
-        assert!(facts.names.plain.contains("real_fn"), "{:?}", facts.names.plain);
-        assert!(!facts.names.plain.contains("attribute_fn"), "{:?}", facts.names.plain);
-        assert!(!facts.names.plain.contains("outer"), "{:?}", facts.names.plain);
+        assert!(
+            facts.names.plain.contains("real_fn"),
+            "{:?}",
+            facts.names.plain
+        );
+        assert!(
+            !facts.names.plain.contains("attribute_fn"),
+            "{:?}",
+            facts.names.plain
+        );
+        assert!(
+            !facts.names.plain.contains("outer"),
+            "{:?}",
+            facts.names.plain
+        );
     }
 
     // --- classify_expr (ARG-SHAPE argument classification) ------------------
@@ -564,7 +606,10 @@ mod tests {
     fn classify_expr_g_helpers_are_global() {
         for name in ["g8", "g16", "g32", "g64", "gf32", "gf64"] {
             let e: Expr = syn::parse_str(&format!("{name}(0x00BEEF)")).unwrap();
-            assert!(matches!(classify_expr(&e), RustArg::Global(0xBEEF)), "{name}");
+            assert!(
+                matches!(classify_expr(&e), RustArg::Global(0xBEEF)),
+                "{name}"
+            );
         }
     }
 
@@ -600,9 +645,8 @@ mod tests {
     /// leak into the operand check. (BUG #13)
     #[test]
     fn collect_hex_literals_excludes_attribute_addresses() {
-        let lits = hex_of_body(
-            "#[origin(0x004028d0, calls = [0x00401f00, 0x00401f20])] fn outer() {}",
-        );
+        let lits =
+            hex_of_body("#[origin(0x004028d0, calls = [0x00401f00, 0x00401f20])] fn outer() {}");
         assert!(!lits.contains(&0x004028d0), "attr hex leaked: {:?}", lits);
         assert!(!lits.contains(&0x00401f00), "attr hex leaked: {:?}", lits);
         assert!(!lits.contains(&0x00401f20), "attr hex leaked: {:?}", lits);
@@ -623,14 +667,16 @@ mod tests {
     /// count it as 1 and `fake_loop_spans` should report zero.
     #[test]
     fn cfg_real_loop_with_iteration_is_counted() {
-        let ts = TokenStream::from_str(
-            "pub fn outer() { loop { foo(); if cond { break; } } }",
-        )
-        .unwrap();
+        let ts =
+            TokenStream::from_str("pub fn outer() { loop { foo(); if cond { break; } } }").unwrap();
         let r = cfg_keyword_counts(ts.clone());
         assert_eq!(r.loops, 1, "real loop should count: {:?}", r);
         let f = fake_loop_spans(ts);
-        assert!(f.spans.is_empty(), "real loop should not be flagged as fake: {:?}", f.spans);
+        assert!(
+            f.spans.is_empty(),
+            "real loop should not be flagged as fake: {:?}",
+            f.spans
+        );
     }
 
     /// The exact pattern from the bug report: `loop { break; }` (possibly
@@ -643,7 +689,13 @@ mod tests {
         let r = cfg_keyword_counts(ts.clone());
         assert_eq!(r.loops, 0, "fake loop must NOT count as iteration: {:?}", r);
         let f = fake_loop_spans(ts.clone());
-        assert_eq!(f.spans.len(), 1, "expected 1 fake loop, got {}: {:?}", f.spans.len(), f.spans);
+        assert_eq!(
+            f.spans.len(),
+            1,
+            "expected 1 fake loop, got {}: {:?}",
+            f.spans.len(),
+            f.spans
+        );
         assert_eq!(f.spans[0].1, "body is just `break;`");
 
         // Without the trailing semicolon — still a placeholder.
@@ -675,7 +727,7 @@ mod tests {
         assert!(f.spans.is_empty(), "no fake loops: {:?}", f.spans);
     }
 
-/// `for` is NOT a placeholder: it always carries an iterator expression
+    /// `for` is NOT a placeholder: it always carries an iterator expression
     /// and the loop body's first break being immediate doesn't make the
     /// loop fake. `cfg_keyword_counts` counts it as a real loop;
     /// `fake_loop_spans` ignores it.
@@ -687,32 +739,27 @@ mod tests {
     #[test]
     fn cfg_for_is_real_loop_while_with_break_is_fake() {
         // `for x in xs { break; }` — real loop, not a placeholder.
-        let ts = TokenStream::from_str(
-            "pub fn outer() { for x in xs { break; } }",
-        )
-        .unwrap();
+        let ts = TokenStream::from_str("pub fn outer() { for x in xs { break; } }").unwrap();
         let r = cfg_keyword_counts(ts.clone());
         assert_eq!(r.loops, 1, "`for` counts as a real loop: {:?}", r);
         let f = fake_loop_spans(ts);
         assert!(f.spans.is_empty(), "`for` is never fake: {:?}", f);
 
         // `while cond { break; }` — fake: the loop never iterates.
-        let ts = TokenStream::from_str(
-            "pub fn outer() { while cond { break; } }",
-        )
-        .unwrap();
+        let ts = TokenStream::from_str("pub fn outer() { while cond { break; } }").unwrap();
         let r = cfg_keyword_counts(ts.clone());
-        assert_eq!(r.loops, 0, "fake `while` must NOT count as iteration: {:?}", r);
+        assert_eq!(
+            r.loops, 0,
+            "fake `while` must NOT count as iteration: {:?}",
+            r
+        );
         let f = fake_loop_spans(ts);
         assert_eq!(f.spans.len(), 1, "expected 1 fake `while`: {:?}", f);
         assert_eq!(f.spans[0].1, "body is just `break;` under `while`");
 
         // `while cond { real_work(); break; }` — NOT a placeholder: the body
         // has real work before the break, so it counts as a real loop.
-        let ts = TokenStream::from_str(
-            "pub fn outer() { while cond { foo(); break; } }",
-        )
-        .unwrap();
+        let ts = TokenStream::from_str("pub fn outer() { while cond { foo(); break; } }").unwrap();
         let r = cfg_keyword_counts(ts.clone());
         assert_eq!(r.loops, 1, "real `while` body counts: {:?}", r);
         let f = fake_loop_spans(ts);
@@ -738,12 +785,14 @@ mod tests {
     #[test]
     fn cfg_fake_while_with_negation_is_subtracted() {
         // The exact bug-report shape: `let _buf = while !cond { break; };`
-        let ts = TokenStream::from_str(
-            "pub fn outer() { let _buf = while !cond { break; }; }",
-        )
-        .unwrap();
+        let ts =
+            TokenStream::from_str("pub fn outer() { let _buf = while !cond { break; }; }").unwrap();
         let r = cfg_keyword_counts(ts.clone());
-        assert_eq!(r.loops, 0, "fake `while !cond {{ break; }}` must not count: {:?}", r);
+        assert_eq!(
+            r.loops, 0,
+            "fake `while !cond {{ break; }}` must not count: {:?}",
+            r
+        );
         let f = fake_loop_spans(ts.clone());
         assert_eq!(f.spans.len(), 1, "expected 1 fake: {:?}", f);
         assert_eq!(f.spans[0].1, "body is just `break;` under `while`");
@@ -763,7 +812,11 @@ mod tests {
         let f = fake_loop_spans(ts);
         assert_eq!(f.spans.len(), 2, "exactly 2 fakes: {:?}", f);
         for (sp, reason) in &f.spans {
-            assert_eq!(*reason, "body is just `break;` under `while`", "span: {:?}", sp);
+            assert_eq!(
+                *reason, "body is just `break;` under `while`",
+                "span: {:?}",
+                sp
+            );
         }
     }
 }
