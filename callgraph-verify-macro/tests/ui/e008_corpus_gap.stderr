@@ -1,0 +1,19 @@
+error:   [CG-VERIFY-E006 ORIGIN-UNREFERENCED] 0x00401100 is never called, jumped to, or stored as a pointer anywhere in the binary — misattributed or invented origin address
+           -> fix: if the addr is verified-real (boot anchor reached via external hook; Ghidra-undetected stub), waive with `#[origin(0x00401100, unreferenced)]`; otherwise fix the address
+  --> tests/ui/e008_corpus_gap.rs:11:5
+   |
+11 | pub fn f() {}
+   |     ^^
+
+error:   [CG-VERIFY-E008 CORPUS-GAP] origin 0x00401100 is not in the corpus scanned from REBUILD_ROOT=$DIR/tests/testdata/corpus — wrong root, empty/missing directory, or the owning file failed to parse. Body-call verification cannot run
+           -> fix: fix REBUILD_ROOT so it contains the source with this #[origin] tag, and re-run `cargo build` so the corpus re-scans
+  --> tests/ui/e008_corpus_gap.rs:11:5
+   |
+11 | pub fn f() {}
+   |     ^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/e008_corpus_gap.rs:11:14
+   |
+11 | pub fn f() {}
+   |              ^ consider adding a `main` function to `$DIR/tests/ui/e008_corpus_gap.rs`

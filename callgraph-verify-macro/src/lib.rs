@@ -41,6 +41,7 @@ use callgraph_verify::{analyze, cfg_fingerprint, diff_body_calls, reg_params, Ar
 
 mod body;
 mod corpus;
+pub(crate) mod error;
 
 struct Args {
     addr: u64,
@@ -115,10 +116,15 @@ impl Parse for Args {
                         continue;
                     }
                     other => {
-                        return Err(syn::Error::new(
-                            key.span(),
-                            format!("unknown flag `{other}`"),
-                        ))
+                        // Stable error code so AI agents can grep the build
+                        // output for "CG-VERIFY-E002" and land on docs.
+                        let msg = format!(
+                            "[CG-VERIFY-E002 UNKNOWN-ATTR-FLAG] unknown flag `{other}` in \
+                             #[origin(...)] — only `unreferenced` is supported as a bare flag. \
+                             Maybe you meant one of: calls, calls_exact, fields, globals, vtables, \
+                             vcall_slots, iat"
+                        );
+                        return Err(syn::Error::new(key.span(), msg));
                     }
                 }
             }
@@ -133,10 +139,13 @@ impl Parse for Args {
                 "vcall_slots" => a.vcall_slots = vals,
                 "iat" => a.iat = vals,
                 other => {
-                    return Err(syn::Error::new(
-                        key.span(),
-                        format!("unknown key `{other}`"),
-                    ))
+                    let msg = format!(
+                        "[CG-VERIFY-E001 UNKNOWN-ATTR-KEY] unknown key `{other}` in \
+                         #[origin(...)] — supported keys: calls, calls_exact, fields, globals, \
+                         vtables, vcall_slots, iat (each takes `= [0xNN, ...]`). Bare flag: \
+                         unreferenced"
+                    );
+                    return Err(syn::Error::new(key.span(), msg));
                 }
             }
         }
@@ -146,7 +155,7 @@ impl Parse for Args {
 
 /// Cache type aliases — clippy `very_complex_type` lint hates the full form.
 type PeCache = Mutex<HashMap<String, Option<Arc<Pe>>>>;
-type AddrsCache = Mutex<HashMap<(String, u64), Arc<HashSet<u32>>>>;
+type AddrsCache = Mutex<HashMap<(String, u64, u64), Arc<HashSet<u32>>>>;
 type VTableMap = HashMap<u64, (u64, usize)>;
 type VTableCache = Mutex<HashMap<CacheKey, OnceLock<Arc<VTableMap>>>>;
 
@@ -163,14 +172,29 @@ fn load_pe_cached(path: &str) -> Option<Arc<Pe>> {
 }
 
 /// Every VA the binary references (rel32 branch targets + in-image dwords at every
-/// byte offset). Built once per `(exe path, image_base)` pair per compiler process
-/// (~one linear pass over the 8 MB image); used by the ORIGIN-UNREFERENCED check.
-/// Keyed per binary — a bare `static OnceLock` would return the FIRST PE's set for
-/// every subsequent PE (the same input-ignoring-cache class as BUG #9).
+/// byte offset). Built once per `(exe path, image_base, file mtime)` tuple per
+/// compiler process (~one linear pass over the 8 MB image); used by the
+/// ORIGIN-UNREFERENCED check. Keyed per binary — a bare `static OnceLock` would
+/// return the FIRST PE's set for every subsequent PE (the same input-ignoring-cache class
+/// as BUG #9).
+///
+/// File mtime is part of the key so that a build process which rewrites the
+/// PE file under the same path (common in tests) doesn't reuse a stale
+/// cached value. Without the mtime suffix, the trybuild test harness —
+/// which writes a synthetic PE per `cargo test` invocation and shares one
+/// target path across all fixtures — would lock in the FIRST fixture's
+/// referenced-set and silently misclassify every subsequent fixture's
+/// ORIGIN-UNREFERENCED check.
 fn referenced_addrs_cached(exe: &str, pe: &Pe) -> std::sync::Arc<std::collections::HashSet<u32>> {
     static CACHE: OnceLock<AddrsCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (exe.to_string(), pe.image_base);
+    let mtime = std::fs::metadata(exe)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let key = (exe.to_string(), pe.image_base, mtime);
     let mut m = cache.lock().unwrap_or_else(|e| e.into_inner());
     m.entry(key)
         .or_insert_with(|| std::sync::Arc::new(pe.referenced_addrs()))
@@ -344,7 +368,7 @@ fn arg_shape_check(
     addr: u64,
     map: &corpus::Corpus,
     call_exprs: &[body::CallExpr],
-    errors: &mut Vec<String>,
+    errors: &mut Vec<error::RichError>,
 ) {
     // CRT allocator/free targets: their decompiled arg lists are unreliable (the project notes
     // 0/2-arg `FormHeap_Allocate`/`Free` calls are decompiler artifacts), so skip them.
@@ -407,10 +431,22 @@ fn arg_shape_check(
         for (i, ra) in ce.args.iter().enumerate() {
             let Some(b) = bin.get(i) else { break };
             if rust_arg_matches(ra, b) == Some(false) {
-                errors.push(format!(
-                    "ARG-SHAPE: `{}` (→{target:#010x}) arg #{i} is {ra:?}, but the binary's call passes {b:?}",
-                    ce.name
-                ));
+                errors.push(
+                    error::RichError::new(
+                        error::Code::ArgShape,
+                        format!(
+                            "`{ce_name}` (→{target:#010x}) arg #{i} is {ra:?}, but the \
+                             binary's call passes {b:?}",
+                            ce_name = ce.name
+                        ),
+                    )
+                    .with_span(ce.span)
+                    .with_fix(format!(
+                        "change arg #{i} at this call site to match what the binary passes \
+                         (or restructure the call if the binary's arg {i} is recovered \
+                         from an ICF-folded stub — see lib.rs comment near arg_shape_check)"
+                    )),
+                );
             }
         }
     }
@@ -430,8 +466,10 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_like = match body::parse_fn_like(&item2) {
         Ok(f) => f,
         Err(e) => {
-            let msg =
-                format!("#[origin] requires a function item (free fn or impl/trait method): {e}");
+            let msg = format!(
+                "[CG-VERIFY-E003 NOT-A-FUNCTION] #[origin] requires a function item \
+                 (free fn or impl/trait method): {e}"
+            );
             let err = syn::Error::new(proc_macro2::Span::call_site(), msg).to_compile_error();
             return quote! { #err #item2 }.into();
         }
@@ -476,22 +514,34 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         // failure mode with the switch left invisible. Both "exists but corrupt"
         // and "points at a missing file" are hard errors: if the env var is
         // set, the build is meant to be verified.
-        let msg = if std::path::Path::new(&exe).exists() {
-            format!(
-                "TARGET_EXE={exe} exists but failed to load as a PE32 image — \
-                 refusing to build unverified; fix or unset it"
+        let (code, hint) = if std::path::Path::new(&exe).exists() {
+            (
+                "TARGET_EXE-EXISTS-BUT-UNREADABLE",
+                "the file exists but is not a valid PE32 image; rebuild the target or \
+                 point TARGET_EXE at the correct binary",
             )
         } else {
-            format!(
-                "TARGET_EXE={exe} does not exist — refusing to build unverified; \
-                 fix the path or unset the variable"
+            (
+                "TARGET-EXE-MISSING",
+                "fix the path in .cargo/config.toml [env] TARGET_EXE, or unset the \
+                 variable to disable verification",
             )
         };
+        let msg = format!(
+            "[CG-VERIFY-E004 TARGET-EXE-UNLOADABLE] {code}: TARGET_EXE={exe} — {hint}. \
+             Refusing to build unverified: an env var is set, so the build IS meant \
+             to be verified (unset it to disable)."
+        );
         let err = syn::Error::new(proc_macro2::Span::call_site(), msg).to_compile_error();
         return quote! { #err #item2 }.into();
     };
 
-    let mut errors: Vec<String> = Vec::new();
+    // Per-diagnostic collector. Each entry is an independently-emitted
+    // `compile_error!` so rustc renders them as separate gutter diagnostics
+    // — agents navigate by span, and the previous single-block string made
+    // every error point at the `#[origin(...)]` line instead of the
+    // offending token.
+    let mut errors: Vec<error::RichError> = Vec::new();
 
     // (0) The claimed origin address itself must be one the binary knows about:
     // a rel32 CALL/JMP/Jcc target, or stored somewhere as an in-image dword
@@ -501,17 +551,37 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     // (boot anchor reached only via external hook; Ghidra-undetected stubs).
     if !args.unreferenced {
         if pe.section_of(args.addr).is_none() {
-            errors.push(format!(
-                "ORIGIN-UNREFERENCED: {:#010x} is outside every PE section — not a function address",
-                args.addr
-            ));
+            errors.push(
+                error::RichError::new(
+                    error::Code::OriginOutsideSection,
+                    format!(
+                        "{:#010x} is outside every PE section — not a function address",
+                        args.addr
+                    ),
+                )
+                .with_span(fn_like.attr_target_span())
+                .with_fix("verify the address against the binary (e.g. open the PE in a \
+                     disassembler), or move the rebuild away from this addr".to_string()),
+            );
         } else if !referenced_addrs_cached(&exe, &pe).contains(&(args.addr as u32)) {
-            errors.push(format!(
-                "ORIGIN-UNREFERENCED: {:#010x} is never called, jumped to, or stored as a \
-                 pointer anywhere in the binary — misattributed or invented origin address? \
-                 (waive a verified-real exception with `#[origin({:#010x}, unreferenced)]`)",
-                args.addr, args.addr
-            ));
+            errors.push(
+                error::RichError::new(
+                    error::Code::OriginUnreferenced,
+                    format!(
+                        "{:#010x} is never called, jumped to, or stored as a pointer \
+                         anywhere in the binary — misattributed or invented origin \
+                         address",
+                        args.addr
+                    ),
+                )
+                .with_span(fn_like.attr_target_span())
+                .with_fix(format!(
+                    "if the addr is verified-real (boot anchor reached via external \
+                     hook; Ghidra-undetected stub), waive with `#[origin({:#010x}, \
+                     unreferenced)]`; otherwise fix the address",
+                    args.addr
+                )),
+            );
         }
     }
 
@@ -531,7 +601,11 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         .vcall_slots(&args.vcall_slots)
         .iat(&args.iat);
     if let Err(msg) = spec.check(&pe) {
-        errors.push(msg);
+        errors.push(
+            error::RichError::new(error::Code::DeclaredFacts, msg).with_span(
+                fn_like.attr_target_span(),
+            ),
+        );
     }
 
     // (2) address-only body-vs-binary diff, when the corpus root is configured.
@@ -546,13 +620,23 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         // body-diff below would pass trivially: no rust_idents resolve, no
         // MISSING can fire, DUP-ADDR has no owners. Fail loudly instead.
         if !map.corpus.contains(&args.addr) {
-            errors.push(format!(
-                "CORPUS-GAP: origin {:#010x} is not in the corpus scanned from \
-                 REBUILD_ROOT={root} — wrong root, empty/missing directory, or the \
-                 owning file failed to parse. Body-call verification cannot run; \
-                 fix REBUILD_ROOT so it contains the source with this #[origin] tag.",
-                args.addr
-            ));
+            errors.push(
+                error::RichError::new(
+                    error::Code::CorpusGap,
+                    format!(
+                        "origin {:#010x} is not in the corpus scanned from \
+                         REBUILD_ROOT={root} — wrong root, empty/missing directory, or \
+                         the owning file failed to parse. Body-call verification \
+                         cannot run",
+                        args.addr
+                    ),
+                )
+                .with_span(fn_like.attr_target_span())
+                .with_fix(
+                    "fix REBUILD_ROOT so it contains the source with this #[origin] tag, \
+                     and re-run `cargo build` so the corpus re-scans",
+                ),
+            );
         }
 
         // Inline-marker sanity (always on, non-fatal): every address in
@@ -581,13 +665,24 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         // dangerous than a build that won't compile.
         if let Some(owners) = map.addr_owners.get(&args.addr) {
             if owners.len() > 1 {
-                errors.push(format!(
-                    "DUP-ADDR: origin {:#010x} is claimed by {} Rust fns (only ONE may \
-                     implement a given binary fn):\n      {}",
-                    args.addr,
-                    owners.len(),
-                    owners.join("\n      ")
-                ));
+                errors.push(
+                    error::RichError::new(
+                        error::Code::DupAddr,
+                        format!(
+                            "origin {:#010x} is claimed by {} Rust fns (only ONE may \
+                             implement a given binary fn):\n      {}",
+                            args.addr,
+                            owners.len(),
+                            owners.join("\n      ")
+                        ),
+                    )
+                    .with_span(fn_like.attr_target_span())
+                    .with_fix(
+                        "delete the duplicate(s) so exactly one Rust fn owns this address, \
+                         or split the binary fn (e.g. move the secondary portion into its \
+                         own `#[origin(other_addr)]` helper)",
+                    ),
+                );
             }
         }
         // Fold-in: an `inline:` helper is pasted into the binary at the call site, so
@@ -649,12 +744,20 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                 && !map.methods.contains_key(n)
                 && resolves_ported(&map.inline_fns[n])
             {
-                errors.push(format!(
-                    "FOLD-SKIP HOLE: call to ambiguous `inline:` helper `{n}` resolves nowhere \
-                     (defined inline in >1 place, not also a free fn/method), so its ported calls \
-                     escape verification — give `{n}` a unique name (addr-suffix), an `inline: 0xADDR` \
-                     tag, or `#[origin]`."
-                ));
+                errors.push(
+                    error::RichError::new(
+                        error::Code::FoldSkipHole,
+                        format!(
+                            "call to ambiguous `inline:` helper `{n}` resolves nowhere \
+                             (defined inline in >1 place, not also a free fn/method), so \
+                             its ported calls escape verification"
+                        ),
+                    )
+                    .with_fix(format!(
+                        "give `{n}` a unique name (addr-suffix), an `inline: 0xADDR` tag, \
+                         or its own `#[origin]`"
+                    )),
+                );
             }
         }
         // Resolve plain/path calls against free fns, method calls against methods —
@@ -709,22 +812,56 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .find_map(|a| vtm.get(a))
                         .copied()
                         .unwrap_or((0, 0));
-                    errors.push(format!(
-                        "VTABLE-DISPATCH: body directly calls `{ident}` ({}) — the binary dispatches it \
-                         via vtable {va:#010x} slot {slot} (byte 0x{:x}); use `vcall_*(obj, 0x{:x})`, \
-                         not a direct call",
-                        list.join(","),
-                        slot * 4,
-                        slot * 4
-                    ));
+                    let span = facts
+                        .exprs
+                        .iter()
+                        .find(|ce| ce.name == *ident && ce.is_method)
+                        .map(|ce| ce.span)
+                        .unwrap_or_else(|| fn_like.attr_target_span());
+                    errors.push(
+                        error::RichError::new(
+                            error::Code::VTableDispatch,
+                            format!(
+                                "body directly calls `{ident}` ({}) — the binary \
+                                 dispatches it via vtable {va:#010x} slot {slot} \
+                                 (byte 0x{:x}); use `vcall_*(obj, 0x{:x})`, not a direct call",
+                                list.join(","),
+                                slot * 4,
+                                slot * 4
+                            ),
+                        )
+                        .with_span(span)
+                        .with_fix(format!(
+                            "replace `{ident}(...)` with a vcall via the declared vtable \
+                             at {va:#010x}, slot {slot}"
+                        )),
+                    );
                 }
                 for (ident, addrs) in &d.hallucinated {
                     let list: Vec<String> = addrs.iter().map(|a| format!("{a:#010x}")).collect();
-                    errors.push(format!(
-                        "HALLUCINATED: body calls `{ident}` ({}) — binary at {:#010x} never calls (or inlines) it",
-                        list.join(","),
-                        args.addr
-                    ));
+                    let span = facts
+                        .exprs
+                        .iter()
+                        .find(|ce| ce.name == *ident)
+                        .map(|ce| ce.span)
+                        .unwrap_or_else(|| fn_like.attr_target_span());
+                    errors.push(
+                        error::RichError::new(
+                            error::Code::Hallucinated,
+                            format!(
+                                "body calls `{ident}` ({}) — binary at {:#010x} never \
+                                 calls (or inlines) it",
+                                list.join(","),
+                                args.addr
+                            ),
+                        )
+                        .with_span(span)
+                        .with_fix(format!(
+                            "remove the call, port `{ident}` at {} with its own \
+                             `#[origin(ADDR)]`, or alias it via `/// inline: ADDR`",
+                            list.first().map(String::as_str).unwrap_or("?")
+                        )),
+                    );
                 }
                 // MISSING is always fatal. A MISSING is often NOT a defect: a
                 // call made via method syntax `x.foo()` isn't resolved yet,
@@ -736,13 +873,32 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // There used to be a `STRICT_MISSING=0` escape hatch — same
                 // story as DUP_STRICT: AI flipped it off to silence failures.
                 for a in &d.missing {
-                    errors.push(format!(
-                        "MISSING: binary calls {} ({a:#010x}) — body doesn't",
-                        map.addr2name.get(a).map(String::as_str).unwrap_or("?")
-                    ));
+                    let name = map.addr2name.get(a).cloned();
+                    let msg = match name.as_deref() {
+                        Some(n) => format!(
+                            "binary calls `{n}` ({a:#010x}) — body doesn't"
+                        ),
+                        None => format!(
+                            "binary calls {a:#010x} (no name in corpus) — body doesn't"
+                        ),
+                    };
+                    errors.push(
+                        error::RichError::new(error::Code::Missing, msg)
+                            .with_span(fn_like.attr_target_span())
+                            .with_fix(format!(
+                                "add the call (a faithful inline is also fine — add an \
+                                 `/// inline: {a:#010x}` marker so the verifier knows)"
+                            )),
+                    );
                 }
             }
-            Err(e) => errors.push(format!("analyze {:#010x}: {e}", args.addr)),
+            Err(e) => errors.push(
+                error::RichError::new(
+                    error::Code::Analyze,
+                    format!("analyze {:#010x}: {e}", args.addr),
+                )
+                .with_span(fn_like.attr_target_span()),
+            ),
         }
 
         // (2b) Argument-shape diff (always on): per call site, compare the
@@ -780,6 +936,9 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             referenced.extend(&cg.imm_addrs);
             referenced.extend(&cg.iat_calls);
             let mut reported: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+            // Collect hex-literal spans so each HALLUCINATED-ADDR error can
+            // be attached to the literal that bakes the invented address.
+            let literal_spans = body::collect_hex_literal_spans(block_ts.clone());
             for v in body::collect_hex_literals(block_ts.clone()) {
                 // Skip the function's own address (recursion / self-reference), dups,
                 // and any literal that isn't an in-image address (counts, masks, sizes).
@@ -787,16 +946,34 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                     continue;
                 }
                 if !referenced.contains(&v) {
-                    errors.push(format!(
-                        "HALLUCINATED-ADDR: body bakes in {v:#010x} (inside the image), but \
-                         binary at {:#010x} never references it (not a CALL target, global, \
-                         baked immediate, or IAT slot)",
-                        args.addr
-                    ));
+                    let span = literal_spans
+                        .get(&v)
+                        .copied()
+                        .unwrap_or_else(|| fn_like.attr_target_span());
+                    errors.push(
+                        error::RichError::new(
+                            error::Code::HallucinatedAddr,
+                            format!(
+                                "body bakes in {v:#010x} (inside the image), but binary \
+                                 at {:#010x} never references it (not a CALL target, \
+                                 global, baked immediate, or IAT slot)",
+                                args.addr
+                            ),
+                        )
+                        .with_span(span)
+                        .with_fix("use the address the binary actually references at this \
+                             origin, or remove the literal if it's a stray".to_string()),
+                    );
                 }
             }
         }
-        Err(e) => errors.push(format!("operand check {:#010x}: {e}", args.addr)),
+        Err(e) => errors.push(
+            error::RichError::new(
+                error::Code::Analyze,
+                format!("operand check {:#010x}: {e}", args.addr),
+            )
+            .with_span(fn_like.attr_target_span()),
+        ),
     }
 
     // (4) CFG-fingerprint diff (always on): catch a port that omits a loop
@@ -811,25 +988,60 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             // Thresholds chosen to suppress the dominant noise: a SINGLE back-edge is usually
             // an inlined memcpy/strlen/refcount loop, not a source loop, so require ≥2.
             if fp.loops >= 2 && r.loops == 0 {
-                errors.push(format!(
-                    "CFG: binary has {} loop back-edge(s) but the body has no loop — missing iteration?",
-                    fp.loops
-                ));
+                errors.push(
+                    error::RichError::new(
+                        error::Code::Cfg,
+                        format!(
+                            "binary has {} loop back-edge(s) but the body has no loop \
+                             — missing iteration?",
+                            fp.loops
+                        ),
+                    )
+                    .with_span(fn_like.attr_target_span())
+                    .with_fix(
+                        "port the iteration inline (the macro verifies the body at the \
+                         attributed addr; loops extracted to helpers must each carry their \
+                         own #[origin(callee_addr)] AND reproduce the loop structure \
+                         inside the helper)",
+                    ),
+                );
             }
             if fp.switch_cases >= 3 && r.matches == 0 && r.ifs < 2 {
-                errors.push(format!(
-                    "CFG: binary has a jump-table switch ({} cases) but the body has no match / if-chain",
-                    fp.switch_cases
-                ));
+                errors.push(
+                    error::RichError::new(
+                        error::Code::Cfg,
+                        format!(
+                            "binary has a jump-table switch ({} cases) but the body has \
+                             no match / if-chain",
+                            fp.switch_cases
+                        ),
+                    )
+                    .with_span(fn_like.attr_target_span())
+                    .with_fix(
+                        "port the dispatch as a `match` over the same case set, or an \
+                         if-chain if the binary uses consecutive compares",
+                    ),
+                );
             }
             // High conditional count + a wholly straight-line body suggests gross under-
             // implementation (delegating bodies have calls but the binary inlined the branches,
             // so this still fires on faithful delegation — kept high to limit that).
             if fp.conditionals >= 12 && r.ifs + r.matches + r.loops == 0 {
-                errors.push(format!(
-                    "CFG: binary branches heavily ({} conditionals) but the body is straight-line (no if/match/loop)",
-                    fp.conditionals
-                ));
+                errors.push(
+                    error::RichError::new(
+                        error::Code::Cfg,
+                        format!(
+                            "binary branches heavily ({} conditionals) but the body is \
+                             straight-line (no if/match/loop)",
+                            fp.conditionals
+                        ),
+                    )
+                    .with_span(fn_like.attr_target_span())
+                    .with_fix(
+                        "the body reproduces too few branches — re-check the binary's \
+                         branch structure (cmp/test/jcc) and port the predicates",
+                    ),
+                );
             }
             // Fake-loop guard: a body that uses `loop { break; }` as a
             // structural placeholder satisfies the keyword counter without
@@ -851,20 +1063,45 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ));
             }
         }
-        Err(e) => errors.push(format!("cfg check {:#010x}: {e}", args.addr)),
+        Err(e) => errors.push(
+            error::RichError::new(
+                error::Code::CfgFingerprint,
+                format!("cfg check {:#010x}: {e}", args.addr),
+            )
+            .with_span(fn_like.attr_target_span()),
+        ),
     }
 
     if errors.is_empty() {
-        quote! { #item2 }.into()
-    } else {
-        let msg = format!(
-            "#[callgraph_verify({:#010x})]:\n  {}",
-            args.addr,
-            errors.join("\n  ")
-        );
-        let err = syn::Error::new(proc_macro2::Span::call_site(), msg).to_compile_error();
-        quote! { #err #item2 }.into()
+        return quote! { #item2 }.into();
     }
+
+    // Each diagnostic gets its own `compile_error!` so rustc renders it as
+    // a separate gutter entry at the offending span (or the attribute call
+    // site when no specific token is known). One wall-of-text error pointing
+    // at `#[origin(...)]` forces the agent to grep the body manually; a
+    // list of gated errors each pointing at the actual token lets it fix
+    // each one without leaving the rustc output.
+    //
+    // The summary header goes to stderr (visible with `cargo build -vv`),
+    // NOT into each `compile_error!` — otherwise rustc prints the header
+    // once per error and the build log becomes unreadable when N errors
+    // share the same root cause (which is common: an unreferenced addr
+    // trips E005, E007, E008, E017, E018 all at once).
+    eprintln!(
+        "callgraph_verify_macro: #[callgraph_verify({:#010x})]: {} diagnostic(s) below — \
+         the build is gated on every one. Fix each in order (the call-graph check \
+         runs FIRST in the next build, so removing a hallucination can cascade-clear \
+         other errors). Run with `-vv` to see this header.",
+        args.addr,
+        errors.len()
+    );
+    let mut combined = proc_macro2::TokenStream::new();
+    for e in errors {
+        let sp = e.span.unwrap_or_else(proc_macro2::Span::call_site);
+        combined.extend(syn::Error::new(sp, e.render()).to_compile_error());
+    }
+    quote! { #combined #item2 }.into()
 }
 
 // ---------------------------------------------------------------------------
@@ -968,34 +1205,57 @@ pub fn vtable_table(input: TokenStream) -> TokenStream {
     };
 
     // Compile-time verification (no-op if the binary / corpus aren't configured).
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<error::RichError> = Vec::new();
     if let (Ok(exe), Ok(root)) = (std::env::var("TARGET_EXE"), std::env::var("REBUILD_ROOT")) {
         if let Some(pe) = load_pe_cached(&exe) {
             let map = corpus::corpus_map(&root);
-            for (slot, _span, path) in &t.entries {
+            for (slot, lit_span, path) in &t.entries {
                 if *slot >= t.slots {
-                    errors.push(format!("slot {slot} >= slots {}", t.slots));
+                    errors.push(
+                        error::RichError::new(
+                            error::Code::VTableSlotOob,
+                            format!("slot {slot} >= slots {}", t.slots),
+                        )
+                        .with_span(*lit_span)
+                        .with_fix(format!(
+                            "use a slot index in 0..{slots} (this vtable has `{slots}` slots)",
+                            slots = t.slots
+                        )),
+                    );
                     continue;
                 }
                 let pname = path.segments.last().unwrap().ident.to_string();
                 if pname == "vtable_unimplemented" {
                     continue;
                 }
-                let Some(bytes) = pe.read(t.va + (*slot as u64) * 4, 4) else {
-                    errors.push(format!(
-                        "slot {slot}: engine VA {:#010x} not readable",
-                        t.va + (*slot as u64) * 4
-                    ));
+                let slot_va = t.va + (*slot as u64) * 4;
+                let Some(bytes) = pe.read(slot_va, 4) else {
+                    errors.push(
+                        error::RichError::new(
+                            error::Code::VTableSlot,
+                            format!("slot {slot}: engine VA {slot_va:#010x} not readable"),
+                        )
+                        .with_span(*lit_span)
+                        .with_fix("verify the vtable VA and slot count against the binary, or \
+                             reduce `slots = N` to the highest slot you actually wire".to_string()),
+                    );
                     continue;
                 };
                 // A clamped short read (section tail) is not a readable slot.
                 if bytes.len() < 4 {
-                    errors.push(format!(
-                        "slot {slot}: engine VA {:#010x} has only {} readable byte(s) \
-                         (section tail) — not a verifiable slot",
-                        t.va + (*slot as u64) * 4,
-                        bytes.len()
-                    ));
+                    errors.push(
+                        error::RichError::new(
+                            error::Code::VTableSlot,
+                            format!(
+                                "slot {slot}: engine VA {slot_va:#010x} has only {} \
+                                 readable byte(s) (section tail) — not a verifiable slot",
+                                bytes.len()
+                            ),
+                        )
+                        .with_span(*lit_span)
+                        .with_fix("shrink `slots = N` so the last slot is fully readable, or \
+                             pick a smaller vtable VA that fits in its section".to_string()),
+                    );
                     continue;
                 }
                 let eng = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
@@ -1017,27 +1277,43 @@ pub fn vtable_table(input: TokenStream) -> TokenStream {
                         .map(|a| format!("{a:#010x}"))
                         .collect::<Vec<_>>()
                         .join("/");
-                    errors.push(format!(
-                        "slot {slot} `{pname}`: engine vtable holds {eng:#010x}, but `{pname}` \
-                         origin is {got} — wrong fn or off-by-one slot"
-                    ));
+                    errors.push(
+                        error::RichError::new(
+                            error::Code::VTableSlot,
+                            format!(
+                                "slot {slot} `{pname}`: engine vtable holds {eng:#010x}, \
+                                 but `{pname}` origin is {got} — wrong fn or off-by-one \
+                                 slot"
+                            ),
+                        )
+                        .with_span(*lit_span)
+                        .with_fix(format!(
+                            "either correct the slot index (off-by-one shows up as an \
+                             adjacent addr), or replace `{pname}` with the fn whose origin \
+                             is {eng:#010x}"
+                        )),
+                    );
                 }
             }
         }
     }
 
     if errors.is_empty() {
-        generated.into()
-    } else {
-        let msg = format!(
-            "vtable_table!({}, {:#010x}):\n  {}",
-            t.name,
-            t.va,
-            errors.join("\n  ")
-        );
-        let err = syn::Error::new(proc_macro2::Span::call_site(), msg).to_compile_error();
-        quote! { #err #generated }.into()
+        return generated.into();
     }
+    eprintln!(
+        "callgraph_verify_macro: vtable_table!({}, {:#010x}): {} diagnostic(s) below — \
+         see the `compile_error!`s above for per-slot detail. Run with `-vv` for this header.",
+        t.name,
+        t.va,
+        errors.len()
+    );
+    let mut combined = proc_macro2::TokenStream::new();
+    for e in errors {
+        let sp = e.span.unwrap_or_else(proc_macro2::Span::call_site);
+        combined.extend(syn::Error::new(sp, e.render()).to_compile_error());
+    }
+    quote! { #combined #generated }.into()
 }
 
 #[cfg(test)]

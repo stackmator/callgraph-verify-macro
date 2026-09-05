@@ -1,0 +1,12 @@
+error:   [CG-VERIFY-E020 VTABLE-SLOT-OOB] slot 5 >= slots 1
+           -> fix: use a slot index in 0..1 (this vtable has `1` slots)
+  --> tests/ui/e020_vtable_slot_oob.rs:13:5
+   |
+13 |     5 = oob_fn;
+   |     ^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/e020_vtable_slot_oob.rs:17:31
+   |
+17 | fn vtable_unimplemented_o() {}
+   |                               ^ consider adding a `main` function to `$DIR/tests/ui/e020_vtable_slot_oob.rs`

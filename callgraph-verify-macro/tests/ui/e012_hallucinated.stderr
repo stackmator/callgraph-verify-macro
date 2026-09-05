@@ -1,0 +1,35 @@
+error:   [CG-VERIFY-E009 DUP-ADDR] origin 0x00401000 is claimed by 2 Rust fns (only ONE may implement a given binary fn):
+             lib.rs:? probe
+             lib.rs:? probe_duplicate
+           -> fix: delete the duplicate(s) so exactly one Rust fn owns this address, or split the binary fn (e.g. move the secondary portion into its own `#[origin(other_addr)]` helper)
+  --> tests/ui/e012_hallucinated.rs:11:5
+   |
+11 | pub fn f() {
+   |     ^^
+
+error:   [CG-VERIFY-E011 VTABLE-DISPATCH] body directly calls `dispatched` (0x00403000) — the binary dispatches it via vtable 0x00a00000 slot 0 (byte 0x0); use `vcall_*(obj, 0x0)`, not a direct call
+           -> fix: replace `dispatched(...)` with a vcall via the declared vtable at 0x00a00000, slot 0
+  --> tests/ui/e012_hallucinated.rs:11:5
+   |
+11 | pub fn f() {
+   |     ^^
+
+error:   [CG-VERIFY-E013 MISSING] binary calls `real_call` (0x00402000) — body doesn't
+           -> fix: add the call (a faithful inline is also fine — add an `/// inline: 0x00402000` marker so the verifier knows)
+  --> tests/ui/e012_hallucinated.rs:11:5
+   |
+11 | pub fn f() {
+   |     ^^
+
+error:   [CG-VERIFY-E016 CFG] binary has 2 loop back-edge(s) but the body has no loop — missing iteration?
+           -> fix: port the iteration inline (the macro verifies the body at the attributed addr; loops extracted to helpers must each carry their own #[origin(callee_addr)] AND reproduce the loop structure inside the helper)
+  --> tests/ui/e012_hallucinated.rs:11:5
+   |
+11 | pub fn f() {
+   |     ^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/e012_hallucinated.rs:13:2
+   |
+13 | }
+   |  ^ consider adding a `main` function to `$DIR/tests/ui/e012_hallucinated.rs`

@@ -1,0 +1,12 @@
+error:   [CG-VERIFY-E019 VTABLE-SLOT] slot 0 `mismatch_fn`: engine vtable holds 0x00402000, but `mismatch_fn` origin is 0x00404000 — wrong fn or off-by-one slot
+           -> fix: either correct the slot index (off-by-one shows up as an adjacent addr), or replace `mismatch_fn` with the fn whose origin is 0x00402000
+  --> tests/ui/e019_vtable_slot.rs:15:5
+   |
+15 |     0 = mismatch_fn;
+   |     ^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/e019_vtable_slot.rs:19:31
+   |
+19 | fn vtable_unimplemented_m() {}
+   |                               ^ consider adding a `main` function to `$DIR/tests/ui/e019_vtable_slot.rs`

@@ -7,8 +7,9 @@
 //! names that collide with std/trait fns (`.get()`, `.clone()`, …) are filtered
 //! by [`DENY`]; resolution further requires the name to be `origin:`-tagged.
 
-use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use std::collections::HashSet;
+use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{Block, Expr, ExprCall, ExprLit, ExprMethodCall, ImplItemFn, ItemFn, Lit};
 
@@ -104,6 +105,7 @@ impl<'ast> Visit<'ast> for FnBodyVisitor {
                     // generic arguments; the callee name is still the segment
                     // ident, so explicit generics resolve like plain calls.
                     args: e.args.iter().map(classify_expr).collect(),
+                    span: e.span(),
                 });
                 self.facts.names.plain.insert(name);
             }
@@ -117,6 +119,7 @@ impl<'ast> Visit<'ast> for FnBodyVisitor {
             name: name.clone(),
             is_method: true,
             args: m.args.iter().map(classify_expr).collect(),
+            span: m.span(),
         });
         self.facts.names.method.insert(name);
         visit::visit_expr_method_call(self, m);
@@ -161,6 +164,19 @@ impl FnLike {
         match self {
             FnLike::Free(f) => &f.block,
             FnLike::Method(m) => &m.block,
+        }
+    }
+
+    /// Best-effort span pointing at the function declaration itself (the
+    /// `fn` keyword). Used as the fallback anchor when a diagnostic has no
+    /// more specific token to attach to. With `Span::call_site()` the
+    /// rustc gutter always lights up the attribute line; this often lights
+    /// up the `fn name(...)` line, which is one click closer to the body
+    /// in IDEs.
+    pub fn attr_target_span(&self) -> Span {
+        match self {
+            FnLike::Free(f) => f.sig.fn_token.span,
+            FnLike::Method(m) => m.sig.fn_token.span,
         }
     }
 }
@@ -235,12 +251,16 @@ pub enum RustArg {
 }
 
 /// One call expression in the body: the callee name, whether it was a method call (`x.f(..)`),
-/// and its classified positional arguments.
+/// and its classified positional arguments. `span` points at the call expression itself so
+/// the macro can attach HALLUCINATED / ARG-SHAPE / VTABLE-DISPATCH errors to the exact call
+/// site in the source (not the attribute line) — agents and IDEs both navigate better when
+/// rustc's gutter points at the offending token.
 #[derive(Debug)]
 pub struct CallExpr {
     pub name: String,
     pub is_method: bool,
     pub args: Vec<RustArg>,
+    pub span: Span,
 }
 
 /// Coarse control-flow keyword counts of a body, for the CFG-fingerprint diff. Counts keyword
@@ -430,11 +450,27 @@ fn count_kw(ts: TokenStream, c: &mut RustCfg) {
 /// literal that coincidentally lands in a PE section would be a false positive.
 pub fn collect_hex_literals(ts: TokenStream) -> Vec<u64> {
     let mut out = Vec::new();
-    walk_hex(ts, &mut out);
+    walk_hex(ts, &mut |v, _span| out.push(v));
     out
 }
 
-fn walk_hex(ts: TokenStream, out: &mut Vec<u64>) {
+/// Same scan as `collect_hex_literals`, but ALSO records each literal's
+/// `Span`. The macro's `HALLUCINATED-ADDR` diagnostic attaches to the
+/// literal that bakes the invented address, so rustc lights up exactly the
+/// spot the agent must change — instead of the `#[origin(...)]` line.
+///
+/// Span identity is per-token: a literal written twice produces two
+/// distinct spans, but the value `HashMap` collapses them. The first span
+/// seen for each value wins, which is fine for navigation purposes.
+pub fn collect_hex_literal_spans(ts: TokenStream) -> std::collections::HashMap<u64, Span> {
+    let mut out = std::collections::HashMap::new();
+    walk_hex(ts, &mut |v, sp| {
+        out.entry(v).or_insert(sp);
+    });
+    out
+}
+
+fn walk_hex(ts: TokenStream, out: &mut dyn FnMut(u64, Span)) {
     for tt in ts {
         match tt {
             TokenTree::Group(g) => walk_hex(g.stream(), out),
@@ -451,7 +487,7 @@ fn walk_hex(ts: TokenStream, out: &mut Vec<u64>) {
                     .collect();
                 if !hex.is_empty() {
                     if let Ok(v) = u64::from_str_radix(&hex, 16) {
-                        out.push(v);
+                        out(v, l.span());
                     }
                 }
             }

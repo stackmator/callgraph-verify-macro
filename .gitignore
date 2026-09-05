@@ -1,3 +1,8 @@
 target/
 Cargo.lock
 noivilbo.exe
+# Synthetic PE + corpus written by tests/error_codes.rs at every test run;
+# checked-in fixtures live under callgraph-verify-macro/tests/ui/.
+callgraph-verify-macro/tests/testdata/
+# Local editor / tooling state.
+.vscode/

@@ -1,0 +1,13 @@
+error: [CG-VERIFY-E004 TARGET-EXE-UNLOADABLE] TARGET_EXE-EXISTS-BUT-UNREADABLE: TARGET_EXE=$DIR/tests/testdata/not_a_pe.bin — the file exists but is not a valid PE32 image; rebuild the target or point TARGET_EXE at the correct binary. Refusing to build unverified: an env var is set, so the build IS meant to be verified (unset it to disable).
+  --> tests/ui/e004_target_exe_unloadable.rs:11:1
+   |
+11 | #[origin(0x00401000)]
+   | ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `origin` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/e004_target_exe_unloadable.rs:12:14
+   |
+12 | pub fn f() {}
+   |              ^ consider adding a `main` function to `$DIR/tests/ui/e004_target_exe_unloadable.rs`

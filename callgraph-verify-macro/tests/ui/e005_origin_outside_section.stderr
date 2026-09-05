@@ -1,0 +1,59 @@
+error:   [CG-VERIFY-E005 ORIGIN-OUTSIDE-SECTION] 0xffff0000 is outside every PE section — not a function address
+           -> fix: verify the address against the binary (e.g. open the PE in a disassembler), or move the rebuild away from this addr
+  --> tests/ui/e005_origin_outside_section.rs:10:5
+   |
+10 | pub fn f() {}
+   |     ^^
+
+error:   [CG-VERIFY-E007 DECLARED-FACTS] 0xffff0000 is not inside any PE section of this image
+           .text    [0x00401000..0x00401200) (512 bytes)
+           .rdata   [0x00a00000..0x00a00200) (512 bytes)
+           .rdata2  [0x00a01000..0x00a01200) (512 bytes)
+         closest section to 0xffff0000: .rdata2 (distance 0xff5eee00 bytes) — did you mean 0x00a01000?
+  --> tests/ui/e005_origin_outside_section.rs:10:5
+   |
+10 | pub fn f() {}
+   |     ^^
+
+error:   [CG-VERIFY-E008 CORPUS-GAP] origin 0xffff0000 is not in the corpus scanned from REBUILD_ROOT=$DIR/tests/testdata/corpus — wrong root, empty/missing directory, or the owning file failed to parse. Body-call verification cannot run
+           -> fix: fix REBUILD_ROOT so it contains the source with this #[origin] tag, and re-run `cargo build` so the corpus re-scans
+  --> tests/ui/e005_origin_outside_section.rs:10:5
+   |
+10 | pub fn f() {}
+   |     ^^
+
+error:   [CG-VERIFY-E017 ANALYZE] analyze 0xffff0000: 0xffff0000 is not inside any PE section of this image
+           .text    [0x00401000..0x00401200) (512 bytes)
+           .rdata   [0x00a00000..0x00a00200) (512 bytes)
+           .rdata2  [0x00a01000..0x00a01200) (512 bytes)
+         closest section to 0xffff0000: .rdata2 (distance 0xff5eee00 bytes) — did you mean 0x00a01000?
+  --> tests/ui/e005_origin_outside_section.rs:10:5
+   |
+10 | pub fn f() {}
+   |     ^^
+
+error:   [CG-VERIFY-E017 ANALYZE] operand check 0xffff0000: 0xffff0000 is not inside any PE section of this image
+           .text    [0x00401000..0x00401200) (512 bytes)
+           .rdata   [0x00a00000..0x00a00200) (512 bytes)
+           .rdata2  [0x00a01000..0x00a01200) (512 bytes)
+         closest section to 0xffff0000: .rdata2 (distance 0xff5eee00 bytes) — did you mean 0x00a01000?
+  --> tests/ui/e005_origin_outside_section.rs:10:5
+   |
+10 | pub fn f() {}
+   |     ^^
+
+error:   [CG-VERIFY-E018 CFG-FINGERPRINT] cfg check 0xffff0000: 0xffff0000 is not inside any PE section
+           .text    [0x00401000..0x00401200) (512 bytes)
+           .rdata   [0x00a00000..0x00a00200) (512 bytes)
+           .rdata2  [0x00a01000..0x00a01200) (512 bytes)
+         closest section to 0xffff0000: .rdata2 (distance 0xff5eee00 bytes) — did you mean 0x00a01000?
+  --> tests/ui/e005_origin_outside_section.rs:10:5
+   |
+10 | pub fn f() {}
+   |     ^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/e005_origin_outside_section.rs:10:14
+   |
+10 | pub fn f() {}
+   |              ^ consider adding a `main` function to `$DIR/tests/ui/e005_origin_outside_section.rs`

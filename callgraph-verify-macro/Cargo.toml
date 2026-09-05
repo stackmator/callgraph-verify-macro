@@ -21,3 +21,12 @@ callgraph-verify = { path = "../callgraph-verify" }
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
 proc-macro2 = "1"
+
+[dev-dependencies]
+# End-to-end compile-error fixtures under tests/ui/. Each fixture file is a
+# small Rust source file with an `#[origin]` (or `vtable_table!`) that should
+# fail with a specific CG-VERIFY-Exxx error; the matching .stderr snapshot
+# pins the exact rendered message. Adding a new error code without a fixture
+# is a regression: the test runner will silently keep working, but the
+# wording can drift undetected. see tests/error_codes.rs.
+trybuild = "1.0"

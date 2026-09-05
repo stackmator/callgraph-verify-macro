@@ -1,0 +1,11 @@
+error: [CG-VERIFY-E001 UNKNOWN-ATTR-KEY] unknown key `bogus` in #[origin(...)] — supported keys: calls, calls_exact, fields, globals, vtables, vcall_slots, iat (each takes `= [0xNN, ...]`). Bare flag: unreferenced
+  --> tests/ui/e001_unknown_attr_key.rs:11:22
+   |
+11 | #[origin(0x00401000, bogus = [0x00402000])]
+   |                      ^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/e001_unknown_attr_key.rs:12:14
+   |
+12 | pub fn f() {}
+   |              ^ consider adding a `main` function to `$DIR/tests/ui/e001_unknown_attr_key.rs`

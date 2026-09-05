@@ -1,0 +1,13 @@
+error: [CG-VERIFY-E003 NOT-A-FUNCTION] #[origin] requires a function item (free fn or impl/trait method): expected `fn`
+ --> tests/ui/e003_not_a_function.rs:9:1
+  |
+9 | #[origin(0x00401000)]
+  | ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `origin` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/e003_not_a_function.rs:12:2
+   |
+12 | }
+   |  ^ consider adding a `main` function to `$DIR/tests/ui/e003_not_a_function.rs`

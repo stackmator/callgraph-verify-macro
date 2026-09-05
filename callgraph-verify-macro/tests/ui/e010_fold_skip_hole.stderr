@@ -1,0 +1,37 @@
+error:   [CG-VERIFY-E009 DUP-ADDR] origin 0x00401000 is claimed by 2 Rust fns (only ONE may implement a given binary fn):
+             lib.rs:? probe
+             lib.rs:? probe_duplicate
+           -> fix: delete the duplicate(s) so exactly one Rust fn owns this address, or split the binary fn (e.g. move the secondary portion into its own `#[origin(other_addr)]` helper)
+  --> tests/ui/e010_fold_skip_hole.rs:13:5
+   |
+13 | pub fn f() {
+   |     ^^
+
+error:   [CG-VERIFY-E010 FOLD-SKIP HOLE] call to ambiguous `inline:` helper `amb` resolves nowhere (defined inline in >1 place, not also a free fn/method), so its ported calls escape verification
+           -> fix: give `amb` a unique name (addr-suffix), an `inline: 0xADDR` tag, or its own `#[origin]`
+  --> tests/ui/e010_fold_skip_hole.rs:12:1
+   |
+12 | #[origin(0x00401000)]
+   | ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `origin` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error:   [CG-VERIFY-E013 MISSING] binary calls `real_call` (0x00402000) — body doesn't
+           -> fix: add the call (a faithful inline is also fine — add an `/// inline: 0x00402000` marker so the verifier knows)
+  --> tests/ui/e010_fold_skip_hole.rs:13:5
+   |
+13 | pub fn f() {
+   |     ^^
+
+error:   [CG-VERIFY-E016 CFG] binary has 2 loop back-edge(s) but the body has no loop — missing iteration?
+           -> fix: port the iteration inline (the macro verifies the body at the attributed addr; loops extracted to helpers must each carry their own #[origin(callee_addr)] AND reproduce the loop structure inside the helper)
+  --> tests/ui/e010_fold_skip_hole.rs:13:5
+   |
+13 | pub fn f() {
+   |     ^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/e010_fold_skip_hole.rs:15:2
+   |
+15 | }
+   |  ^ consider adding a `main` function to `$DIR/tests/ui/e010_fold_skip_hole.rs`

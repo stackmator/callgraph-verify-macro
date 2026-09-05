@@ -229,11 +229,7 @@ impl Pe {
             ));
             let d = if va < start {
                 start - va
-            } else if va >= end {
-                va - end
-            } else {
-                0
-            };
+            } else { va.saturating_sub(end) };
             if best.map(|(_, bd)| d < bd).unwrap_or(true) {
                 best = Some((sec, d));
             }

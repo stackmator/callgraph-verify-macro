@@ -1,0 +1,35 @@
+error:   [CG-VERIFY-E009 DUP-ADDR] origin 0x00401000 is claimed by 2 Rust fns (only ONE may implement a given binary fn):
+             lib.rs:? probe
+             lib.rs:? probe_duplicate
+           -> fix: delete the duplicate(s) so exactly one Rust fn owns this address, or split the binary fn (e.g. move the secondary portion into its own `#[origin(other_addr)]` helper)
+  --> tests/ui/e015_hallucinated_addr.rs:11:5
+   |
+11 | pub fn f() -> u32 {
+   |     ^^
+
+error:   [CG-VERIFY-E013 MISSING] binary calls `real_call` (0x00402000) — body doesn't
+           -> fix: add the call (a faithful inline is also fine — add an `/// inline: 0x00402000` marker so the verifier knows)
+  --> tests/ui/e015_hallucinated_addr.rs:11:5
+   |
+11 | pub fn f() -> u32 {
+   |     ^^
+
+error:   [CG-VERIFY-E015 HALLUCINATED-ADDR] body bakes in 0x00a00004 (inside the image), but binary at 0x00401000 never references it (not a CALL target, global, baked immediate, or IAT slot)
+           -> fix: use the address the binary actually references at this origin, or remove the literal if it's a stray
+  --> tests/ui/e015_hallucinated_addr.rs:12:15
+   |
+12 |     unsafe { (0x00A00004 as *const u32).read_volatile() }
+   |               ^^^^^^^^^^
+
+error:   [CG-VERIFY-E016 CFG] binary has 2 loop back-edge(s) but the body has no loop — missing iteration?
+           -> fix: port the iteration inline (the macro verifies the body at the attributed addr; loops extracted to helpers must each carry their own #[origin(callee_addr)] AND reproduce the loop structure inside the helper)
+  --> tests/ui/e015_hallucinated_addr.rs:11:5
+   |
+11 | pub fn f() -> u32 {
+   |     ^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/e015_hallucinated_addr.rs:13:2
+   |
+13 | }
+   |  ^ consider adding a `main` function to `$DIR/tests/ui/e015_hallucinated_addr.rs`
