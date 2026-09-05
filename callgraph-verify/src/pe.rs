@@ -75,24 +75,42 @@ impl Pe {
     }
 
     pub fn parse(data: Vec<u8>) -> Result<Pe, String> {
-        if data.len() < 0x40 || &data[0..2] != b"MZ" {
-            return Err("not an MZ image".into());
+        let sz = data.len();
+        if sz < 0x40 || &data[0..2] != b"MZ" {
+            return Err(format!(
+                "not an MZ image: first 2 bytes are {:?} (expected b\"MZ\"), file size = {sz} bytes",
+                &data[..data.len().min(2)]
+            ));
         }
         let e_lfanew = u32(&data, 0x3c) as usize;
         if data.len() < e_lfanew + 24 || &data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
-            return Err("bad PE signature".into());
+            // Show the e_lfanew value, the bytes at that offset, and what's there.
+            // That single line is enough to tell whether the user gave us an MZ
+            // wrapped around something exotic (a DOS driver, a NE/LE binary)
+            // or just a corrupted PE.
+            let there = data
+                .get(e_lfanew..e_lfanew + 4)
+                .map(|s| format!("{:02x?}", s))
+                .unwrap_or_else(|| "<past EOF>".into());
+            return Err(format!(
+                "bad PE signature: e_lfanew = {e_lfanew:#x}, bytes there = [{there}] (expected b\"PE\\0\\0\"); file size = {sz} bytes"
+            ));
         }
         let coff = e_lfanew + 4;
         let machine = u16(&data, coff);
         if machine != 0x014c {
-            return Err(format!("expected i386 (0x14c), got {machine:#06x}"));
+            return Err(format!(
+                "unsupported machine {machine:#06x} (expected i386 = 0x014c); this crate only decodes 32-bit x86"
+            ));
         }
         let num_sections = u16(&data, coff + 2) as usize;
         let opt_size = u16(&data, coff + 16) as usize;
         let opt = coff + 20;
         let magic = u16(&data, opt);
         if magic != 0x10b {
-            return Err(format!("expected PE32 (0x10b), got {magic:#06x}"));
+            return Err(format!(
+                "unsupported optional-header magic {magic:#06x} (expected PE32 = 0x10b); PE32+ (64-bit) and ROM images are not handled"
+            ));
         }
         let image_base = u32(&data, opt + 28) as u64;
 
@@ -101,7 +119,11 @@ impl Pe {
         for i in 0..num_sections {
             let s = sec_table + i * 40;
             if s + 40 > data.len() {
-                return Err("section table runs past EOF".into());
+                return Err(format!(
+                    "section table runs past EOF: section #{i} would start at file offset {s:#x} \
+                     (e_lfanew={e_lfanew:#x} + opt_size={opt_size:#x} + {i}*40), \
+                     but file size is only {sz} bytes — corrupt header or wrong format"
+                ));
             }
             let raw_name = &data[s..s + 8];
             let end = raw_name.iter().position(|&b| b == 0).unwrap_or(8);
@@ -184,6 +206,47 @@ impl Pe {
         self.section_of(va)
             .map(|s| s.is_executable())
             .unwrap_or(false)
+    }
+
+    /// Pretty-print every section as `name [RVA..RVA+size)` with the image base
+    /// baked in, plus a hint pointing at the closest section to `va` (by VA
+    /// distance) so the user can immediately tell whether they mistyped an
+    /// address or used the wrong file.
+    pub fn describe_sections(&self, va: u64) -> String {
+        let mut s = String::new();
+        let mut best: Option<(&Section, u64)> = None;
+        for sec in &self.sections {
+            let start = self.image_base + sec.virtual_address as u64;
+            let span = sec.virtual_size.max(sec.raw_size) as u64;
+            let end = start + span;
+            s.push_str(&format!(
+                "    {name:<8} [0x{start:08x}..0x{end:08x}) ({span} bytes){flag}\n",
+                name = sec.name,
+                start = start,
+                end = end,
+                span = span,
+                flag = if sec.is_executable() { " code" } else { "" },
+            ));
+            let d = if va < start {
+                start - va
+            } else if va >= end {
+                va - end
+            } else {
+                0
+            };
+            if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((sec, d));
+            }
+        }
+        if let Some((sec, d)) = best {
+            s.push_str(&format!(
+                "  closest section to {va:#010x}: {name} (distance {d:#x} bytes) — \
+                 did you mean 0x{start:08x}?",
+                name = sec.name,
+                start = self.image_base + sec.virtual_address as u64,
+            ));
+        }
+        s
     }
 
     /// The image's VA range `[image_base, end)` (end = highest section end).

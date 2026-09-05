@@ -83,6 +83,12 @@ pub struct CallGraph {
     /// Highest instruction-end VA reached — the function's apparent extent.
     pub max_end: u64,
     pub decode_errors: u32,
+    /// First few decode failures as `(ip, raw_bytes)`. Decoders hitting
+    /// invalid opcodes is normal at padding/alignment/data boundaries, but a
+    /// long run inside what is supposed to be a function usually means the
+    /// entry VA is wrong, or the function crosses into embedded data. The
+    /// hex bytes here are enough to tell which.
+    pub decode_error_samples: Vec<(u64, Vec<u8>)>,
 }
 
 impl CallGraph {
@@ -364,7 +370,10 @@ pub fn reg_params(pe: &Pe, addr: u64) -> (bool, bool) {
 /// Walk the function at `entry` and return its facts, sourced purely from bytes.
 pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
     if !pe.is_executable_va(entry) {
-        return Err(format!("{entry:#010x} is not inside any PE section"));
+        return Err(format!(
+            "{entry:#010x} is not inside any PE section of this image\n{}",
+            pe.describe_sections(entry)
+        ));
     }
     let mut cg = CallGraph {
         entry,
@@ -418,6 +427,15 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
             dec.decode_out(&mut instr);
             if instr.is_invalid() {
                 cg.decode_errors += 1;
+                // Keep up to 5 samples so the user can tell at a glance
+                // whether the failures are padding (single 0x00/0xCC/0x90),
+                // an aligned jump table (4 distinct bytes), or something
+                // structural (random bytes that decode to nothing — entry
+                // VA is probably wrong).
+                if cg.decode_error_samples.len() < 5 {
+                    let bytes = pe.read(ip, 8).unwrap_or(&[]).to_vec();
+                    cg.decode_error_samples.push((ip, bytes));
+                }
                 break;
             }
             cg.max_end = cg.max_end.max(instr.next_ip());

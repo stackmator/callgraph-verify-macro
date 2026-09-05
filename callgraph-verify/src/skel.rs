@@ -297,7 +297,10 @@ fn dominators(entry: u64, blocks: &[Block]) -> BTreeMap<u64, BTreeSet<u64>> {
 /// should compare these tolerantly (optimized CFGs do not map 1:1 to source).
 pub fn cfg_fingerprint(pe: &Pe, entry: u64) -> Result<CfgFingerprint, String> {
     if !pe.is_executable_va(entry) {
-        return Err(format!("{entry:#010x} is not inside any PE section"));
+        return Err(format!(
+            "{entry:#010x} is not inside any PE section\n{}",
+            pe.describe_sections(entry)
+        ));
     }
     let (lo, hi) = (entry, entry.saturating_add(MAX_SPAN));
     let (instrs, blocks) = build_cfg(pe, entry);
@@ -351,7 +354,10 @@ pub fn cfg_fingerprint(pe: &Pe, entry: u64) -> Result<CfgFingerprint, String> {
 /// Emit the reference skeleton for the function at `entry`.
 pub fn emit_skeleton(pe: &Pe, entry: u64) -> Result<String, String> {
     if !pe.is_executable_va(entry) {
-        return Err(format!("{entry:#010x} is not inside any PE section"));
+        return Err(format!(
+            "{entry:#010x} is not inside any PE section\n{}",
+            pe.describe_sections(entry)
+        ));
     }
     let (instrs, blocks) = build_cfg(pe, entry);
     let _ = &instrs;

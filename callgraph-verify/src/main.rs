@@ -20,7 +20,8 @@ use std::collections::BTreeSet;
 
 fn parse_addr(s: &str) -> Result<u64, String> {
     let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    u64::from_str_radix(s, 16).map_err(|e| format!("bad addr {s:?}: {e}"))
+    u64::from_str_radix(s, 16)
+        .map_err(|e| format!("bad address {s:?}: {e} — expected hex like \"0x401000\" or \"401000\""))
 }
 
 #[derive(Default)]
@@ -130,7 +131,7 @@ fn main() {
             return;
         }
         "--list" => {
-            parse_max(&args[3..], &mut max);
+            parse_max(3, &args, &mut max);
             let pe = Pe::load(exe).unwrap_or_else(|e| fatal(&e));
             let entries = enumerate_functions(&pe, max);
             for (va, extent, cg) in &entries {
@@ -146,7 +147,7 @@ fn main() {
             return;
         }
         "--json" => {
-            parse_max(&args[3..], &mut max);
+            parse_max(3, &args, &mut max);
             let pe = Pe::load(exe).unwrap_or_else(|e| fatal(&e));
             let entries = enumerate_functions(&pe, max);
             print_json(&pe, &entries);
@@ -163,6 +164,7 @@ fn main() {
     let mut skeleton = false;
     let mut i = 3;
     while i < args.len() {
+        let pos = i; // 1-indexed argv position for the error message
         match args[i].as_str() {
             "--skeleton" | "--skel" | "show-skeleton" => skeleton = true,
             "--exact" => exact = true,
@@ -170,15 +172,24 @@ fn main() {
                 i += 1;
                 let list = args
                     .get(i)
-                    .unwrap_or_else(|| fatal("--declared needs a value"));
+                    .unwrap_or_else(|| {
+                        fatal(&format!("argv[{pos}] = --declared: missing value (need a comma-separated hex list, e.g. 0x401000,0x401050)"))
+                    });
                 declared = Some(
                     list.split(',')
                         .filter(|s| !s.trim().is_empty())
-                        .map(|s| parse_addr(s).unwrap_or_else(|e| fatal(&e)))
+                        .enumerate()
+                        .map(|(idx, s)| {
+                            parse_addr(s).unwrap_or_else(|e| {
+                                fatal(&format!("argv[{}] = --declared entry #{idx} ({s:?}): {e}", pos + 1))
+                            })
+                        })
                         .collect(),
                 );
             }
-            other => fatal(&format!("unknown arg {other:?}")),
+            other => fatal(&format!(
+                "argv[{pos}] = {other:?}: unknown flag (valid: --declared, --exact, --skeleton, --max)"
+            )),
         }
         i += 1;
     }
@@ -244,7 +255,24 @@ fn main() {
                 false,
             );
             if cg.decode_errors > 0 {
-                println!("  decode stops (padding/data/end):   {}", cg.decode_errors);
+                let more = cg
+                    .decode_errors
+                    .saturating_sub(cg.decode_error_samples.len() as u32);
+                println!(
+                    "  decode stops (padding/data/end):   {}",
+                    cg.decode_errors
+                );
+                if !cg.decode_error_samples.is_empty() {
+                    println!("    first {}:", cg.decode_error_samples.len());
+                    for (ip, bytes) in &cg.decode_error_samples {
+                        let hex: Vec<String> =
+                            bytes.iter().map(|b| format!("{b:02x}")).collect();
+                        println!("      {ip:#010x}: {}", hex.join(" "));
+                    }
+                    if more > 0 {
+                        println!("      ...and {more} more (not shown)");
+                    }
+                }
             }
         }
         Some(d) => {
@@ -264,19 +292,27 @@ fn main() {
     }
 }
 
-fn parse_max(args: &[String], max: &mut u32) {
-    let mut i = 0;
+fn parse_max(base: usize, args: &[String], max: &mut u32) {
+    // `base` is the argv index of the first flag (e.g. 3 for `--list` /
+    // `--json`, where argv[1]=exe argv[2]=--mode argv[3..]=flags). Including
+    // it in the error lets the user pinpoint which flag tripped parsing.
+    let mut i = base;
     while i < args.len() {
+        let pos = i;
         match args[i].as_str() {
             "--max" => {
                 i += 1;
                 if let Some(v) = args.get(i) {
-                    *max = v.parse().unwrap_or_else(|_| fatal("--max needs a number"));
+                    *max = v.parse().unwrap_or_else(|_| {
+                        fatal(&format!("argv[{pos}] = --max: {v:?} is not a u32 (need 0..=4294967295)"))
+                    });
                 } else {
-                    fatal("--max needs a value");
+                    fatal(&format!("argv[{pos}] = --max: missing value"));
                 }
             }
-            other => fatal(&format!("unknown arg {other:?}")),
+            other => fatal(&format!(
+                "argv[{pos}] = {other:?}: unknown flag (valid here: --max N)"
+            )),
         }
         i += 1;
     }
@@ -405,6 +441,14 @@ fn print_set(label: &str, set: &BTreeSet<u64>, small: bool) {
 }
 
 fn fatal(msg: &str) -> ! {
+    // Always print the binary path (argv[1]) + the offending argv so the
+    // user (and an AI reading logs) can reproduce: which exe, which addr,
+    // which flags. Without this you can't tell whether the error came from
+    // a bad address or a typo'd --declared list.
+    let argv: Vec<String> = std::env::args().collect();
+    let exe = argv.get(1).map(String::as_str).unwrap_or("<missing>");
     eprintln!("error: {msg}");
+    eprintln!("  invoked as: {}", argv.join(" "));
+    eprintln!("  target exe: {exe}");
     std::process::exit(2);
 }
