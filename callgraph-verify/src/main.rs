@@ -69,13 +69,30 @@ fn enumerate_functions(pe: &Pe, max: u32) -> Vec<(u64, u64, callgraph_verify::Ca
 
 fn print_usage(prog: &str) -> ! {
     eprintln!(
-        "usage: {prog} <exe> <addr-hex> [--declared 0xA,0xB,...] [--exact] [--skeleton]\n\
+        "{prog} {} (git {})\n\
+         \n\
+         usage: {prog} <exe> <addr-hex> [--declared 0xA,0xB,...] [--exact] [--skeleton]\n\
          \n       {prog} <exe> --list   [--max N]\n\
          \n       {prog} <exe> --count\n\
          \n       {prog} <exe> --summary\n\
-         \n       {prog} <exe> --json   [--max N]"
+         \n       {prog} <exe> --json   [--max N]",
+        env!("CARGO_PKG_VERSION"),
+        short_sha(),
     );
     std::process::exit(2);
+}
+
+/// `GIT_SHA` is emitted by `build.rs` via `git rev-parse --short HEAD`.
+/// It's empty when built from a tarball (no `.git` present) — we render
+/// that as "no-git" so the user knows the binary isn't pinned to a commit.
+fn short_sha() -> &'static str {
+    // build.rs already passes --short (8 chars), but if it ever returns ""
+    // we want a stable, non-empty placeholder.
+    if env!("GIT_SHA").is_empty() {
+        "no-git"
+    } else {
+        env!("GIT_SHA")
+    }
 }
 
 fn main() {

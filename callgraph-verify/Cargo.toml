@@ -25,3 +25,4 @@ path = "src/main.rs"
 # Pure-Rust x86/x64 decoder (no C deps). Decode-only feature set keeps it lean.
 # `nasm` adds the formatter used by the reference-skeleton emitter (host-only build dep).
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info", "nasm"] }
+
