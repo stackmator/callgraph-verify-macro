@@ -357,6 +357,7 @@ mod tests {
                     &rust_idents,
                     &inlined_markers,
                     &std::collections::BTreeSet::new(),
+                    &std::collections::BTreeSet::new(),
                 )
                 .expect("diff_body_calls");
 
@@ -402,6 +403,7 @@ mod tests {
                     &rust_idents,
                     &std::collections::BTreeSet::new(),
                     &vtable_methods,
+                    &std::collections::BTreeSet::new(),
                 )
                 .expect("diff_body_calls");
 
@@ -441,6 +443,7 @@ mod tests {
                     &rust_idents,
                     &std::collections::BTreeSet::new(),
                     &std::collections::BTreeSet::new(),
+                    &std::collections::BTreeSet::new(),
                 )
                 .expect("diff_body_calls");
 
@@ -449,6 +452,49 @@ mod tests {
                 return;
             }
         }
+    }
+
+    #[test]
+    fn test_diff_body_calls_miss_satisfied_suppresses_missing() {
+        let pe = load_test_pe();
+        let addrs = find_function_addresses(&pe);
+
+        for addr in &addrs {
+            let cg = analyze(&pe, *addr).expect("analyze");
+            if !cg.direct_calls.is_empty() {
+                let real_targets: Vec<u64> = cg.call_targets().into_iter().collect();
+
+                let corpus: std::collections::BTreeSet<u64> =
+                    real_targets.iter().copied().collect();
+
+                // Same empty body as test_diff_body_calls_missing, but the callee is
+                // covered by `miss_satisfied` (a same-named body call that the strict
+                // table split can't see — e.g. a DENY'd name or a qualified path).
+                let miss_satisfied: std::collections::BTreeSet<u64> =
+                    real_targets.iter().copied().collect();
+
+                let diff = diff_body_calls(
+                    &pe,
+                    &[*addr],
+                    &corpus,
+                    &[],
+                    &std::collections::BTreeSet::new(),
+                    &std::collections::BTreeSet::new(),
+                    &miss_satisfied,
+                )
+                .expect("diff_body_calls");
+
+                // Every binary->corpus callee is name-satisfied: nothing missing.
+                assert!(
+                    diff.missing.is_empty(),
+                    "missing: {:?} (miss_satisfied covers {:?})",
+                    diff.missing,
+                    real_targets
+                );
+                return;
+            }
+        }
+        panic!("no function with direct calls found in test binary");
     }
 
     /// Resolve `name` (e.g. "leaf_function") to its VA by walking the PE's symbol-like hints:

@@ -399,6 +399,7 @@ pub fn diff_body_calls(
     rust_idents: &[(String, Vec<u64>)],
     inlined_markers: &BTreeSet<u64>,
     vtable_methods: &BTreeSet<u64>,
+    miss_satisfied: &BTreeSet<u64>,
 ) -> Result<CorpusDiff, String> {
     let primary = *own_addrs.first().ok_or("no origin address")?;
     let mut bin_calls = BTreeSet::new();
@@ -488,7 +489,20 @@ pub fn diff_body_calls(
         }
         hallucinated.push((ident.clone(), aset));
     }
-    let missing: Vec<u64> = bin_ported.difference(&resolved).copied().collect();
+    // A MISSING is a binary call to a ported fn the body doesn't spell. But the
+    // verifier can only SEE a spelling when the body call name resolves through
+    // the strict table split + DENY filter — a qualified path `Self::m(..)` /
+    // `Type::m(..)` denotes an impl method yet resolves against free_fns only,
+    // and a generically-named ported fn (`mul`, `new`) is excluded outright, so
+    // its MISSING would be UNSATISFIABLE no matter how faithfully the body
+    // spells it. `miss_satisfied` (both tables, DENY-inclusive, split-agnostic)
+    // marks those addresses as satisfiable-by-name. Used ONLY here — never to
+    // excuse a HALLUCINATED, which keeps the strict split + DENY filter.
+    let missing: Vec<u64> = bin_ported
+        .difference(&resolved)
+        .filter(|a| !miss_satisfied.contains(a))
+        .copied()
+        .collect();
     Ok(CorpusDiff {
         addr: primary,
         hallucinated,

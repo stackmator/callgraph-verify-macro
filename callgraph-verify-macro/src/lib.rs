@@ -779,6 +779,30 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let mut rust_idents = resolve(&plain, &map.free_fns);
         rust_idents.extend(resolve(&method, &map.methods));
+        // MISSING-satisfaction set: every address any body call NAME could
+        // denote, across BOTH tables, DENY-inclusive and split-agnostic. A
+        // qualified path call (`Self::m(..)` / `Type::m(..)`) legitimately
+        // denotes an impl method (the strict plain→free split would miss it),
+        // and a generically-named ported fn (`mul`, `new`) is tracked in the
+        // corpus by name even though DENY excludes it from HALLUCINATED
+        // resolution. Without this, MISSING for those fns is UNSATISFIABLE:
+        // the binary calls them, a faithful body spells them, and the verifier
+        // still reports "body doesn't". The trade-off mirrors DENY's documented
+        // one (weakest-name-form check): a same-named collateral call can
+        // satisfy a MISSING — it can never FIRE a HALLUCINATED.
+        let miss_satisfied: std::collections::BTreeSet<u64> =
+            plain.iter().chain(method.iter()).fold(
+                std::collections::BTreeSet::new(),
+                |mut acc, n| {
+                    if let Some(s) = map.free_fns.get(n) {
+                        acc.extend(s.iter().copied());
+                    }
+                    if let Some(s) = map.methods.get(n) {
+                        acc.extend(s.iter().copied());
+                    }
+                    acc
+                },
+            );
         let vtm = vtable_method_map(&pe, &map.declared_vtables);
         let vtable_methods: std::collections::BTreeSet<u64> = vtm.keys().copied().collect();
         // VTABLE-ONLY DISPATCH (warning, not fatal): the origin IS referenced (passed the
@@ -800,6 +824,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             &rust_idents,
             &map.inlined_markers,
             &vtable_methods,
+            &miss_satisfied,
         ) {
             Ok(d) => {
                 // VTABLE-DISPATCH: a direct call to a known vtable method — must be a `vcall`.
