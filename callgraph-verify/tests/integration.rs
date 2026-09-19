@@ -327,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_body_calls_with_inlined_marker() {
+    fn test_diff_body_calls_call_without_binary_call_is_hallucinated() {
         let pe = load_test_pe();
         let addrs = find_function_addresses(&pe);
 
@@ -337,38 +337,31 @@ mod tests {
             if !cg.direct_calls.is_empty() {
                 let real_targets: Vec<u64> = cg.call_targets().into_iter().collect();
 
-                // Create a corpus with these addresses plus an extra one (the "inlined" callee)
+                // Create a corpus with these addresses plus an extra one the binary
+                // never calls. There is no inline-marker escape hatch anymore: if the
+                // engine inlines a helper, the faithful port spells the work inline,
+                // so a call to the helper is a HALLUCINATED.
                 let mut corpus: std::collections::BTreeSet<u64> =
                     real_targets.iter().copied().collect();
-                let inlined_callee = 0xDEADBEEF; // Not in the binary's direct calls
-                corpus.insert(inlined_callee);
+                let fake_callee = 0xDEADBEEF; // Not in the binary's direct calls
+                corpus.insert(fake_callee);
 
-                // Rust calls the inlined callee
-                let rust_idents = vec![("inlined_fn".to_string(), vec![inlined_callee])];
-
-                // Mark it as inlined
-                let inlined_markers: std::collections::BTreeSet<u64> =
-                    [inlined_callee].into_iter().collect();
+                // Rust calls the never-called callee
+                let rust_idents = vec![("invented_fn".to_string(), vec![fake_callee])];
 
                 let diff = diff_body_calls(
                     &pe,
                     &[*addr],
                     &corpus,
                     &rust_idents,
-                    &inlined_markers,
                     &std::collections::BTreeSet::new(),
                     &std::collections::BTreeSet::new(),
                 )
                 .expect("diff_body_calls");
 
-                // The call should be classified as inlined_ok, not hallucinated
+                // The call must be classified as hallucinated, never excused.
                 assert!(
-                    diff.inlined_ok.contains(&"inlined_fn".to_string()),
-                    "inlined_ok: {:?}",
-                    diff.inlined_ok
-                );
-                assert!(
-                    !diff.hallucinated.iter().any(|(n, _)| n == "inlined_fn"),
+                    diff.hallucinated.iter().any(|(n, _)| n == "invented_fn"),
                     "hallucinated: {:?}",
                     diff.hallucinated
                 );
@@ -401,7 +394,6 @@ mod tests {
                     &[*addr],
                     &corpus,
                     &rust_idents,
-                    &std::collections::BTreeSet::new(),
                     &vtable_methods,
                     &std::collections::BTreeSet::new(),
                 )
@@ -443,7 +435,6 @@ mod tests {
                     &rust_idents,
                     &std::collections::BTreeSet::new(),
                     &std::collections::BTreeSet::new(),
-                    &std::collections::BTreeSet::new(),
                 )
                 .expect("diff_body_calls");
 
@@ -478,7 +469,6 @@ mod tests {
                     &[*addr],
                     &corpus,
                     &[],
-                    &std::collections::BTreeSet::new(),
                     &std::collections::BTreeSet::new(),
                     &miss_satisfied,
                 )

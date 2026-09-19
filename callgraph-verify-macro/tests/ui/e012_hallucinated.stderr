@@ -15,7 +15,7 @@ error:   [CG-VERIFY-E011 VTABLE-DISPATCH] body directly calls `dispatched` (0x00
    |     ^^
 
 error:   [CG-VERIFY-E013 MISSING] binary calls `real_call` (0x00402000) — body doesn't
-           -> fix: add the call (a faithful inline is also fine — add an `/// inline: 0x00402000` marker so the verifier knows)
+           -> fix: add the call — the binary has a real CALL to 0x00402000, so the faithful body must spell it (or reproduce the callee's work inline, matching the binary)
   --> tests/ui/e012_hallucinated.rs:11:5
    |
 11 | pub fn f() {

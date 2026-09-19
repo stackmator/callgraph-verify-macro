@@ -45,14 +45,12 @@ pub enum Code {
     OriginOutsideSection,
     /// The claimed origin address is never referenced in the binary. E006.
     OriginUnreferenced,
-    /// Explicit declared facts (calls/fields/globals/…) failed. E007.
+    /// Explicit declared facts (fields/globals/vtables/…) failed. E007.
     DeclaredFacts,
     /// `REBUILD_ROOT` is set but does not contain this `#[origin]`'s addr. E008.
     CorpusGap,
     /// Two Rust fns claim the same origin address. E009.
     DupAddr,
-    /// An ambiguous `inline:` helper hides ported calls. E010.
-    FoldSkipHole,
     /// Body directly calls a vtable method (must use `vcall_*`). E011.
     VTableDispatch,
     /// Body calls something the binary never does. E012.
@@ -88,7 +86,6 @@ impl Code {
             Code::DeclaredFacts => "E007",
             Code::CorpusGap => "E008",
             Code::DupAddr => "E009",
-            Code::FoldSkipHole => "E010",
             Code::VTableDispatch => "E011",
             Code::Hallucinated => "E012",
             Code::Missing => "E013",
@@ -114,7 +111,6 @@ impl Code {
             Code::DeclaredFacts => "DECLARED-FACTS",
             Code::CorpusGap => "CORPUS-GAP",
             Code::DupAddr => "DUP-ADDR",
-            Code::FoldSkipHole => "FOLD-SKIP HOLE",
             Code::VTableDispatch => "VTABLE-DISPATCH",
             Code::Hallucinated => "HALLUCINATED",
             Code::Missing => "MISSING",
@@ -179,8 +175,8 @@ impl RichError {
     /// Render the diagnostic as one indented block.
     ///
     /// ```text
-    ///   [CG-VERIFY-E012 HALLUCINATED] body calls `foo` (0x401000) — binary at 0x4028d0 never calls (or inlines) it
-    ///     -> fix: remove the call, port `foo` to 0x401000, or alias it via `/// inline: 0x401000`
+    ///   [CG-VERIFY-E012 HALLUCINATED] body calls `foo` (0x401000) — binary at 0x4028d0 never calls it
+    ///     -> fix: remove the call, or port `foo` at 0x401000 with its own `#[origin(0xADDR)]`
     /// ```
     pub fn render(&self) -> String {
         let mut s = format!("  {} {}", self.code.prefix(), self.message);
@@ -202,7 +198,7 @@ impl std::fmt::Display for RichError {
 /// `#[origin]` produced the error without scrolling.
 #[allow(dead_code)]
 pub fn render_block(addr: u64, header: &str, errs: &[RichError]) -> String {
-    let mut s = format!("#[callgraph_verify({:#010x})] {}\n", addr, header);
+    let mut s = format!("#[origin({:#010x})] {}\n", addr, header);
     if errs.is_empty() {
         return s;
     }
@@ -284,7 +280,6 @@ mod tests {
             ("E007", "DECLARED-FACTS", DeclaredFacts),
             ("E008", "CORPUS-GAP", CorpusGap),
             ("E009", "DUP-ADDR", DupAddr),
-            ("E010", "FOLD-SKIP HOLE", FoldSkipHole),
             ("E011", "VTABLE-DISPATCH", VTableDispatch),
             ("E012", "HALLUCINATED", Hallucinated),
             ("E013", "MISSING", Missing),
@@ -345,7 +340,7 @@ mod tests {
             RichError::new(Code::Missing, "y"),
         ];
         let s = render_block(0x4028d0, "verification failed", &errs);
-        assert!(s.contains("#[callgraph_verify(0x004028d0)] verification failed"));
+        assert!(s.contains("#[origin(0x004028d0)] verification failed"));
         assert!(s.contains("[CG-VERIFY-E012 HALLUCINATED] x"));
         assert!(s.contains("[CG-VERIFY-E013 MISSING] y"));
     }

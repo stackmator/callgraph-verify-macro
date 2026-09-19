@@ -9,7 +9,7 @@ Compile-time anti-hallucination call-graph verification for binary reverse-engin
 | Crate | Purpose |
 |-------|---------|
 | `callgraph-verify` | Core library + CLI: PE parsing, iced-x86 disassembly, call-graph analysis, skeleton emitter |
-| `callgraph-verify-macro` | Proc-macro `#[origin(0xADDR)]` / `#[callgraph_verify(0xADDR)]` that runs the verifier at compile time |
+| `callgraph-verify-macro` | Proc-macro `#[origin(0xADDR)]` that runs the verifier at compile time |
 
 ## Architecture
 
@@ -70,42 +70,6 @@ binary's loop structure inside it. The macro will then verify each piece
 against its own byte range — the entry against the entry's loops, the helper
 against the helper's loops. Neither side gets a free pass.
 
-### What `inline:` markers are for (and what they're NOT for)
-
-The verifier supports three inline annotations:
-
-| Annotation | Purpose |
-|---|---|
-| `/// inline: 0xADDR` (with address) | Registers a Rust helper as the inlined-by-the-engine version of the binary function at `0xADDR`. Calls to it from other rebuild fns classify as `inlined_ok` (not `hallucinated`). |
-| `/// inline: <no-addr>` | Body fold-in: a pure-Rust idiom helper with no binary equivalent — its calls are folded into every caller so a call to `flag_helper()` doesn't introduce hidden invented calls. |
-| `/// callgraph-inlined` / `/// callgraph-virtual` | Alternate syntax for the same two ideas above. |
-
-**These markers are for cross-function call resolution. They do NOT relax
-the CFG check on any attributed entry.** A `/// inline: 0xADDR`-tagged
-helper is still verified against the bytes at `0xADDR` — its CFG must match,
-its calls must match, its fields must match. The marker only tells the
-*callers* of the helper "this name is recognised, don't HALLUCINATED-flag it."
-
-Concretely, the pattern from the previous section is unchanged:
-
-```text
-/// inline: 0x00AABBCC           // ← this does NOT exempt you
-fn pick_traverse(...) {          // ← from the CFG check at 0x959d60
-    while ... { ... }            //
-}                                //
-                                 //
-#[origin(0x959d60)]              //
-fn outer(...) {                  //
-    pick_traverse();             // ← still flagged: body has no loop,
-    update_world_bound();        //   binary at 0x959d60 has 4 back-edges
-}                                //
-```
-
-The annotation lives on `pick_traverse`'s *own* `#[origin(0x00AABBCC)]`
-declaration, where it explains "the engine inlined this; callers may share
-me." It does not, and cannot, make `outer`'s body structurally faithful to a
-binary function whose loops were never extracted in the first place.
-
 ### 2. Annotate a rebuild function
 
 ```rust
@@ -121,13 +85,11 @@ pub unsafe fn SomeFunction(this: *mut Context, x: i32, y: i32) -> *mut Result {
 
 ### 3. Explicit facts (optional)
 
-Pin calls, field offsets, globals, vtables, vcall slots, IAT slots:
+Pin field offsets, globals, vtables, vcall slots, IAT slots:
 
 ```rust
 #[origin(
     0x0070b780,
-    calls = [0x00401f00, 0x00401f20],      // superset check (binary may call more)
-    calls_exact = [0x00401f00],              // exact set check
     fields = [0x4, 0x6, 0xbc],               // field offsets the binary reads/writes
     globals = [0x00b12340, 0x00b12350],      // global addresses
     vtables = [0x00a7e38c],                  // vtable VAs
@@ -196,13 +158,12 @@ Emits a `.asm`-style skeleton showing every instruction with offsets — useful 
 On every `cargo check`/`cargo build`:
 
 1. **Loads** `TARGET_EXE` and disassembles the function at the attributed address
-2. **Scans** the rebuild source tree (`REBUILD_ROOT`) for `#[origin]` tags to build a `name → address` corpus (free fns, methods, inline helpers, declared vtables)
+2. **Scans** the rebuild source tree (`REBUILD_ROOT`) for `#[origin]` tags to build a `name → address` corpus (free fns, methods, declared vtables)
 3. **Parses** the attributed function's body for:
    - Direct calls (`foo()`)
    - Method calls (`obj.bar()`)
    - Field accesses (`ptr.field`)
    - Hex literals (globals, vtables, RTTI, fn pointers)
-   - Inline helper calls (recursively folded if unambiguous)
 4. **Diffs** body calls against binary calls:
    - `HALLUCINATED` — body calls something binary never does → **fatal**
    - `MISSING` — binary calls something body doesn't → non-fatal (opt-in strict)
@@ -211,7 +172,6 @@ On every `cargo check`/`cargo build`:
    - `HALLUCINATED-ADDR` — body bakes in-image address binary never references (opt-in `STRICT_OPERANDS`)
    - `CFG` — structural CFG divergence (opt-in `STRICT_CFG`)
    - `DUP-ADDR` — multiple Rust fns claim same binary address (opt-in `DUP_STRICT`)
-   - `FOLD-SKIP HOLE` — ambiguous inline helper with ported calls escapes verification
    - `ORIGIN-UNREFERENCED` — attributed address not called/jumped/stored in binary (waivable)
 
 ---

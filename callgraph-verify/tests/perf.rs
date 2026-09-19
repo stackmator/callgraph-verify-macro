@@ -1,11 +1,11 @@
 //! Performance-regression guards for the whole-`.text` scans.
 //!
 //! `has_direct_branch_target` used to byte-scan the ENTIRE `.text` blob on
-//! every call. The proc-macro calls it once per inline marker per `#[origin]`
-//! expansion, so a 6 MB `.text` × 77 markers × ~1800 tagged fns turned a
-//! rebuild's compile into a ~30-minute scan-fest. The fix caches all rel32
-//! branch targets in one pass; these tests fail loudly if a future change
-//! reintroduces per-call rescanning.
+//! every call. The proc-macro calls it once per `#[origin]` expansion (for
+//! the ORIGIN-UNREFERENCED / vtable-only-dispatch gates), so a 6 MB `.text`
+//! × ~1800 tagged fns turned a rebuild's compile into a ~30-minute
+//! scan-fest. The fix caches all rel32 branch targets in one pass; these
+//! tests fail loudly if a future change reintroduces per-call rescanning.
 //!
 //! The timing assertions are SELF-CALIBRATING instead of absolute: they
 //! compare a batch of repeat lookups against the one-time warmup cost on the

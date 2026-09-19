@@ -1,6 +1,6 @@
 # callgraph-verify-macro — the pure-byte call-graph check AS A FUNCTION ATTRIBUTE.
 #
-#   #[callgraph_verify(0x004028d0, calls = [0x00401f00, 0x00401f20], fields = [0x4, 0x6])]
+#   #[origin(0x004028d0, fields = [0x4, 0x6])]
 #   pub unsafe fn set(..) { .. }
 #
 # The macro disassembles the target binary at compile time and emits `compile_error!`

@@ -8,7 +8,7 @@ error:   [CG-VERIFY-E009 DUP-ADDR] origin 0x00401000 is claimed by 2 Rust fns (o
    |     ^^
 
 error:   [CG-VERIFY-E013 MISSING] binary calls `real_call` (0x00402000) — body doesn't
-           -> fix: add the call (a faithful inline is also fine — add an `/// inline: 0x00402000` marker so the verifier knows)
+           -> fix: add the call — the binary has a real CALL to 0x00402000, so the faithful body must spell it (or reproduce the callee's work inline, matching the binary)
   --> tests/ui/e009_dup_addr.rs:11:5
    |
 11 | pub fn first() {}
@@ -31,7 +31,7 @@ error:   [CG-VERIFY-E009 DUP-ADDR] origin 0x00401000 is claimed by 2 Rust fns (o
    |     ^^
 
 error:   [CG-VERIFY-E013 MISSING] binary calls `real_call` (0x00402000) — body doesn't
-           -> fix: add the call (a faithful inline is also fine — add an `/// inline: 0x00402000` marker so the verifier knows)
+           -> fix: add the call — the binary has a real CALL to 0x00402000, so the faithful body must spell it (or reproduce the callee's work inline, matching the binary)
   --> tests/ui/e009_dup_addr.rs:14:5
    |
 14 | pub fn second() {}

@@ -1,4 +1,4 @@
-error: [CG-VERIFY-E002 UNKNOWN-ATTR-FLAG] unknown flag `strict_anything` in #[origin(...)] — only `unreferenced` is supported as a bare flag. Maybe you meant one of: calls, calls_exact, fields, globals, vtables, vcall_slots, iat
+error: [CG-VERIFY-E002 UNKNOWN-ATTR-FLAG] unknown flag `strict_anything` in #[origin(...)] — only `unreferenced` is supported as a bare flag. Maybe you meant one of: fields, globals, vtables, vcall_slots, iat
  --> tests/ui/e002_unknown_attr_flag.rs:8:22
   |
 8 | #[origin(0x00401000, strict_anything)]

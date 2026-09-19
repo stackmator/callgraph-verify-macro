@@ -5,7 +5,7 @@
 //! (`HEAP.allocate(..)` → `MemoryHeap::Allocate` 0x00401aa0), and the strict
 //! MISSING check would otherwise flag that real call as absent. Generic method
 //! names that collide with std/trait fns (`.get()`, `.clone()`, …) are filtered
-//! by [`DENY`]; resolution further requires the name to be `origin:`-tagged.
+//! by [`DENY`]; resolution further requires the name to be `#[origin]`-tagged.
 
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use std::collections::HashSet;
@@ -677,12 +677,12 @@ mod tests {
     // --- collect_hex_literals (operand-fact check input) --------------------
 
     /// The caller passes ONLY the body block (`parse_fn_like` -> block), so
-    /// hex inside `#[origin(0xA, calls = [0xB, 0xC])]` structurally cannot
+    /// hex inside `#[origin(0xA, fields = [0xB, 0xC])]` structurally cannot
     /// leak into the operand check. (BUG #13)
     #[test]
     fn collect_hex_literals_excludes_attribute_addresses() {
         let lits =
-            hex_of_body("#[origin(0x004028d0, calls = [0x00401f00, 0x00401f20])] fn outer() {}");
+            hex_of_body("#[origin(0x004028d0, fields = [0x00401f00, 0x00401f20])] fn outer() {}");
         assert!(!lits.contains(&0x004028d0), "attr hex leaked: {:?}", lits);
         assert!(!lits.contains(&0x00401f00), "attr hex leaked: {:?}", lits);
         assert!(!lits.contains(&0x00401f20), "attr hex leaked: {:?}", lits);

@@ -1,8 +1,8 @@
-//! `#[callgraph_verify(0xADDR)]` — keep a rebuild function true to the target binary
+//! `#[origin(0xADDR)]` — keep a rebuild function true to the target binary
 //! AT COMPILE TIME. On every build the macro:
 //!
 //!   1. parses ITS OWN function body for the functions it calls,
-//!   2. resolves those names to addresses via the rebuild's `origin:` corpus
+//!   2. resolves those names to addresses via the rebuild's `#[origin(...)]` corpus
 //!      (scanned straight from the source tree — a proc-macro can't see the
 //!      compiler's symbol table, but it can read the files),
 //!   3. disassembles the binary at `0xADDR` and diffs the two call sets.
@@ -13,14 +13,14 @@
 //! omits are `MISSING` (often a faithful inline) — reported, non-fatal unless
 //! `strict_missing` is passed.
 //!
-//! The bare address is enough:  `#[callgraph_verify(0x004028d0)]`
+//! The bare address is enough:  `#[origin(0x004028d0)]`
 //! Optional explicit facts pin individual operands too:
-//!   `#[callgraph_verify(0x0070b780, vtables = [0x00a7e38c], fields = [0xbc])]`
+//!   `#[origin(0x0070b780, vtables = [0x00a7e38c], fields = [0xbc])]`
 //!
 //! ## Environment (set in `.cargo/config.toml` `[env]`)
 //!   * `TARGET_EXE`     — path to the binary (absent → macro is a no-op)
 //!   * `REBUILD_ROOT`   — rebuild source root for the corpus scan (absent →
-//!     the body-diff is skipped; explicit `calls=`/`fields=` checks still run)
+//!     the body-diff is skipped; explicit `fields=` checks still run)
 //!
 //! Strict checks (`DUP-ADDR`, `MISSING`, `ARG-SHAPE`, `HALLUCINATED-ADDR`,
 //! `CFG`) are always on. There used to be `DUP_STRICT=0`,
@@ -45,7 +45,6 @@ pub(crate) mod error;
 
 struct Args {
     addr: u64,
-    calls: Option<(Vec<u64>, bool)>,
     fields: Vec<u64>,
     globals: Vec<u64>,
     vtables: Vec<u64>,
@@ -58,7 +57,7 @@ struct Args {
     unreferenced: bool,
 }
 
-/// What the macro needs to harvest from `#[origin(...)]` / `#[callgraph_verify(...)]`
+/// What the macro needs to harvest from `#[origin(...)]`
 /// for the corpus scanner. Public(crate) so `corpus::scan_item` can reuse the
 /// same parser instead of inventing a parallel one. The proc-macro's own
 /// `verify_impl` builds a richer `Spec` from `Args`; the scanner only needs
@@ -68,7 +67,7 @@ pub(crate) struct OriginAttr {
     pub addr: u64,
 }
 
-/// Parse the inner tokens of `#[origin(…)]` / `#[callgraph_verify(…)]`.
+/// Parse the inner tokens of `#[origin(…)]`.
 /// Accepts a `proc_macro2::TokenStream` so `corpus::scan_item` (which walks
 /// the syn AST) can call it without round-tripping through `proc_macro`.
 pub(crate) fn parse_origin_attr(tokens: proc_macro2::TokenStream) -> syn::Result<OriginAttr> {
@@ -94,7 +93,6 @@ impl Parse for Args {
         let addr: u64 = input.parse::<LitInt>()?.base10_parse()?;
         let mut a = Args {
             addr,
-            calls: None,
             fields: Vec::new(),
             globals: Vec::new(),
             vtables: Vec::new(),
@@ -121,8 +119,7 @@ impl Parse for Args {
                         let msg = format!(
                             "[CG-VERIFY-E002 UNKNOWN-ATTR-FLAG] unknown flag `{other}` in \
                              #[origin(...)] — only `unreferenced` is supported as a bare flag. \
-                             Maybe you meant one of: calls, calls_exact, fields, globals, vtables, \
-                             vcall_slots, iat"
+                             Maybe you meant one of: fields, globals, vtables, vcall_slots, iat"
                         );
                         return Err(syn::Error::new(key.span(), msg));
                     }
@@ -131,8 +128,6 @@ impl Parse for Args {
             input.parse::<Token![=]>()?;
             let vals = array_of_u64(&input.parse::<ExprArray>()?)?;
             match key.to_string().as_str() {
-                "calls" => a.calls = Some((vals, false)),
-                "calls_exact" => a.calls = Some((vals, true)),
                 "fields" => a.fields = vals,
                 "globals" => a.globals = vals,
                 "vtables" => a.vtables = vals,
@@ -141,8 +136,8 @@ impl Parse for Args {
                 other => {
                     let msg = format!(
                         "[CG-VERIFY-E001 UNKNOWN-ATTR-KEY] unknown key `{other}` in \
-                         #[origin(...)] — supported keys: calls, calls_exact, fields, globals, \
-                         vtables, vcall_slots, iat (each takes `= [0xNN, ...]`). Bare flag: \
+                         #[origin(...)] — supported keys: fields, globals, vtables, \
+                         vcall_slots, iat (each takes `= [0xNN, ...]`). Bare flag: \
                          unreferenced"
                     );
                     return Err(syn::Error::new(key.span(), msg));
@@ -221,38 +216,9 @@ fn note(msg: &str) {
     }
 }
 
-/// Compute the set of inlined-marker addresses that the binary still
-/// CALL/JMP/Jccs into from .text. Each is returned as a one-line note
-/// suitable for `note`. Extracted from the macro body so it can be
-/// unit-tested without a proc-macro harness.
-pub(crate) fn inline_marker_mismatches(
-    pe: &callgraph_verify::Pe,
-    inlined: &std::collections::BTreeSet<u64>,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    for &addr in inlined {
-        if callgraph_verify::has_direct_branch_target(pe, addr) {
-            out.push(format!(
-                "INLINE-MARKER MISMATCH: {addr:#010x} is marked `inline:` (or `callgraph-inlined`) \
-                 in the corpus, but the binary still has a real CALL/JMP/Jcc targeting it from .text. \
-                 If the engine only sometimes inlines this helper, ensure the non-inlined call sites \
-                 also have a faithful `#[origin({addr:#010x})]` implementation."
-            ));
-        }
-    }
-    out
-}
-
 /// `#[origin(0xADDR)]` — provenance tag + compile-time call-graph verifier.
-/// See the crate docs. `#[callgraph_verify(..)]` is kept as an alias.
 #[proc_macro_attribute]
 pub fn origin(attr: TokenStream, item: TokenStream) -> TokenStream {
-    verify_impl(attr, item)
-}
-
-/// Alias for [`macro@origin`].
-#[proc_macro_attribute]
-pub fn callgraph_verify(attr: TokenStream, item: TokenStream) -> TokenStream {
     verify_impl(attr, item)
 }
 
@@ -478,7 +444,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let body_calls = &facts.names;
     // Token view of JUST the body block: hex-literal and CFG-keyword harvest
     // operate on tokens, and scoping them to the block keeps attribute
-    // internals (`#[origin(0xA, calls = [0xB])]`) out of both.
+    // internals (`#[origin(0xA, fields = [0xB])]`) out of both.
     let block_ts = fn_like.block().to_token_stream();
 
     // A macro invocation's body is an opaque token stream — calls and loops
@@ -494,7 +460,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             "OPAQUE-MACRO: body of the fn at {:#010x} invokes macro(s) {} — their \
              expansion is not visible to the verifier, so calls/loops inside them \
              escape the HALLUCINATED / MISSING / CFG checks. Inline the work (or \
-             add an explicit `calls = [...]` pin) if it touches ported fns.",
+             pin the relevant `fields = [...]` / `globals = [...]`) if it touches ported fns.",
             args.addr,
             names
                 .iter()
@@ -586,15 +552,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // (1) explicit declared facts, if any.
-    let mut spec = Spec::new(args.addr);
-    if let Some((c, exact)) = &args.calls {
-        spec = if *exact {
-            spec.calls_exact(c)
-        } else {
-            spec.calls_superset(c)
-        };
-    }
-    spec = spec
+    let spec = Spec::new(args.addr)
         .fields(&args.fields)
         .globals(&args.globals)
         .vtables(&args.vtables)
@@ -639,23 +597,6 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             );
         }
 
-        // Inline-marker sanity (always on, non-fatal): every address in
-        // `inlined_markers` was claimed by the porter as "the engine inlined
-        // this" via an `/// inline: 0xADDR` or `/// callgraph-inlined`
-        // marker. If `.text` still contains a CALL/JMP/Jcc targeting that
-        // address, the engine did not (always) inline it — the marker is
-        // either wrong or the engine only sometimes inlines. Either way the
-        // porter should be aware: a faithful non-inlined caller must still
-        // have its own `#[origin(0xADDR)]` implementation. Fired as a
-        // NOTE rather than a fatal error: agents were flipping off similar
-        // fatal warnings to silence builds, and a mixed inlining strategy
-        // (header guards, debug builds, hot/cold paths) is a real pattern.
-        // `note` dedups by full message (which embeds the address), so a
-        // corpus with many markers prints each distinct address at most once.
-        for msg in inline_marker_mismatches(&pe, &map.inlined_markers) {
-            note(&msg);
-        }
-
         // Duplicate-origin check (always on, no escape hatch): a binary fn
         // may be implemented by exactly ONE Rust fn. Mirrors
         // `check_origins.py`'s dup-addr gate, but at compile time and
@@ -685,81 +626,12 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                 );
             }
         }
-        // Fold-in: an `inline:` helper is pasted into the binary at the call site, so
-        // its calls become the caller's calls. Recursively merge every called inline
-        // helper's body calls into this body's call sets — this is what lets the
-        // verifier catch an invented call hidden inside an untagged inline helper.
-        let mut plain = body_calls.plain.clone();
-        let mut method = body_calls.method.clone();
-        let mut work: Vec<String> = plain.iter().chain(method.iter()).cloned().collect();
-        let mut expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Only fold a name that UNAMBIGUOUSLY denotes one inline helper: not a
-        // std/generic name (DENY), not also a real fn/method, and not defined in
-        // multiple places. Bare names like `rd`/`read` mean different things per
-        // module, so folding them by name would inject spurious calls.
-        let foldable = |n: &str| {
-            map.inline_fns.contains_key(n)
-                && !body::DENY.contains(&n)
-                && !map.inline_ambiguous.contains(n)
-                && !map.free_fns.contains_key(n)
-                && !map.methods.contains_key(n)
-        };
-        while let Some(n) = work.pop() {
-            if !foldable(&n) {
-                continue;
-            }
-            if expanded.insert(n.clone()) {
-                let inl = &map.inline_fns[&n];
-                for p in &inl.plain {
-                    plain.insert(p.clone());
-                    work.push(p.clone());
-                }
-                for m in &inl.method {
-                    method.insert(m.clone());
-                    work.push(m.clone());
-                }
-            }
-        }
-        // GUARD against a fold-skip hole: a call to an `inline:` helper that is AMBIGUOUS
-        // (defined inline in >1 place) and is NOT also a free fn / method resolves NOWHERE —
-        // it is neither folded in (above) nor resolved (below). If such a helper's body makes a
-        // ported call, that call silently escapes verification, so a future edit could hide a
-        // hallucination inside it. Force it to be disambiguated (unique name / addr-suffix),
-        // given an `inline: 0xADDR` tag, or `#[origin]`-tagged. (Pure idiom helpers — no ported
-        // call — are harmless and don't trip this.) Fires 0 times on the current tree.
-        // A "ported call" is one that resolves to a real binary address (a free fn / method) —
-        // NOT another addr-less inline helper (those are pure-byte/idiom code with no own CALL,
-        // e.g. a local `rd32` forwarding to the global `rd32`), which would be a false alarm.
-        let resolves_ported = |inl: &body::BodyCalls| {
-            inl.plain.iter().chain(inl.method.iter()).any(|c| {
-                !body::DENY.contains(&c.as_str())
-                    && (map.free_fns.contains_key(c) || map.methods.contains_key(c))
-            })
-        };
-        for n in body_calls.plain.iter().chain(body_calls.method.iter()) {
-            if map.inline_fns.contains_key(n)
-                && !body::DENY.contains(&n.as_str())
-                && map.inline_ambiguous.contains(n)
-                && !map.free_fns.contains_key(n)
-                && !map.methods.contains_key(n)
-                && resolves_ported(&map.inline_fns[n])
-            {
-                errors.push(
-                    error::RichError::new(
-                        error::Code::FoldSkipHole,
-                        format!(
-                            "call to ambiguous `inline:` helper `{n}` resolves nowhere \
-                             (defined inline in >1 place, not also a free fn/method), so \
-                             its ported calls escape verification"
-                        ),
-                    )
-                    .with_fix(format!(
-                        "give `{n}` a unique name (addr-suffix), an `inline: 0xADDR` tag, \
-                         or its own `#[origin]`"
-                    )),
-                );
-            }
-        }
+        // Fold-in was removed: there is exactly ONE annotation form,
+        // `#[origin(0xADDR)]`, and every fn in the rebuild that corresponds
+        // to binary code carries it (a 1:1 mapping). A helper the engine
+        // inlines is not CALLed by the binary, so a faithful port spells the
+        // inlined work inside the caller — it does not call the helper. There
+        // is no doc-comment `inline:` marker and no body fold-in anymore.
         // Resolve plain/path calls against free fns, method calls against methods —
         // so e.g. the CRT free-fn `free()` doesn't resolve to the method `MemoryHeap::Free`.
         let resolve = |names: &std::collections::HashSet<String>,
@@ -777,8 +649,8 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                 })
                 .collect::<Vec<(String, Vec<u64>)>>()
         };
-        let mut rust_idents = resolve(&plain, &map.free_fns);
-        rust_idents.extend(resolve(&method, &map.methods));
+        let mut rust_idents = resolve(&body_calls.plain, &map.free_fns);
+        rust_idents.extend(resolve(&body_calls.method, &map.methods));
         // MISSING-satisfaction set: every address any body call NAME could
         // denote, across BOTH tables, DENY-inclusive and split-agnostic. A
         // qualified path call (`Self::m(..)` / `Type::m(..)`) legitimately
@@ -791,7 +663,11 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         // one (weakest-name-form check): a same-named collateral call can
         // satisfy a MISSING — it can never FIRE a HALLUCINATED.
         let miss_satisfied: std::collections::BTreeSet<u64> =
-            plain.iter().chain(method.iter()).fold(
+            body_calls
+                .plain
+                .iter()
+                .chain(body_calls.method.iter())
+                .fold(
                 std::collections::BTreeSet::new(),
                 |mut acc, n| {
                     if let Some(s) = map.free_fns.get(n) {
@@ -822,14 +698,13 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             &[args.addr],
             &map.corpus,
             &rust_idents,
-            &map.inlined_markers,
             &vtable_methods,
             &miss_satisfied,
         ) {
             Ok(d) => {
                 // VTABLE-DISPATCH: a direct call to a known vtable method — must be a `vcall`.
-                // This is independent of `callgraph-virtual` (the vtable is declared, so the
-                // call CAN be made virtually) — the marker does NOT excuse it.
+                // The vtable is declared, so the call CAN be made virtually — a direct call is
+                // never faithful, regardless of any marker.
                 for (ident, addrs) in &d.vtable_dispatch {
                     let list: Vec<String> = addrs.iter().map(|a| format!("{a:#010x}")).collect();
                     let (va, slot) = addrs
@@ -875,15 +750,17 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                             error::Code::Hallucinated,
                             format!(
                                 "body calls `{ident}` ({}) — binary at {:#010x} never \
-                                 calls (or inlines) it",
+                                 calls it (and no branch target shows it inlined)",
                                 list.join(","),
                                 args.addr
                             ),
                         )
                         .with_span(span)
                         .with_fix(format!(
-                            "remove the call, port `{ident}` at {} with its own \
-                             `#[origin(ADDR)]`, or alias it via `/// inline: ADDR`",
+                            "remove the call, or port `{ident}` at {} with its own \
+                             `#[origin(0xADDR)]`. If the binary inlines this callee, \
+                             reproduce the inlined work directly in this body — calling \
+                             the helper is never faithful",
                             list.first().map(String::as_str).unwrap_or("?")
                         )),
                     );
@@ -911,8 +788,9 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                         error::RichError::new(error::Code::Missing, msg)
                             .with_span(fn_like.attr_target_span())
                             .with_fix(format!(
-                                "add the call (a faithful inline is also fine — add an \
-                                 `/// inline: {a:#010x}` marker so the verifier knows)"
+                                "add the call — the binary has a real CALL to {a:#010x}, \
+                                 so the faithful body must spell it (or reproduce the \
+                                 callee's work inline, matching the binary)"
                             )),
                     );
                 }
@@ -1114,7 +992,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     // share the same root cause (which is common: an unreferenced addr
     // trips E005, E007, E008, E017, E018 all at once).
     eprintln!(
-        "callgraph_verify_macro: #[callgraph_verify({:#010x})]: {} diagnostic(s) below — \
+        "callgraph_verify_macro: #[origin({:#010x})]: {} diagnostic(s) below — \
          the build is gated on every one. Fix each in order (the call-graph check \
          runs FIRST in the next build, so removing a hallucination can cascade-clear \
          other errors). Run with `-vv` to see this header.",
@@ -1343,10 +1221,9 @@ pub fn vtable_table(input: TokenStream) -> TokenStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{inline_marker_mismatches, vtable_method_map, vtable_only_dispatch_msg, CacheKey};
+    use super::{vtable_method_map, vtable_only_dispatch_msg, CacheKey};
     use crate::Pe;
     use quote::{quote, ToTokens};
-    use std::collections::BTreeSet;
 
     #[test]
     fn function_body_token_stream_preserves_cfg_keywords() {
@@ -1509,243 +1386,4 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
-    // inline_marker_mismatches — fake-inline detector
-    //
-    // An `/// inline: 0xADDR` or `/// callgraph-inlined` marker says
-    // "the engine inlined this here." If `.text` still has a real
-    // CALL/JMP/Jcc targeting that address, the marker is suspect —
-    // either the porter got the inlining strategy wrong, or the engine
-    // only sometimes inlines. These tests pin the detector's two paths:
-    //
-    //   1. The address HAS a real CALL → mismatch note emitted.
-    //   2. The address has NO real CALL (truly inlined) → no note.
-    // -----------------------------------------------------------------
-
-    /// Build a minimal PE for the inline-marker tests with a single
-    /// `.text` section containing `code` at offset 0x1000. Returns the PE
-    /// and the entry VA (image_base + 0x1000).
-    fn build_pe_with_code(code: &[u8]) -> (Pe, u64) {
-        build_pe_with_text_len(code, code.len())
-    }
-
-    /// Same builder with `.text` padded to `text_len` bytes (zeros beyond
-    /// `code`) — used by the perf-regression guards below to model a
-    /// multi-MB target image like noivilbo.exe's 6.4 MB `.text`.
-    fn build_pe_with_text_len(code: &[u8], text_len: usize) -> (Pe, u64) {
-        assert!(text_len >= code.len());
-        let image_base: u32 = 0x0040_0000;
-        let text_va: u32 = 0x1000;
-        let e_lfanew: u32 = 0x40;
-        let text_raw: u32 = ((text_len + 0x1ff) & !0x1ff).max(0x200) as u32;
-        // Section raw data lives at file offset `text_raw` and spans
-        // `text_raw` bytes (raw_offset == raw_size == text_raw), so the file
-        // must be ~2× text_raw long — a shorter buffer truncates every
-        // `Pe::read` at EOF.
-        let mut data: Vec<u8> = vec![0; 0x400 + text_raw as usize * 2];
-        data[0..2].copy_from_slice(b"MZ");
-        data[0x3c..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
-        let pe_off = e_lfanew as usize;
-        data[pe_off..pe_off + 4].copy_from_slice(b"PE\0\0");
-        let coff = pe_off + 4;
-        data[coff..coff + 2].copy_from_slice(&0x014cu16.to_le_bytes());
-        data[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes());
-        data[coff + 16..coff + 18].copy_from_slice(&0x60u16.to_le_bytes());
-        let opt = coff + 20;
-        data[opt..opt + 2].copy_from_slice(&0x010bu16.to_le_bytes());
-        data[opt + 28..opt + 32].copy_from_slice(&image_base.to_le_bytes());
-        let sec_off = opt + 0x60;
-        data[sec_off..sec_off + 8].copy_from_slice(b".text\0\0\0");
-        data[sec_off + 8..sec_off + 12].copy_from_slice(&text_raw.to_le_bytes());
-        data[sec_off + 12..sec_off + 16].copy_from_slice(&text_va.to_le_bytes());
-        data[sec_off + 16..sec_off + 20].copy_from_slice(&text_raw.to_le_bytes());
-        data[sec_off + 20..sec_off + 24].copy_from_slice(&text_raw.to_le_bytes());
-        let code_off = text_raw as usize;
-        data[code_off..code_off + code.len()].copy_from_slice(code);
-        (
-            Pe::parse(data).expect("parse"),
-            image_base as u64 + text_va as u64,
-        )
-    }
-
-    /// `inline_marker_mismatches` returns a note for any `inlined_markers`
-    /// address that has a real CALL/JMP/Jcc targeting it from `.text`. This
-    /// is the "fake inline" detector: a porter marked something as inlined,
-    /// but the binary still calls it normally — either the marker is wrong
-    /// or the engine only sometimes inlines.
-    #[test]
-    fn inline_marker_mismatch_detects_address_with_real_call() {
-        // Layout:
-        //   entry at 0x00401000: CALL 0x00401006 ; RET
-        //   target at 0x00401006: RET
-        // The CALL at 0x00401000 targets 0x00401006. The corpus marks
-        // 0x00401006 as inlined → the detector should flag it.
-        let target_va = 0x0040_1006u64;
-        let code = [
-            0xE8, 0x01, 0x00, 0x00, 0x00, // CALL +1 → 0x00401006
-            0xC3, // RET at 0x00401005
-            0xC3, // RET at 0x00401006 (the target)
-        ];
-        let (pe, _entry) = build_pe_with_code(&code);
-        let mut inlined = BTreeSet::new();
-        inlined.insert(target_va);
-        let notes = inline_marker_mismatches(&pe, &inlined);
-        assert_eq!(
-            notes.len(),
-            1,
-            "expected 1 mismatch note for {target_va:#x}, got {}: {:?}",
-            notes.len(),
-            notes
-        );
-        assert!(
-            notes[0].contains(&format!("{target_va:#010x}")),
-            "note should name the address: {}",
-            notes[0]
-        );
-        assert!(
-            notes[0].contains("INLINE-MARKER MISMATCH"),
-            "note should self-identify: {}",
-            notes[0]
-        );
-    }
-
-    /// Sanity: when the binary has NO real CALL targeting the inlined
-    /// address, no note is emitted (the engine really did inline it).
-    /// Without this guard, every `/// inline: 0xADDR` would generate noise.
-    #[test]
-    fn inline_marker_no_note_for_truly_inlined_address() {
-        // .text contains only RET; nothing targets any address. An
-        // inlined marker at any executable address should pass silently.
-        let (pe, entry) = build_pe_with_code(&[0xC3]);
-        let mut inlined = BTreeSet::new();
-        // Pick an address *outside* .text on purpose — `has_direct_branch_target`
-        // would return false trivially (no .text byte encodes a CALL to it),
-        // but in production the corpus only registers addresses that ARE
-        // fn entries, so this is a strict-but-realistic test.
-        inlined.insert(entry + 4);
-        let notes = inline_marker_mismatches(&pe, &inlined);
-        assert!(
-            notes.is_empty(),
-            "no mismatch expected (binary has no CALL to {:#x}): {:?}",
-            entry + 4,
-            notes
-        );
-    }
-
-    /// Empty `inlined_markers` set → empty output. Guards against an
-    /// over-eager implementation that synthesises notes for unmarked
-    /// addresses.
-    #[test]
-    fn inline_marker_empty_set_produces_no_notes() {
-        let (pe, _entry) = build_pe_with_code(&[0xC3]);
-        let notes = inline_marker_mismatches(&pe, &BTreeSet::new());
-        assert!(
-            notes.is_empty(),
-            "empty set must yield zero notes: {notes:?}"
-        );
-    }
-
-    /// Mixed set: one address with a real CALL, one without. Only the
-    /// first should produce a note. Pin the filter is per-address, not
-    /// "all or nothing".
-    #[test]
-    fn inline_marker_partial_set_only_flags_real_calls() {
-        // Build a .text with one CALL to target_a; nothing targets target_b.
-        let target_a = 0x0040_1006u64;
-        let target_b = 0x0040_2000u64; // outside this PE — no CALL anywhere
-        let code = [
-            0xE8, 0x01, 0x00, 0x00, 0x00, // CALL +1 → 0x00401006
-            0xC3, // RET at 0x00401005
-            0xC3, // RET at 0x00401006 (target_a)
-        ];
-        let (pe, _entry) = build_pe_with_code(&code);
-        let mut inlined = BTreeSet::new();
-        inlined.insert(target_a);
-        inlined.insert(target_b);
-        let notes = inline_marker_mismatches(&pe, &inlined);
-        assert_eq!(
-            notes.len(),
-            1,
-            "expected exactly 1 note (target_a), got {}: {:?}",
-            notes.len(),
-            notes
-        );
-        assert!(
-            notes[0].contains(&format!("{target_a:#010x}")),
-            "note should name target_a: {}",
-            notes[0]
-        );
-        assert!(
-            !notes[0].contains(&format!("{target_b:#010x}")),
-            "note should NOT name target_b: {}",
-            notes[0]
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Performance-regression guards (the disasm-layer twins live in
-    // callgraph-verify/tests/perf.rs). inline_marker_mismatches used to
-    // trigger a full .text byte-scan PER MARKER per #[origin] expansion —
-    // ~77 markers × 6.4 MB on every tagged fn, which turned elder-engine-rs
-    // builds into a ~30-minute scan-fest. The one-pass all-branch-targets
-    // cache fixed it; these tests fail if per-call rescanning ever returns.
-    //
-    // The timing assertion is SELF-CALIBRATING: it compares one
-    // inline_marker_mismatches call (100 markers) against the measured
-    // one-time warmup cost (first .text decode + one scan) on the same PE.
-    // A cached implementation runs the 100-marker call in microseconds
-    // (~1000× margin); a rescan-per-marker implementation costs ~100 scans
-    // and exceeds the warmup cost ~100× in both debug and release.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn inline_marker_mismatches_many_markers_on_large_text_are_not_rescans() {
-        // One real `CALL rel32 ; RET` at the start of .text (rel 0 → the CALL
-        // targets its own next_ip, entry+5) → the marker at entry+5 must be
-        // flagged; the other 99 markers are misses (worst case for the old
-        // scanner, which walked all of .text to conclude a miss).
-        let (pe, entry) =
-            build_pe_with_text_len(&[0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3], 4 * 1024 * 1024);
-        let hit = entry + 5;
-
-        // Measure the one-time warmup (decode + first scan) on a miss.
-        let t0 = std::time::Instant::now();
-        assert!(!callgraph_verify::has_direct_branch_target(
-            &pe,
-            entry + 0x400
-        ));
-        let warmup = t0.elapsed();
-        assert!(
-            warmup.as_millis() > 0,
-            "warmup did no measurable work — test PE too small to calibrate against"
-        );
-
-        let mut inlined = BTreeSet::new();
-        inlined.insert(hit);
-        for k in 1..100u64 {
-            inlined.insert(entry + 0x400 + k * 8);
-        }
-        let t1 = std::time::Instant::now();
-        let notes = inline_marker_mismatches(&pe, &inlined);
-        let elapsed = t1.elapsed();
-
-        // Correctness must hold at this scale too: exactly the targeted
-        // marker is flagged.
-        assert_eq!(
-            notes.len(),
-            1,
-            "exactly the targeted marker fires: {notes:?}"
-        );
-        assert!(
-            notes[0].contains(&format!("{hit:#010x}")),
-            "note names the targeted marker: {}",
-            notes[0]
-        );
-        assert!(
-            elapsed * 10 < warmup,
-            "inline_marker_mismatches over 100 markers took {elapsed:?} vs {warmup:?} \
-             warmup — has_direct_branch_target is rescanning .text per marker; \
-             the all-branch-targets cache was dropped or its key stopped matching"
-        );
-    }
 }

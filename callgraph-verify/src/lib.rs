@@ -363,8 +363,8 @@ pub struct CorpusDiff {
     /// Rust calls a ported fn the binary inlines — reclassified faithful.
     pub inlined_ok: Vec<String>,
     /// Rust DIRECTLY calls a method the binary dispatches through a known (declared) vtable —
-    /// the faithful form is a `vcall`. NOT excused by a `callgraph-virtual` marker, because the
-    /// vtable is built so the call CAN be made virtually.
+    /// the faithful form is a `vcall`. Once the vtable is declared, the call CAN be made
+    /// virtually, so it MUST be one.
     pub vtable_dispatch: Vec<(String, Vec<u64>)>,
     /// Binary calls a ported fn the Rust body doesn't (often inlined; review).
     pub missing: Vec<u64>,
@@ -380,8 +380,9 @@ fn is_inlined_into(pe: &Pe, callee: u64, caller_fp: &BTreeSet<u64>) -> bool {
             // accessor) or a single shared call target is a subset of almost any
             // caller that touches the same thing — that's coincidence, not
             // inlining, and accepting it would excuse an invented call. Trivial
-            // single-element callees that really were inlined need an explicit
-            // `/// inline: 0xADDR` marker instead of footprint evidence.
+            // single-element callees can't be footprint-confirmed, so the
+            // faithful port reproduces the inlined work inside the caller —
+            // it does not call the helper.
             fp.len() >= 2 && fp.is_subset(caller_fp)
         }
         Err(_) => false,
@@ -397,7 +398,6 @@ pub fn diff_body_calls(
     own_addrs: &[u64],
     corpus: &BTreeSet<u64>,
     rust_idents: &[(String, Vec<u64>)],
-    inlined_markers: &BTreeSet<u64>,
     vtable_methods: &BTreeSet<u64>,
     miss_satisfied: &BTreeSet<u64>,
 ) -> Result<CorpusDiff, String> {
@@ -477,15 +477,11 @@ pub fn diff_body_calls(
             continue; // faithful: binary inlined the callee (footprint-confirmed)
         }
         // Known (declared) vtable method the binary doesn't directly call → it is dispatched
-        // virtually; the faithful form is a `vcall`. This takes precedence over a
-        // `callgraph-virtual` marker: the vtable exists, so the call CAN and MUST be virtual.
+        // virtually; the faithful form is a `vcall`. The vtable exists, so the call CAN and
+        // MUST be virtual — no other form is faithful.
         if aset.iter().any(|a| vtable_methods.contains(a)) {
             vtable_dispatch.push((ident.clone(), aset));
             continue;
-        }
-        if aset.iter().any(|a| inlined_markers.contains(a)) {
-            inlined_ok.push(ident.clone());
-            continue; // faithful: callee carries an explicit `callgraph-inlined` marker
         }
         hallucinated.push((ident.clone(), aset));
     }

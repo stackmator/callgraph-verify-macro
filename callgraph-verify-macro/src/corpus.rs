@@ -2,10 +2,8 @@
 //! tree. A proc-macro can't see the compiler's symbol table, but it can read the
 //! files — so we harvest every function's declared origin address from its tag.
 //!
-//! Three tag forms are recognized, each associated with the `fn NAME` below it:
-//!   * `#[origin(0x004028d0)]`        — the structured attribute (preferred)
-//!   * `#[callgraph_verify(0x..)]`    — the verifier attribute (alias)
-//!   * `/// origin: 0x004028d0`       — the legacy doc-comment convention
+//! Only one tag form is recognized, associated with the `fn NAME` below it:
+//!   * `#[origin(0x004028d0)]` — the provenance tag + verifier attribute
 //!
 //! Scanned once per compiler process and cached.
 
@@ -13,11 +11,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use syn::{
-    parse_file as syn_parse_file, Attribute, Expr, FnArg, ImplItem, ImplItemFn, Item, ItemFn, Lit,
-    Meta, Signature, TraitItem, TraitItemFn,
+    parse_file as syn_parse_file, Attribute, FnArg, ImplItem, ImplItemFn, Item, ItemFn, Meta,
+    Signature, TraitItem, TraitItemFn,
 };
 
-use crate::body::BodyCalls;
 use crate::{parse_origin_attr, VtableTable};
 
 pub struct Corpus {
@@ -31,17 +28,6 @@ pub struct Corpus {
     /// with >1 owner here is a duplicate (mirrors `check_origins.py`'s dup-addr check).
     pub addr_owners: HashMap<u64, Vec<String>>,
     pub corpus: BTreeSet<u64>,
-    /// `inline:`-tagged helpers (no own address) → the calls in their body. The
-    /// binary inlines these into callers, so a caller's verification folds in these
-    /// calls — catching an invented call hidden inside an untagged inline helper.
-    pub inline_fns: HashMap<String, BodyCalls>,
-    /// Inline-helper names defined in more than one place (e.g. a per-module `rd`).
-    /// Bare-name fold-in can't tell which one a caller meant, so these are skipped.
-    pub inline_ambiguous: HashSet<String>,
-    /// Origin addresses of fns carrying a `callgraph-inlined` marker: the binary inlines
-    /// the callee into its callers, so a direct Rust call to it is faithful even though
-    /// no caller shows a direct `CALL 0xADDR`.
-    pub inlined_markers: BTreeSet<u64>,
     /// `(engine vtable VA, slot count)` for every `vtable_table!` the rebuild declares.
     /// Lets the verifier read those engine vtables from the PE and recognize which call
     /// targets are virtual methods (→ "use vcall, not a direct call").
@@ -77,9 +63,6 @@ fn build(root: &str) -> Corpus {
         addr2name: HashMap::new(),
         addr_owners: HashMap::new(),
         corpus: BTreeSet::new(),
-        inline_fns: HashMap::new(),
-        inline_ambiguous: HashSet::new(),
-        inlined_markers: BTreeSet::new(),
         declared_vtables: Vec::new(),
     };
     let root_path = std::path::Path::new(root);
@@ -92,9 +75,8 @@ fn build(root: &str) -> Corpus {
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        // syn-based scan: every comment-vs-attribute-vs-code ambiguity is
-        // resolved by the Rust parser; the only text matching left is inside
-        // doc-comment strings, which are legitimate plain text.
+        // syn-based scan: the Rust parser resolves every comment-vs-attribute-vs-code
+        // ambiguity; only structured attributes carry provenance facts, never comments.
         let Ok(file) = syn_parse_file(&text) else {
             continue;
         };
@@ -157,48 +139,37 @@ fn path_is(path: &syn::Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Harvest a free `fn`'s origin and inline annotations.
+/// Harvest a free `fn`'s origin annotation.
 fn scan_fn(f: &ItemFn, disp_path: &str, c: &mut Corpus) {
     let name = f.sig.ident.to_string();
     let is_method = is_method_sig(&f.sig);
-    scan_attrs_and_record(&f.attrs, &name, is_method, Some(&f.block), disp_path, c);
+    scan_attrs_and_record(&f.attrs, &name, is_method, disp_path, c);
 }
 
-/// Harvest an `impl`-block method's origin and inline annotations.
+/// Harvest an `impl`-block method's origin annotation.
 fn scan_impl_fn(m: &ImplItemFn, disp_path: &str, c: &mut Corpus) {
     let name = m.sig.ident.to_string();
     let is_method = true; // `self` is implicit inside an impl block
-    scan_attrs_and_record(&m.attrs, &name, is_method, Some(&m.block), disp_path, c);
+    scan_attrs_and_record(&m.attrs, &name, is_method, disp_path, c);
 }
 
-/// Harvest a trait method's origin and inline annotations (a trait default body).
+/// Harvest a trait method's origin annotation (a trait default body).
 fn scan_trait_fn(m: &TraitItemFn, disp_path: &str, c: &mut Corpus) {
     let name = m.sig.ident.to_string();
     let is_method = true;
-    let block = m.default.as_ref();
-    scan_attrs_and_record(&m.attrs, &name, is_method, block, disp_path, c);
+    scan_attrs_and_record(&m.attrs, &name, is_method, disp_path, c);
 }
 
-/// Walk an attribute list looking for `#[origin(0xA)]` / `#[callgraph_verify(0xA)]`,
-/// `#[doc = "inline: ..."]` / `#[doc = "callgraph-inlined"]`, and the
-/// `inline:` and `unreferenced` flags. Record everything into `c`.
-fn scan_attrs_and_record(
-    attrs: &[Attribute],
-    name: &str,
-    is_method: bool,
-    body: Option<&syn::Block>,
-    disp_path: &str,
-    c: &mut Corpus,
-) {
+/// Walk an attribute list looking for `#[origin(0xA)]`
+/// and the `unreferenced` flag. Record every origin address into `c`.
+fn scan_attrs_and_record(attrs: &[Attribute], name: &str, is_method: bool, disp_path: &str, c: &mut Corpus) {
     let mut addrs: Vec<u64> = Vec::new();
-    let mut inline_body = false;
-    let mut cginlined = false;
 
     for attr in attrs {
         match &attr.meta {
-            Meta::Path(p) => {
-                // Bare path attributes don't carry origin addresses.
-                let _ = p;
+            Meta::Path(_) | Meta::NameValue(_) => {
+                // Bare-path and name-value attributes (doc comments, derives, …)
+                // carry no structured origin facts — they are ignored.
             }
             Meta::List(m) => {
                 // Match on the LAST segment of the path: the macro is typically
@@ -208,7 +179,7 @@ fn scan_attrs_and_record(
                 // qualified `#[origin]` tag in the workspace, then the
                 // CORPUS-GAP self-check fired for every fn (it looked like the
                 // scanner saw zero origins). Same helper as vtable_table below.
-                if !path_is(attr.path(), "origin") && !path_is(attr.path(), "callgraph_verify") {
+                if !path_is(attr.path(), "origin") {
                     continue;
                 }
                 // The token stream between the parens — `parse_origin_attr`
@@ -217,66 +188,11 @@ fn scan_attrs_and_record(
                     addrs.push(o.addr);
                 }
             }
-            Meta::NameValue(nv) if nv.path.is_ident("doc") => {
-                // Doc comments are stored as `#[doc = "..."]` by syn.
-                if let Expr::Lit(el) = &nv.value {
-                    if let Lit::Str(s) = &el.lit {
-                        let txt = s.value();
-                        if txt.contains("callgraph-inlined") || txt.contains("callgraph-virtual") {
-                            cginlined = true;
-                        }
-                        // `inline: 0x0070b780 (...)` — parse the address.
-                        // `inline: flag accessor` — no address, fall back to
-                        // body fold-in via `inline_body`.
-                        if let Some(addr) = parse_inline_addr(&txt) {
-                            addrs.push(addr);
-                            cginlined = true;
-                        } else if txt.trim_start().starts_with("inline:") {
-                            inline_body = true;
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
     if !addrs.is_empty() {
-        record_fn_addresses(&addrs, name, is_method, cginlined, disp_path, c);
-    } else if inline_body {
-        // Untagged inline helper: capture the calls in its body so callers
-        // can fold them in. Same syn-visitor path as the verifier itself.
-        if let Some(block) = body {
-            if c.inline_fns
-                .insert(
-                    name.to_string(),
-                    crate::body::collect_block_facts(block).names,
-                )
-                .is_some()
-            {
-                c.inline_ambiguous.insert(name.to_string());
-            }
-        }
-    }
-}
-
-/// Pull a single 0x… address out of an `inline: <addr> …` doc-comment. Returns
-/// `None` if the comment is `inline: <no-addr>`. Image-base floor (0x40_0000)
-/// filters out incidental small hex like vtable slots.
-fn parse_inline_addr(txt: &str) -> Option<u64> {
-    let after = txt.trim_start().strip_prefix("inline:")?.trim_start();
-    // Take the first whitespace-delimited token.
-    let first = after.split_whitespace().next()?;
-    if !first.starts_with("0x") && !first.starts_with("0X") {
-        return None;
-    }
-    // Strip Rust `_` digit separators (e.g. `0xAFFE_BABE`) before parsing.
-    let stripped: String = first[2..].chars().filter(|c| *c != '_').collect();
-    let v = u64::from_str_radix(&stripped, 16).ok()?;
-    if v >= 0x40_0000 {
-        Some(v)
-    } else {
-        None
+        record_fn_addresses(&addrs, name, is_method, disp_path, c);
     }
 }
 
@@ -284,7 +200,6 @@ fn record_fn_addresses(
     addrs: &[u64],
     name: &str,
     is_method: bool,
-    cginlined: bool,
     disp_path: &str,
     c: &mut Corpus,
 ) {
@@ -305,9 +220,6 @@ fn record_fn_addresses(
         set.insert(a);
         c.addr2name.entry(a).or_insert_with(|| name.to_string());
         c.corpus.insert(a);
-        if cginlined {
-            c.inlined_markers.insert(a);
-        }
         if seen_here.insert(a) {
             c.addr_owners.entry(a).or_default().push(label.clone());
         }
@@ -318,10 +230,11 @@ fn record_fn_addresses(
 // caller handles parse errors by skipping the file.
 //
 // (Note: the previous text-matching helpers — find_kv, hex_addrs, fn_sig,
-// skip_generics, grab_body, scan_file — are no longer needed. syn parses
-// every file into structured Items; the only string matching left is inside
-// doc-comment contents (legitimate plain text). Tests for the old helpers
-// are replaced with syn-based equivalents below.)
+// skip_generics, grab_body, scan_file — and the doc-comment `inline:` /
+// `callgraph-inlined` / `origin:` scanning are all gone. syn parses every
+// file into structured Items, and provenance facts come ONLY from the
+// `#[origin(..)]` attributes. Tests for the old
+// helpers are replaced with syn-based equivalents below.)
 
 /// True if the function's first parameter is a `self` receiver.
 fn is_method_sig(sig: &Signature) -> bool {
@@ -354,7 +267,7 @@ fn rust_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_cached, parse_inline_addr, scan_item, Corpus};
+    use super::{build_cached, scan_item, Corpus};
 
     /// Build a Corpus and run every item in `text` through `scan_item` (the
     /// syn-based walker). Mirrors what `build()` does for one file.
@@ -365,9 +278,6 @@ mod tests {
             addr2name: std::collections::HashMap::new(),
             addr_owners: std::collections::HashMap::new(),
             corpus: std::collections::BTreeSet::new(),
-            inline_fns: std::collections::HashMap::new(),
-            inline_ambiguous: std::collections::HashSet::new(),
-            inlined_markers: std::collections::BTreeSet::new(),
             declared_vtables: Vec::new(),
         };
         let file = syn::parse_file(text).expect("parse");
@@ -384,33 +294,24 @@ mod tests {
         crate::body::collect_block_facts(&block)
     }
 
-    // --- parse_inline_addr -------------------------------------------------
-
-    #[test]
-    fn parse_inline_addr_basic() {
-        assert_eq!(
-            parse_inline_addr("inline: 0x004028d0 (foo)").unwrap(),
-            0x004028d0
-        );
-        assert_eq!(
-            parse_inline_addr("inline: 0xAFFE_BABE").unwrap(),
-            0xAFFEBABE
-        );
-    }
-
-    #[test]
-    fn parse_inline_addr_no_addr() {
-        // No address after `inline:` → None (caller falls back to body fold-in).
-        assert!(parse_inline_addr("inline: flag accessor").is_none());
-    }
-
-    #[test]
-    fn parse_inline_addr_small_hex_filtered() {
-        // Below 0x40_0000 → filtered out as incidental hex (vtable slot, offset).
-        assert!(parse_inline_addr("inline: 0x84").is_none());
-    }
-
     // --- syn-based scan ----------------------------------------------------
+
+    /// Regression: the old doc-comment `/// inline:` / `/// callgraph-inlined`
+    /// conventions are gone. Comments carry no structured facts — a doc comment
+    /// mentioning `inline:` must NOT create an origin or any corpus entry.
+    #[test]
+    fn syn_scan_inline_doc_comment_does_not_affect_corpus() {
+        let c = scan_text(
+            "\
+#[origin(0x004028d0)]
+/// inline: 0x0070b780 (typed entry over [ni_node_ctor])
+pub unsafe fn foo() {}
+",
+        );
+        assert_eq!(c.corpus.len(), 1, "expected only the attribute's addr: {:?}", c.corpus);
+        assert!(c.corpus.contains(&0x004028d0));
+        assert!(!c.corpus.contains(&0x0070b780));
+    }
 
     #[test]
     fn syn_scan_picks_up_free_fn_with_origin() {
@@ -497,14 +398,6 @@ impl S {
         assert!(c.corpus.contains(&0x004028d0));
     }
 
-    /// `#[callgraph_verify(0xA)]` is an alias for `#[origin(0xA)]`.
-    #[test]
-    fn syn_scan_picks_up_callgraph_verify_alias() {
-        let c = scan_text("#[callgraph_verify(0x004028d0)] pub unsafe fn foo() {}");
-        assert!(c.free_fns.contains_key("foo"));
-        assert!(c.corpus.contains(&0x004028d0));
-    }
-
     /// Regression: `#[callgraph_verify_macro::origin(VA)]` (the FULL path the
     /// macro is actually invoked with, three segments, not one) was silently
     /// dropped because the scanner checked `attr.path().is_ident("origin")`
@@ -525,65 +418,6 @@ impl S {
             "qualified origin addr missing from corpus: {:?}",
             c.corpus
         );
-    }
-
-    #[test]
-    fn syn_scan_picks_up_qualified_callgraph_verify_alias_path() {
-        let c = scan_text(
-            "#[callgraph_verify_macro::callgraph_verify(0x004028d1)] pub unsafe fn bar() {}",
-        );
-        assert!(c.free_fns.contains_key("bar"), "{:?}", c.free_fns);
-        assert!(c.corpus.contains(&0x004028d1), "{:?}", c.corpus);
-    }
-
-    /// `/// inline: 0xA …` doc-comment with an address → records the addr,
-    /// marks it as inlinable.
-    #[test]
-    fn syn_scan_inline_with_address_records_origin() {
-        let c = scan_text(
-            "\
-/// inline: 0x0070b780 (typed entry over [ni_node_ctor])
-pub unsafe fn helper() {}
-",
-        );
-        assert!(c.free_fns.contains_key("helper"));
-        assert!(c.corpus.contains(&0x0070b780));
-        assert!(c.inlined_markers.contains(&0x0070b780));
-    }
-
-    /// `/// inline: <no-addr>` → captures body calls for fold-in.
-    #[test]
-    fn syn_scan_inline_without_address_captures_body() {
-        let c = scan_text(
-            "\
-/// inline: flag accessor
-pub unsafe fn flag_helper() { real_callee(); }
-fn real_callee() {}
-",
-        );
-        assert!(c.inline_fns.contains_key("flag_helper"));
-        let bc = &c.inline_fns["flag_helper"];
-        assert!(
-            bc.plain.contains("real_callee"),
-            "real_callee should be in the captured body calls: plain={:?}, method={:?}",
-            bc.plain,
-            bc.method
-        );
-    }
-
-    /// `/// callgraph-inlined` and `/// callgraph-virtual` markers register
-    /// the fn's address as inlinable (faithful direct call) regardless of
-    /// whether the binary CALLs it.
-    #[test]
-    fn syn_scan_callgraph_inlined_marks_addr() {
-        let c = scan_text(
-            "\
-/// callgraph-inlined
-#[origin(0x004028d0)]
-pub unsafe fn foo() {}
-",
-        );
-        assert!(c.inlined_markers.contains(&0x004028d0));
     }
 
     /// `vtable_table!` macro invocation is parsed via syn::parse_file; the
@@ -646,8 +480,9 @@ fn helper() {}
         assert!(c.corpus.contains(&0x004028d0));
     }
 
-    /// Multiple addresses in one `#[origin]` should each be recorded as the
-    /// fn's address (rare but supported via the dual-tag convention).
+    /// A doc comment mentioning `origin:` (the legacy convention) alongside the
+    /// real attribute must NOT double-register the owner: comments carry no
+    /// structured facts, so only the `#[origin]` records the address.
     #[test]
     fn syn_scan_dual_tag_does_not_duplicate_owner() {
         let c = scan_text(

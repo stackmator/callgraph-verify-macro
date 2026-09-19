@@ -19,7 +19,7 @@
 //! `error.rs::all_codes_have_stable_prefix_label_and_prefix_string`:
 //! E001 UNKNOWN-ATTR-KEY, E002 UNKNOWN-ATTR-FLAG, E003 NOT-A-FUNCTION,
 //! E004 TARGET-EXE-UNLOADABLE, E007 DECLARED-FACTS, E009 DUP-ADDR,
-//! E010 FOLD-SKIP HOLE, E011 VTABLE-DISPATCH, E012 HALLUCINATED,
+//! E011 VTABLE-DISPATCH, E012 HALLUCINATED,
 //! E013 MISSING, E014 ARG-SHAPE, E015 HALLUCINATED-ADDR, E016 CFG,
 //! E017 ANALYZE, E018 CFG-FINGERPRINT, E019 VTABLE-SLOT, E020 VTABLE-SLOT-OOB.
 //!
@@ -163,13 +163,8 @@ fn build_synthetic_pe() -> Vec<u8> {
 /// The corpus is set up for several fixtures:
 ///   - `lib.rs` declares `#[origin(0x401000)]` for `probe`, so CORPUS-GAP
 ///     does NOT fire when a fixture targets 0x401000.
-///   - `amb_a.rs` and `amb_b.rs` each define `amb()` as an `/// inline:`
-///     helper that calls `real_call()`. Two same-named inline helpers make
-///     `amb` ambiguous — this is the precondition for E010 FOLD-SKIP HOLE
-///     when the fixture body calls `amb()`.
-///   - `real_call.rs` declares `#[origin(0x00402000)]` for `real_call`,
-///     so `amb`'s body makes a "ported call" (resolves to a real binary
-///     address) — also required for E010.
+///   - `real_call.rs` declares `#[origin(0x00402000)]` for `real_call` —
+///     a body-call target with a corpus entry.
 fn setup_testdata(manifest_dir: &Path) -> (PathBuf, PathBuf) {
     let testdata = manifest_dir.join("tests").join("testdata");
     std::fs::create_dir_all(&testdata).expect("create tests/testdata");
@@ -188,28 +183,6 @@ fn setup_testdata(manifest_dir: &Path) -> (PathBuf, PathBuf) {
          pub fn probe_duplicate() {}\n",
     )
     .expect("write corpus lib.rs");
-    // Two same-named inline helpers in separate files — the scanner
-    // collects them under `inline_fns["amb"]` and marks `amb` as
-    // `inline_ambiguous`. Each helper calls `real_call()`, which resolves
-    // to `#[origin(0x00402000)]` in the corpus — so the ambiguous-helper
-    // body makes a "ported call" and E010's guard fires when the fixture
-    // body itself calls `amb()`.
-    std::fs::write(
-        corpus_dir.join("amb_a.rs"),
-        "use callgraph_verify_macro::origin;\n\
-         /// inline: <no-addr>\n\
-         #[allow(dead_code)]\n\
-         pub fn amb() { real_call(); }\n",
-    )
-    .expect("write corpus amb_a.rs");
-    std::fs::write(
-        corpus_dir.join("amb_b.rs"),
-        "use callgraph_verify_macro::origin;\n\
-         /// inline: <no-addr>\n\
-         #[allow(dead_code)]\n\
-         pub fn amb() { real_call(); }\n",
-    )
-    .expect("write corpus amb_b.rs");
     std::fs::write(
         corpus_dir.join("real_call.rs"),
         "use callgraph_verify_macro::origin;\n\
@@ -307,7 +280,6 @@ fn ui() {
             "tests/ui/e007_declared_facts.rs",
             "tests/ui/e008_corpus_gap.rs",
             "tests/ui/e009_dup_addr.rs",
-            "tests/ui/e010_fold_skip_hole.rs",
             "tests/ui/e011_vtable_dispatch.rs",
             "tests/ui/e012_hallucinated.rs",
             "tests/ui/e013_missing.rs",
