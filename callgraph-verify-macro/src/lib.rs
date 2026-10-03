@@ -42,6 +42,7 @@ use callgraph_verify::{analyze, cfg_fingerprint, diff_body_calls, reg_params, Ar
 mod body;
 mod corpus;
 pub(crate) mod error;
+mod expand;
 
 struct Args {
     addr: u64,
@@ -440,27 +441,43 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             return quote! { #err #item2 }.into();
         }
     };
-    let facts = body::collect_block_facts(fn_like.block());
-    let body_calls = &facts.names;
     // Token view of JUST the body block: hex-literal and CFG-keyword harvest
     // operate on tokens, and scoping them to the block keeps attribute
     // internals (`#[origin(0xA, fields = [0xB])]`) out of both.
-    let block_ts = fn_like.block().to_token_stream();
+    // Unambiguous local `macro_rules!` invocations are expanded first so
+    // all three harvests (calls, CFG keywords, hex literals) see through
+    // them; anything without a single local definition stays opaque (and
+    // the OPAQUE-MACRO note below still fires for it).
+    let macro_defs = std::env::var("REBUILD_ROOT")
+        .ok()
+        .map(|root| corpus::corpus_map(&root).macro_defs.clone());
+    let (facts, block_ts, fell_back) =
+        expand::expand_and_collect(fn_like.block(), macro_defs.as_ref());
+    if fell_back {
+        note(
+            "macro expansion produced unparseable tokens; falling back \
+             to the unexpanded body (opaque macros stay invisible)",
+        );
+    }
+    let body_calls = &facts.names;
 
-    // A macro invocation's body is an opaque token stream — calls and loops
-    // inside it are INVISIBLE to every check below. Silent invisibility is
-    // exactly the escape hatch this macro exists to close, so surface it as
-    // a loud (non-fatal) note; the build stays green but the note is impossible
-    // to miss in -vv output / CI logs.
+    // A macro invocation whose definition cannot be resolved to a single
+    // unambiguous local `macro_rules!` is an opaque token stream — calls and
+    // loops inside it are INVISIBLE to every check below. Silent invisibility
+    // is exactly the escape hatch this macro exists to close, so surface it
+    // as a loud (non-fatal) note; the build stays green but the note is
+    // impossible to miss in -vv output / CI logs. (Resolvable invocations
+    // were already expanded above, so they never reach this note.)
     if !facts.macros.is_empty() {
         let mut names: Vec<String> = facts.macros.clone();
         names.sort();
         names.dedup();
         note(&format!(
-            "OPAQUE-MACRO: body of the fn at {:#010x} invokes macro(s) {} — their \
-             expansion is not visible to the verifier, so calls/loops inside them \
-             escape the HALLUCINATED / MISSING / CFG checks. Inline the work (or \
-             pin the relevant `fields = [...]` / `globals = [...]`) if it touches ported fns.",
+            "OPAQUE-MACRO: body of the fn at {:#010x} invokes macro(s) {} — no \
+             unambiguous local definition was found, so their expansion is not \
+             visible to the verifier, and calls/loops inside them escape the \
+             HALLUCINATED / MISSING / CFG checks. Inline the work (or pin the \
+             relevant `fields = [...]` / `globals = [...]`) if it touches ported fns.",
             args.addr,
             names
                 .iter()

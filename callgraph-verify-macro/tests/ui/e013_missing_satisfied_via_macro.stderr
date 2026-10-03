@@ -1,0 +1,14 @@
+error:   [CG-VERIFY-E009 DUP-ADDR] origin 0x00401000 is claimed by 2 Rust fns (only ONE may implement a given binary fn):
+             lib.rs:? probe
+             lib.rs:? probe_duplicate
+           -> fix: delete the duplicate(s) so exactly one Rust fn owns this address, or split the binary fn (e.g. move the secondary portion into its own `#[origin(other_addr)]` helper)
+  --> tests/ui/e013_missing_satisfied_via_macro.rs:17:5
+   |
+17 | pub fn f() {
+   |     ^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/e013_missing_satisfied_via_macro.rs:21:2
+   |
+21 | }
+   |  ^ consider adding a `main` function to `$DIR/tests/ui/e013_missing_satisfied_via_macro.rs`

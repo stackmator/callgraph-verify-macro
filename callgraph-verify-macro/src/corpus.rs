@@ -15,7 +15,7 @@ use syn::{
     Signature, TraitItem, TraitItemFn,
 };
 
-use crate::{parse_origin_attr, VtableTable};
+use crate::{expand, parse_origin_attr, VtableTable};
 
 pub struct Corpus {
     /// Free / associated fns (no `self` receiver), keyed by name.
@@ -32,6 +32,11 @@ pub struct Corpus {
     /// Lets the verifier read those engine vtables from the PE and recognize which call
     /// targets are virtual methods (→ "use vcall, not a direct call").
     pub declared_vtables: Vec<(u64, usize)>,
+    /// `macro_rules!` definitions by macro name (all definition sites; an
+    /// entry with more than one def is ambiguous and never expanded).
+    /// Harvested by the same file scan so the body check can see through
+    /// unambiguous local macros (see `expand`).
+    pub macro_defs: HashMap<String, Vec<expand::MacroDef>>,
 }
 
 /// Scan `root` for the corpus map, caching the result per root path.
@@ -64,6 +69,7 @@ fn build(root: &str) -> Corpus {
         addr_owners: HashMap::new(),
         corpus: BTreeSet::new(),
         declared_vtables: Vec::new(),
+        macro_defs: HashMap::new(),
     };
     let root_path = std::path::Path::new(root);
     for path in rust_files(root_path) {
@@ -111,6 +117,11 @@ fn scan_item(item: &Item, disp_path: &str, c: &mut Corpus) {
             if path_is(&m.mac.path, "vtable_table") {
                 if let Ok(t) = syn::parse2::<VtableTable>(m.mac.tokens.clone()) {
                     c.declared_vtables.push((t.va, t.slots));
+                }
+            }
+            if path_is(&m.mac.path, "macro_rules") {
+                if let Some((name, def)) = expand::parse_macro_rules(m, disp_path) {
+                    c.macro_defs.entry(name).or_default().push(def);
                 }
             }
         }
@@ -279,6 +290,7 @@ mod tests {
             addr_owners: std::collections::HashMap::new(),
             corpus: std::collections::BTreeSet::new(),
             declared_vtables: Vec::new(),
+            macro_defs: std::collections::HashMap::new(),
         };
         let file = syn::parse_file(text).expect("parse");
         for item in &file.items {
@@ -731,6 +743,38 @@ mod b {
         assert!(c.free_fns.is_empty());
         assert!(c.methods.is_empty());
         assert!(c.addr_owners.is_empty());
+    }
+
+    // B-XX: `macro_rules!` definitions are harvested for the body
+    // expander: a simple arm parses, a repetition-only macro yields no
+    // usable arms (and is not stored), and a name defined twice stays
+    // ambiguous (two defs — the expander must decline it).
+    #[test]
+    fn bxx_macro_rules_defs_harvested() {
+        let dir = std::env::temp_dir().join("callgraph_bxx_macros");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "macro_rules! rel { ($o:expr) => { g($o); }; }\n\
+             macro_rules! fwd { ($($a:ident),*) => { g($($a),*) }; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.rs"),
+            "macro_rules! rel { ($o:expr) => { h($o); }; }\n",
+        )
+        .unwrap();
+        let c = build_cached(dir.to_str().unwrap());
+        // `rel` is defined twice -> ambiguous (two defs stored).
+        let rel = c.macro_defs.get("rel").expect("rel harvested");
+        assert_eq!(rel.len(), 2, "ambiguous name keeps both defs: {rel:?}");
+        // `fwd` needs repetitions -> no usable arm -> not stored.
+        assert!(
+            !c.macro_defs.contains_key("fwd"),
+            "repetition-only def must not be stored: {:?}",
+            c.macro_defs.keys()
+        );
     }
 
     // B-02: `diff_body_calls` returns a hallucinated entry for a body

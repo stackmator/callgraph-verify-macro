@@ -226,6 +226,17 @@ fn setup_testdata(manifest_dir: &Path) -> (PathBuf, PathBuf) {
          pub fn oob_fn() {}\n",
     )
     .expect("write corpus vtable_oob.rs");
+    // For macro-expansion fixtures (e012_hallucinated_via_macro,
+    // e013_missing_satisfied_via_macro): unambiguous local macro_rules
+    // definitions the verifier is expected to see through. The fixtures
+    // pull this file in with `include!` (so rustc can expand the macros)
+    // while the corpus scanner reads it from here (so the verifier can
+    // resolve the definitions).
+    std::fs::write(
+        corpus_dir.join("macro_defs.rs"),
+        "#[allow(unused_macros)]\nmacro_rules! sneaky {\n    ($x:expr) => { oob_fn($x) };\n}\n#[allow(unused_macros)]\nmacro_rules! caller {\n    ($x:expr) => { real_call($x) };\n}\n",
+    )
+    .expect("write corpus macro_defs.rs");
     (pe_path, corpus_dir)
 }
 
@@ -282,7 +293,9 @@ fn ui() {
             "tests/ui/e009_dup_addr.rs",
             "tests/ui/e011_vtable_dispatch.rs",
             "tests/ui/e012_hallucinated.rs",
+            "tests/ui/e012_hallucinated_via_macro.rs",
             "tests/ui/e013_missing.rs",
+            "tests/ui/e013_missing_satisfied_via_macro.rs",
             "tests/ui/e014_arg_shape.rs",
             "tests/ui/e015_hallucinated_addr.rs",
             "tests/ui/e016_cfg.rs",
