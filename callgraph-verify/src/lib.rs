@@ -403,6 +403,7 @@ pub fn diff_body_calls(
 ) -> Result<CorpusDiff, String> {
     let primary = *own_addrs.first().ok_or("no origin address")?;
     let mut bin_calls = BTreeSet::new();
+    let mut wide_extras = BTreeSet::new();
     let mut footprint = BTreeSet::new();
     let mut indirect = 0u32;
     let mut tail_targets: BTreeSet<u64> = BTreeSet::new();
@@ -414,17 +415,10 @@ pub fn diff_body_calls(
         // a faithful port spells it as an ordinary call.
         bin_calls.extend(&cg.tail_calls);
         tail_targets.extend(&cg.tail_calls);
-        // A code-pointer immediate (`PUSH 0xADDR` / `MOV reg,0xADDR` with ADDR in a
-        // section flagged EXECUTE/CODE) is a function the binary hands to a higher-order
-        // helper that then INVOKES it — a CRT `_EH_vector_constructor_iterator` over an
-        // element array, a `qsort` comparator, a registered callback, etc. So it is
-        // reached as part of this function's execution, and a faithful port that spells
-        // the per-element / callback work as a direct call to that function is not a
-        // hallucination. The characteristics-based filter (`is_executable_section_va`,
-        // NOT the permissive `is_executable_va`) excludes `.rdata` vtable VAs and string
-        // addresses — those are data, not call targets; like the tail-call fold above
-        // this only WIDENS the accepted set, so it can never make a passing function fail.
-        bin_calls.extend(
+        // Code-pointer immediates widen acceptance only (folded into
+        // `bin_calls_wide` below, never into the MISSING requirement); staged here
+        // so the walk stays single-pass.
+        wide_extras.extend(
             cg.imm_addrs
                 .iter()
                 .copied()
@@ -433,27 +427,44 @@ pub fn diff_body_calls(
         footprint.extend(cg.footprint());
         indirect += cg.indirect_calls;
     }
-    // A tail-call `JMP G` transfers control to G, so the calls G makes are reachable as part of
-    // THIS function's execution. MSVC frequently splits a function across non-contiguous chunks
-    // linked by a `JMP`, or emits a tiny entry stub that tail-jumps to a shared body
-    // (e.g. `0x00590110` → `JMP 0x0058da00`, whose body `CALL 0x0058d1c0`; or the ICF-folded
-    // stubs that all `JMP 0x004524c0`). The decompiler shows that body inlined into the entry, so
-    // a faithful port spells those as ordinary calls. Fold ONE level of each tail-callee's own
-    // direct calls into the accepted set. This only widens `bin_calls` via a *separate* analysis
-    // of each tail target — it never alters this function's own walk, so it cannot drop a real
-    // call or make a passing function start failing; it only clears false "HALLUCINATED"s.
+    // Wide acceptance set: `bin_calls` plus, per function, its executable-section
+    // code-pointer immediates and one level of each tail-callee's direct calls.
+    // - A code-pointer immediate (`PUSH 0xADDR` / `MOV reg,0xADDR` with ADDR in a
+    //   section flagged EXECUTE/CODE) is a function the binary hands to a higher-order
+    //   helper that then INVOKES it — a CRT `_EH_vector_constructor_iterator` over an
+    //   element array, a `qsort` comparator, a registered callback, etc. A faithful
+    //   port that spells the per-element / callback work as a direct call to that
+    //   function is not a hallucination. The characteristics-based filter
+    //   (`is_executable_section_va`, NOT the permissive `is_executable_va`) excludes
+    //   `.rdata` vtable VAs and string addresses — those are data, not call targets.
+    // - A tail-call `JMP G` transfers control to G, so the calls G makes are reachable
+    //   as part of THIS function's execution. MSVC frequently splits a function across
+    //   non-contiguous chunks linked by a `JMP`, or emits a tiny entry stub that
+    //   tail-jumps to a shared body (e.g. `0x00590110` → `JMP 0x0058da00`, whose body
+    //   `CALL 0x0058d1c0`; or the ICF-folded stubs that all `JMP 0x004524c0`). The
+    //   decompiler shows that body inlined into the entry, so a faithful port spells
+    //   those as ordinary calls.
+    // Both folds only ever ADD acceptable spellings (HALLUCINATED direction). They must
+    // NOT feed the MISSING requirement: the binary issues no CALL to an imm-addr, and
+    // no CALL here to the tail target's callees — demanding them forces ports to
+    // duplicate the tail target's body (previously misdiagnosed as E013 with an
+    // unactionable "add the call" fix; the suggested call was already spelled).
+    let mut bin_calls_wide = bin_calls.clone();
+    bin_calls_wide.extend(wide_extras);
     for t in tail_targets {
         if let Ok(tcg) = analyze(pe, t) {
-            bin_calls.extend(tcg.call_targets());
+            bin_calls_wide.extend(tcg.call_targets());
         }
     }
     // Follow one level of jmp-thunks: a call to a `JMP X` thunk (tail-jump stub / ICF forwarder)
     // really targets X, so a faithful direct Rust call to X is not a hallucination.
-    let thunked: Vec<u64> = bin_calls
+    // Resolved over the WIDE set (as before this split) so acceptance is unchanged;
+    // the results stay wide-only — a thunk is never itself a MISSING requirement.
+    let thunked: Vec<u64> = bin_calls_wide
         .iter()
         .filter_map(|&t| resolve_thunk(pe, t))
         .collect();
-    bin_calls.extend(thunked);
+    bin_calls_wide.extend(thunked);
     let own: BTreeSet<u64> = own_addrs.iter().copied().collect();
     let bin_ported: BTreeSet<u64> = bin_calls
         .intersection(corpus)
@@ -469,7 +480,11 @@ pub fn diff_body_calls(
             continue;
         }
         resolved.extend(&aset);
-        if aset.iter().any(|a| bin_calls.contains(a)) {
+        // Satisfied-direction check reads the WIDE set: a body edge the binary
+        // reaches only through a tail-jump or a higher-order immediate is faithful.
+        // (`bin_calls` below stays narrow: MISSING must only require edges the binary
+        // actually CALLs here.)
+        if aset.iter().any(|a| bin_calls_wide.contains(a)) {
             continue; // satisfied — binary makes (one of) this call
         }
         if aset.iter().any(|a| is_inlined_into(pe, *a, &footprint)) {
