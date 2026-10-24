@@ -506,8 +506,13 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
                     }
                     break;
                 }
-                FlowControl::Return | FlowControl::Interrupt | FlowControl::Exception => break,
-                FlowControl::Next | FlowControl::XbeginXabortXend => {}
+                FlowControl::Return | FlowControl::Exception => break,
+                // NOTE: `Interrupt` (`int n`) is deliberately NOT terminal:
+                // DOS `int 21h` / DPMI `int 31h` are API calls that return
+                // normally, so decoding must continue at `next_ip()`.
+                // Treating them like `ret` truncated listings and hid
+                // calls reachable only via post-`int` fallthrough.
+                FlowControl::Next | FlowControl::Interrupt | FlowControl::XbeginXabortXend => {}
             }
         }
     }

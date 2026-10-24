@@ -496,9 +496,11 @@ fn print_asm(pe: &Pe, entry: u64) {
                     }
                     break;
                 }
-                FlowControl::IndirectBranch | FlowControl::Return | FlowControl::Interrupt => {
+                FlowControl::IndirectBranch | FlowControl::Return => {
                     break
                 }
+                // `int n` returns normally (DOS/DPMI API call) — keep
+                // decoding the fallthrough (see disasm.rs note).
                 _ => {}
             }
         }

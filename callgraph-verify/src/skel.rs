@@ -102,7 +102,9 @@ fn decode_all(pe: &Pe, entry: u64) -> (BTreeMap<u64, Instruction>, BTreeSet<u64>
                     }
                     break;
                 }
-                FlowControl::Return | FlowControl::Interrupt | FlowControl::Exception => break,
+                FlowControl::Return | FlowControl::Exception => break,
+                // `int n` falls through (DOS/DPMI API call that returns;
+                // see disasm.rs) — it ends neither a leader walk nor a block.
                 _ => {}
             }
         }

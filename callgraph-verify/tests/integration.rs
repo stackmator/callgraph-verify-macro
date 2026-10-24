@@ -868,6 +868,54 @@ mod tests {
         );
     }
 
+    /// Regression: `int n` is NOT a function terminator. DOS `int 21h` /
+    /// DPMI `int 31h` are API calls that return normally, so decoding must
+    /// continue at `next_ip()`. The harvester used to treat iced-x86
+    /// `FlowControl::Interrupt` like `ret`: listings truncated at the
+    /// first `int` and any CALL reachable only via post-`int`
+    /// fallthrough was silently dropped from the call set (real
+    /// instance: FALL.EXE `0xb73d8` → `0xa3805` absent), blinding the
+    /// gate's MISSING check for those callees.
+    #[test]
+    fn test_int_does_not_terminate_decode() {
+        // PUSH EBX                       ; 53
+        // MOV AX, 0x4400                 ; 66 B8 00 44
+        // INT 21h                        ; CD 21
+        // CALL entry+0x20                ; E8 14 00 00 00
+        //   (rel32 = (entry+0x20) - (entry+0x0C) = 0x14)
+        // POP EBX                        ; 5B
+        // RET                            ; C3
+        // <padding to 0x20>              ; 8x 90 (NOP)
+        // RET (call target)              ; C3
+        let mut code = vec![
+            0x53, // PUSH EBX
+            0x66, 0xB8, 0x00, 0x44, // MOV AX, 0x4400
+            0xCD, 0x21, // INT 21h
+            0xE8, 0x14, 0x00, 0x00, 0x00, // CALL entry+0x20
+            0x5B, // POP EBX
+            0xC3, // RET
+        ];
+        while code.len() < 0x20 {
+            code.push(0x90);
+        }
+        code.push(0xC3); // RET at entry+0x20
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let cg = analyze(&pe, entry).expect("analyze");
+        assert!(
+            cg.direct_calls.contains_key(&(entry + 0x20)),
+            "CALL after INT 21h must be harvested — `int` returns normally. \
+             direct_calls = {:?}",
+            cg.direct_calls
+        );
+        assert!(
+            cg.max_end >= entry + 0x0E,
+            "decoding must continue past `int 21h` through POP/RET. \
+             max_end = {:#x}",
+            cg.max_end
+        );
+    }
+
     // --- has_direct_branch_target (BUG #3) -------------------------------
     //
     // The byte-scan variant of `has_direct_branch_target` used to accept any
