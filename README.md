@@ -1,5 +1,7 @@
 # callgraph-verify-macro
 
+[![crates.io](https://img.shields.io/crates/v/callgraph-verify-macro.svg)](https://crates.io/crates/callgraph-verify-macro)
+
 ⚠️ **Alpha** — 32-bit x86 PE and DOS4GW linear-executable (LE) targets are supported. x86_64, ARM, and ARM64 are planned.
 
 Compile-time anti-hallucination call-graph verification for binary reverse-engineering rebuilds. The macro disassembles the target binary at build time and compares its call graph against your Rust function body — any invented call is a hard `compile_error!`.
