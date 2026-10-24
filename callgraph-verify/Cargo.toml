@@ -11,7 +11,15 @@
 name = "callgraph-verify"
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-byte x86 call-graph verifier for reverse-engineering rebuilds — disassembles the target PE/LE at build time, no decompiler input"
+documentation = "https://docs.rs/callgraph-verify"
+readme = "../README.md"
+keywords = ["reverse-engineering", "disassembly", "verification", "x86", "call-graph"]
+categories = ["development-tools"]
+exclude = ["test-bin/"]
 
 [lib]
 name = "callgraph_verify"

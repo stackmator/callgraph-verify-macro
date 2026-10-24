@@ -757,8 +757,62 @@ mod tests {
         assert!(
             cg.field_offsets.contains(&0x10),
             "0x10 should be in field_offsets for plain [ECX+0x10] — non-indexed \
-             memory is still a struct field. field_offsets = {:?}",
+            memory is still a struct field. field_offsets = {:?}",
             cg.field_offsets
+        );
+    }
+
+    /// SIB-indexed `[base + index*scale + disp32]` with an IN-SECTION
+    /// displacement is a table-base load (e.g. FALL.EXE `[eax*4+0x18F01]`),
+    /// not a struct field. `analyze` must record the displacement in
+    /// `cg.globals` — otherwise HALLUCINATED-ADDR fires on the true table
+    /// address — and must NOT record it in `field_offsets` (BUG #4 stays).
+    #[test]
+    fn test_scan_operands_indexed_memory_in_image_disp_is_global() {
+        // MOV EAX, [EAX + ECX*4 + 0x00401000] ; RET
+        // ModRM = 0x84 (mod=10, reg=000(EAX), rm=100(SIB), disp32)
+        // SIB = 0x88 (scale=10(*4), index=001(ECX), base=000(EAX))
+        // disp32 = 0x00401000 (the .text section base of the synthetic PE)
+        let code = [
+            0x8B, 0x84, 0x88, 0x00, 0x10, 0x40, 0x00, // MOV EAX, [EAX+ECX*4+0x401000]
+            0xC3, // RET
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let cg = analyze(&pe, entry).expect("analyze");
+        assert!(
+            cg.globals.contains(&0x0040_1000),
+            "0x401000 should be in globals for indexed [EAX+ECX*4+disp] — the \
+            table base is really referenced. globals = {:?}",
+            cg.globals
+        );
+        assert!(
+            !cg.field_offsets.contains(&0x0040_1000),
+            "0x401000 must not leak into field_offsets from indexed memory. \
+            field_offsets = {:?}",
+            cg.field_offsets
+        );
+    }
+
+    /// Sanity: an indexed load with a SMALL displacement still records
+    /// nothing (no global — the offset is not an address; no field —
+    /// BUG #4). Guards the new global branch against over-eager matching.
+    #[test]
+    fn test_scan_operands_indexed_memory_small_disp_records_nothing() {
+        // MOV EAX, [EAX + ECX*4 + 0x10] ; RET (covered for fields by the
+        // BUG #4 test above; here we also pin the globals side).
+        let code = [
+            0x8B, 0x44, 0x88, 0x10, // MOV EAX, [EAX + ECX*4 + 0x10]
+            0xC3, // RET
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let cg = analyze(&pe, entry).expect("analyze");
+        assert!(
+            !cg.globals.contains(&0x10),
+            "0x10 must not be in globals for indexed [EAX+ECX*4+0x10] — a \
+            small offset is not an address. globals = {:?}",
+            cg.globals
         );
     }
 

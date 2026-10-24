@@ -126,6 +126,17 @@ fn scan_operands(pe: &Pe, instr: &Instruction, cg: &mut CallGraph) {
                     if pe.section_of(disp).is_some() && instr.mnemonic() != Mnemonic::Lea {
                         cg.globals.insert(disp);
                     }
+                } else if pe.section_of(disp).is_some()
+                    && instr.mnemonic() != Mnemonic::Lea
+                {
+                    // Indexed `[base + index*scale + disp]` (or `[reg+disp]`)
+                    // off a large in-image displacement — a table base, not a
+                    // struct field (e.g. FALL.EXE `[eax*4+0x18F01]`). Record it
+                    // as a global so bodies may bake the true address without
+                    // tripping HALLUCINATED-ADDR. Small offsets miss
+                    // `section_of` and fall through to the field branch below;
+                    // LEA never dereferences (BUG #14), so it stays excluded.
+                    cg.globals.insert(disp);
                 } else if base != Register::None
                     && base != Register::ESP
                     && base != Register::EBP

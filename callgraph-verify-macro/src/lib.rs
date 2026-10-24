@@ -10,8 +10,7 @@
 //! An invented call (`HALLUCINATED`) expands to `compile_error!`, so `cargo
 //! build`/`cargo check` FAILS — if someone edits the body to call something the
 //! original never does, the build breaks. Calls the binary makes that the body
-//! omits are `MISSING` (often a faithful inline) — reported, non-fatal unless
-//! `strict_missing` is passed.
+//! omits are `MISSING` — fatal (a ported callee the body doesn't spell).
 //!
 //! The bare address is enough:  `#[origin(0x004028d0)]`
 //! Optional explicit facts pin individual operands too:

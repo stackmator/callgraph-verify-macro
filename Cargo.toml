@@ -11,4 +11,6 @@ exclude = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-publish = false
+rust-version = "1.70"
+license = "MIT"
+repository = "https://github.com/stackmator/callgraph-verify-macro"

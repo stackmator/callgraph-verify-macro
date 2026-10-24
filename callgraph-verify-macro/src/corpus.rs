@@ -549,7 +549,7 @@ impl S {
     }
 
     // ====================================================================
-    // Unhappy-path / regression tests (see UNTESTED.md B-01..B-10).
+    // Unhappy-path / regression tests (B-01..B-10 coverage).
     // ====================================================================
 
     // B-01: Two `#[origin(0xA)]` on different functions → both are recorded as

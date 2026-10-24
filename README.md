@@ -224,4 +224,4 @@ On every `cargo check`/`cargo build`:
 
 ## License
 
-Internal tooling for binary reverse-engineering rebuild projects. Not published.
+MIT — see [LICENSE](./LICENSE). Alpha (`0.x`): 32-bit x86 PE and DOS4GW LE targets are supported; x86_64, ARM, and ARM64 are planned.

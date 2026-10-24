@@ -11,13 +11,20 @@
 name = "callgraph-verify-macro"
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "`#[origin]` compile-time call-graph gate: fails the build when a rebuild function calls what the binary never calls"
+documentation = "https://docs.rs/callgraph-verify-macro"
+readme = "../README.md"
+keywords = ["reverse-engineering", "proc-macro", "verification", "x86", "call-graph"]
+categories = ["development-tools"]
 
 [lib]
 proc-macro = true
 
 [dependencies]
-callgraph-verify = { path = "../callgraph-verify" }
+callgraph-verify = { version = "0.1.0", path = "../callgraph-verify" }
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
 proc-macro2 = "1"
