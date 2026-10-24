@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `referenced_addrs` (the ORIGIN-UNREFERENCED scan) now indexes `JMP
+  short rel8` (`0xEB`) targets alongside CALL/JMP rel32 and Jcc rel32.
+  A function reached solely via short jump was invisible to the scan
+  and needed an `unreferenced` waiver (real instance: FALL.EXE
+  `0x9dbe2`, reached only by `EB F0` from `0x9dbeb` — E006 fired on a
+  genuine entry). Over-approximation is unchanged: a stray `0xEB`
+  only ever widens the accept set. Regression tests:
+  `test_referenced_addrs_indexes_jmp_short`,
+  `test_referenced_addrs_still_indexes_call_rel32`.
+- Real-binary before/after (FALL.EXE, dagger-engine-rs @ 1753 fns):
+  before, `#[origin(0x9dbe2)]` failed E006; after, it passes with no
+  waiver and no other diagnostic delta (`cargo check` green, count
+  unchanged).
+
 ## [0.1.1] - 2026-10-24
 
 ### Fixed

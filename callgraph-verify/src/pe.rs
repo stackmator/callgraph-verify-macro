@@ -265,11 +265,12 @@ impl Pe {
     /// — vtable slots, switch jump tables, baked function pointers, data refs.
     ///
     /// Purpose: catch a MISATTRIBUTED or invented `origin` address. A real
-    /// function entry is always reachable somehow (called, tail-jumped, or its
-    /// address stored in a table), so an address referenced NOWHERE cannot be
-    /// one. Over-approximate by construction (a spurious `0xE8` inside another
-    /// instruction adds a junk target; a random data dword may collide) — that
-    /// only ever widens the accept set, so it can't false-positive a real entry.
+    /// function entry is always reachable somehow (called, tail-jumped — long
+    /// OR short form — or its address stored in a table), so an address
+    /// referenced NOWHERE cannot be one. Over-approximate by construction
+    /// (a spurious `0xE8` inside another instruction adds a junk target; a
+    /// random data dword may collide) — that only ever widens the accept
+    /// set, so it can't false-positive a real entry.
     pub fn referenced_addrs(&self) -> std::collections::HashSet<u32> {
         let (lo, hi) = self.image_range();
         let mut out: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -281,9 +282,22 @@ impl Pe {
             }
             let blob = &self.data[start..end];
             let sec_va = self.image_base + sec.virtual_address as u64;
-            // rel32 branch targets — only meaningful in the code section.
+            // rel8/rel32 branch targets — only meaningful in the code section.
             if sec.name == ".text" {
                 for i in 0..blob.len().saturating_sub(4) {
+                    // `JMP short rel8` (0xEB): the scan used to index rel32
+                    // branches only, so a function reached solely via short
+                    // jump (e.g. FALL.EXE `0x9dbe2`, reached only by `EB F0`
+                    // from `0x9dbeb`) was invisible to ORIGIN-UNREFERENCED.
+                    // Over-approximate like the rest: a stray 0xEB only
+                    // widens the set.
+                    if blob[i] == 0xEB && i + 2 <= blob.len() {
+                        let rel = blob[i + 1] as i8 as i64;
+                        let t = (sec_va + i as u64 + 2).wrapping_add(rel as u64);
+                        if (lo..hi).contains(&t) {
+                            out.insert(t as u32);
+                        }
+                    }
                     let (op, rel_at) = match blob[i] {
                         0xE8 | 0xE9 => (blob[i], i + 1), // CALL rel32 / JMP rel32
                         0x0F if i + 6 <= blob.len() && (0x80..=0x8F).contains(&blob[i + 1]) => {

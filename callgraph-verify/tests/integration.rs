@@ -916,6 +916,57 @@ mod tests {
         );
     }
 
+    /// Regression: `referenced_addrs` must index `JMP short rel8` (0xEB)
+    /// targets. The scan only recognized CALL/JMP rel32 and Jcc rel32, so a
+    /// function reached solely via short jump (real instance: FALL.EXE
+    /// `0x9dbe2`, reached only by `EB F0` from `0x9dbeb`) was invisible to
+    /// ORIGIN-UNREFERENCED and needed a waiver. Over-approximation stays:
+    /// a stray 0xEB only ever widens the accept set.
+    #[test]
+    fn test_referenced_addrs_indexes_jmp_short() {
+        // offset 0: JMP short +6 → target = entry+8  ; EB 06
+        // offsets 2..7: NOP padding                   ; 6x 90
+        // offset 8: RET (the short-jump target)        ; C3
+        let code = [
+            0xEB, 0x06, // JMP short entry+8
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // NOP padding
+            0xC3, // RET at entry+8
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let refs = pe.referenced_addrs();
+        assert!(
+            refs.contains(&((entry + 8) as u32)),
+            "JMP short target entry+8 must be indexed — EB was invisible. \
+             refs = {refs:?}"
+        );
+    }
+
+    /// Sanity: a real `CALL rel32` at an instruction start IS still indexed
+    /// by `referenced_addrs`. Guards against an over-eager fix that drops
+    /// rel32 recognition.
+    #[test]
+    fn test_referenced_addrs_still_indexes_call_rel32() {
+        // offset 0: CALL entry+8                       ; E8 03 00 00 00
+        //   (rel32 = (entry+8) - (entry+5) = 3)
+        // offset 5: RET                                ; C3
+        // offsets 6..7: NOP padding                    ; 2x 90
+        // offset 8: RET (the call target)              ; C3
+        let code = [
+            0xE8, 0x03, 0x00, 0x00, 0x00, // CALL entry+8
+            0xC3, // RET
+            0x90, 0x90, // NOP padding
+            0xC3, // RET at entry+8
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let refs = pe.referenced_addrs();
+        assert!(
+            refs.contains(&((entry + 8) as u32)),
+            "CALL rel32 target entry+8 must stay indexed. refs = {refs:?}"
+        );
+    }
+
     // --- has_direct_branch_target (BUG #3) -------------------------------
     //
     // The byte-scan variant of `has_direct_branch_target` used to accept any
