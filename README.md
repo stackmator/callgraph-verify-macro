@@ -1,6 +1,6 @@
 # callgraph-verify-macro
 
-⚠️ **Alpha** — only 32-bit x86 PE targets are supported currently. x86_64, ARM, and ARM64 are planned.
+⚠️ **Alpha** — 32-bit x86 PE and DOS4GW linear-executable (LE) targets are supported. x86_64, ARM, and ARM64 are planned.
 
 Compile-time anti-hallucination call-graph verification for binary reverse-engineering rebuilds. The macro disassembles the target binary at build time and compares its call graph against your Rust function body — any invented call is a hard `compile_error!`.
 
@@ -13,7 +13,7 @@ Compile-time anti-hallucination call-graph verification for binary reverse-engin
 
 ## Architecture
 
-- **Target binary**: 32-bit x86 PE (x86_64 / ARM / ARM64 planned)
+- **Target binary**: 32-bit x86 PE or DOS4GW LE (x86_64 / ARM / ARM64 planned)
 - **Host**: x86_64 (proc-macros always build for host; iced-x86 never enters the i686 target build)
 - **Dependencies**: Pure Rust — `iced-x86` for decoding, `goblin` for PE parsing, `syn`/`quote` for macro expansion
 
@@ -116,6 +116,15 @@ vtable_table! {
 }
 ```
 
+Slot indices are decimal, `va` accepts hex. The macro generates
+`pub fn name() -> *const [usize; N]` (fat pointer — keeps the slot
+count) and checks every wired slot against the binary's vtable bytes
+at build time. There is no `vcall_*` call helper in the crates: the
+faithful call form is an indirect call through the declared table
+(register dispatch, e.g. `CALL [reg+slot]`); pin the byte offset with
+`vcall_slots = [...]` on the caller and never call a declared vtable
+method directly (that is `VTABLE-DISPATCH`, fatal).
+
 ---
 
 ## CLI: `callgraph-verify` binary
@@ -135,6 +144,16 @@ Output includes:
 - Immediate address literals
 - IAT calls
 
+### Ground-truth disassembly (port from this)
+
+```bash
+cargo run --bin callgraph_verify -- C:/path/to/target.exe 0x0076a420 --asm
+```
+
+Raw iced-x86 dump of the verified bytes at the address — this is the
+ground truth. Always port from `--asm`; `--skeleton` below is a coarse
+structural hint only.
+
 ### Generate reference skeleton (NASM-flavored)
 
 ```bash
@@ -143,13 +162,28 @@ cargo run --bin callgraph_verify -- C:/path/to/target.exe 0x0076a420 --skeleton
 
 Emits a `.asm`-style skeleton showing every instruction with offsets — useful for manual matching or feeding to a decompiler diff.
 
+### Enumerate / measure the binary
+
+```bash
+cargo run --bin callgraph_verify -- C:/path/to/target.exe --list [--max N]
+cargo run --bin callgraph_verify -- C:/path/to/target.exe --count
+cargo run --bin callgraph_verify -- C:/path/to/target.exe --summary
+```
+
+`--list` prints one line per function (`extent/calls/tails/indir_calls/
+indir_jumps`); `--count` prints the function total; `--summary` prints
+totals (functions, code bytes, direct calls).
+
 ### Other flags
 
 | Flag | Purpose |
 |------|---------|
 | `--skeleton` | Emit NASM-style reference skeleton |
-| `--json` | Machine-readable JSON output |
-| `--cfg` | Include CFG fingerprint (loops, switches, conditionals) |
+| `--asm` | Raw disassembly dump of the verified bytes (ground truth) |
+| `--list [--max N]` | Enumerate functions with extent/call counts |
+| `--count` | Print the function total |
+| `--summary` | Print binary totals (functions, code bytes, calls) |
+| `--declared 0xA,0xB --exact` | Verify an explicit call set for the address |
 
 ---
 
@@ -164,22 +198,26 @@ On every `cargo check`/`cargo build`:
    - Method calls (`obj.bar()`)
    - Field accesses (`ptr.field`)
    - Hex literals (globals, vtables, RTTI, fn pointers)
-4. **Diffs** body calls against binary calls:
-   - `HALLUCINATED` — body calls something binary never does → **fatal**
-   - `MISSING` — binary calls something body doesn't → non-fatal (opt-in strict)
-   - `VTABLE-DISPATCH` — direct call to a known vtable method → fatal (must use `vcall`)
-   - `ARG-SHAPE` — concrete arg kinds mismatch (opt-in `STRICT_ARGS`)
-   - `HALLUCINATED-ADDR` — body bakes in-image address binary never references (opt-in `STRICT_OPERANDS`)
-   - `CFG` — structural CFG divergence (opt-in `STRICT_CFG`)
-   - `DUP-ADDR` — multiple Rust fns claim same binary address (opt-in `DUP_STRICT`)
-   - `ORIGIN-UNREFERENCED` — attributed address not called/jumped/stored in binary (waivable)
+4. **Diffs** body calls against binary calls (all checks always on —
+   the old `STRICT_*=0` / `DUP_STRICT=0` escape hatches were removed):
+    - `HALLUCINATED` — body calls something binary never does → **fatal**
+    - `MISSING` — binary calls a corpus-known fn the body doesn't spell → **fatal**
+      (calls to addresses with no `#[origin]` may be omitted with a `TODO`)
+    - `VTABLE-DISPATCH` — direct call to a known vtable method → **fatal**
+      (call indirectly through the declared table)
+    - `ARG-SHAPE` — concrete arg-kind mismatch at a call site
+    - `HALLUCINATED-ADDR` — body bakes an in-image address the binary never references
+    - `CFG` — structural CFG divergence (coarse/tolerant)
+    - `DUP-ADDR` — multiple Rust fns claim same binary address → **fatal**
+    - `ORIGIN-UNREFERENCED` — attributed address never called/jumped/stored
+      in the binary → waive with `#[origin(VA, unreferenced)]` (boot anchors only)
 
 ---
 
 ## Requirements
 
 - Rust 1.70+ (edition 2021)
-- `TARGET_EXE` pointing to a valid 32-bit PE
+- `TARGET_EXE` pointing to a valid 32-bit PE or DOS4GW LE binary
 - Rebuild source tree with `#[origin]` tags for corpus resolution
 
 ---
