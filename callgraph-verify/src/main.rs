@@ -161,11 +161,13 @@ fn main() {
 
     let mut declared: Option<Vec<u64>> = None;
     let mut exact = false;
+    let mut asm = false;
     let mut skeleton = false;
     let mut i = 3;
     while i < args.len() {
         let pos = i; // 1-indexed argv position for the error message
         match args[i].as_str() {
+            "--asm" => asm = true,
             "--skeleton" | "--skel" | "show-skeleton" => skeleton = true,
             "--exact" => exact = true,
             "--declared" => {
@@ -188,13 +190,18 @@ fn main() {
                 );
             }
             other => fatal(&format!(
-                "argv[{pos}] = {other:?}: unknown flag (valid: --declared, --exact, --skeleton, --max)"
+                "argv[{pos}] = {other:?}: unknown flag (valid: --declared, --exact, --skeleton, --asm, --max)"
             )),
         }
         i += 1;
     }
 
     let pe = Pe::load(exe).unwrap_or_else(|e| fatal(&e));
+
+    if asm {
+        print_asm(&pe, addr);
+        return;
+    }
 
     if skeleton {
         match skel::emit_skeleton(&pe, addr) {
@@ -438,6 +445,75 @@ fn print_set(label: &str, set: &BTreeSet<u64>, small: bool) {
         })
         .collect();
     println!("  {label} ({}): {}", set.len(), items.join(", "));
+}
+
+/// Raw NASM disassembly of the verified bytes at `entry`, in address order.
+///
+/// Same recursive-descent traversal as `analyze` (conditional + in-range
+/// unconditional branches), so the dump shows exactly the bytes the gate
+/// verifies — ground truth for writing faithful bodies (operand sizes,
+/// globals widths, branch structure).
+fn print_asm(pe: &Pe, entry: u64) {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, Formatter, NasmFormatter};
+    use std::collections::{BTreeMap, BTreeSet};
+    const MAX_FN_SPAN: u64 = 0x10000;
+    let (lo, hi) = (entry, entry.saturating_add(MAX_FN_SPAN));
+    let mut instrs: BTreeMap<u64, iced_x86::Instruction> = BTreeMap::new();
+    let mut work = vec![entry];
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    while let Some(start) = work.pop() {
+        if !seen.insert(start) {
+            continue;
+        }
+        let Some(bytes) = pe.read(start, 32 * 64) else {
+            continue;
+        };
+        let mut dec = Decoder::with_ip(32, bytes, start, DecoderOptions::NONE);
+        let mut instr = iced_x86::Instruction::default();
+        while dec.can_decode() {
+            let ip = dec.ip();
+            if ip != start && instrs.contains_key(&ip) {
+                break;
+            }
+            dec.decode_out(&mut instr);
+            if instr.is_invalid() {
+                break;
+            }
+            instrs.insert(ip, instr);
+            match instr.flow_control() {
+                FlowControl::ConditionalBranch => {
+                    let t = instr.near_branch_target();
+                    if (lo..hi).contains(&t) {
+                        work.push(t);
+                    }
+                    work.push(instr.next_ip());
+                    break;
+                }
+                FlowControl::UnconditionalBranch => {
+                    let t = instr.near_branch_target();
+                    if (lo..hi).contains(&t) {
+                        work.push(t);
+                    }
+                    break;
+                }
+                FlowControl::IndirectBranch | FlowControl::Return | FlowControl::Interrupt => {
+                    break
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut fmt = NasmFormatter::new();
+    let mut out = String::new();
+    for (ip, ins) in &instrs {
+        out.clear();
+        fmt.format(ins, &mut out);
+        let len = ins.len();
+        let bytes = pe.read(*ip, len).unwrap_or(&[]);
+        let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        println!("{ip:#010x}: {:<24} {out}", hex.join(" "));
+    }
+    println!("; {} instructions, extent ~{} bytes", instrs.len(), instrs.keys().last().map(|l| l + 1 - entry).unwrap_or(0));
 }
 
 fn fatal(msg: &str) -> ! {
