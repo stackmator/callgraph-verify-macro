@@ -80,13 +80,6 @@ jobs:
       - name: Cross-compile fixtures (PE via MinGW, LE via Watcom)
         run: python3 callgraph-verify/test-fixtures/build_fixtures.py --out target/fixtures
 
-      # TEMPORARY debug aid: show how MinGW lays out the od branch_caller
-      # call (PUSH vs MOV idiom) to settle the arg-recovery question.
-      - name: Dump od branch_caller disassembly
-        run: |
-          ADDR=$(python3 -c "import json;print(json.load(open('target/fixtures/c_callgraph_od_addrs.json'))['symbols']['branch_caller'])")
-          i686-w64-mingw32-objdump -d --start-address=$ADDR target/fixtures/c_callgraph_od.exe | head -30
-
       - name: Assert all fixture artifacts exist
         run: |
           ls -la target/fixtures/
