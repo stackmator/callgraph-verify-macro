@@ -30,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Hardened the `has_direct_branch_target` perf regression test against
+  wall-clock flakes. Two changes, detection power preserved: the three
+  tests in `tests/perf.rs` now serialize on a file-local mutex (cargo runs
+  one binary's tests on parallel threads, and a sibling test's 4 MB scan —
+  done while holding the caches' global locks — used to stall the measured
+  batch and trip the assertion), and the threshold relaxed from
+  `batch*10 < warmup` to `batch*2 < warmup` (a rescan-per-call regression
+  costs the batch ~200 scans ≈ 200× warmup, so it still fails by ~400×;
+  a cached batch passes with ~500× headroom).
+
+### Fixed
+
 - `referenced_addrs` (the ORIGIN-UNREFERENCED scan) now indexes `JMP
   short rel8` (`0xEB`) targets alongside CALL/JMP rel32 and Jcc rel32.
   A function reached solely via short jump was invisible to the scan

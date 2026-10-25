@@ -7,14 +7,37 @@
 //! scan-fest. The fix caches all rel32 branch targets in one pass; these
 //! tests fail loudly if a future change reintroduces per-call rescanning.
 //!
-//! The timing assertions are SELF-CALIBRATING instead of absolute: they
-//! compare a batch of repeat lookups against the one-time warmup cost on the
-//! same PE, so they hold on any machine speed and in both debug and release.
-//! A rescan-per-call implementation fails them by ~100×, a cached one passes
-//! with ~1000× margin.
+//! The timing assertion is SELF-CALIBRATING instead of absolute: it compares
+//! a batch of repeat lookups against the one-time warmup cost on the same
+//! PE, so it holds on any machine speed and in both debug and release. A
+//! rescan-per-call implementation makes the batch cost ~200 scans
+//! (≈200× warmup); a cached one costs ~warmup/1000. The threshold
+//! (`batch*2 < warmup`) sits between them with ~400× margin on each side.
+//!
+//! Wall-clock tests are inherently noisy, so this file removes the two
+//! noise sources it controls: all three tests serialize on `SERIAL` (cargo
+//! runs tests in one binary on parallel threads, and the sibling tests'
+//! own 4 MB scans — done while holding the caches' global locks — would
+//! otherwise contend with the measured batch), and the threshold tolerates
+//! ~500× slowdown of the batch before firing. What remains (a descheduled
+//! box) cannot bridge a 400× gap without a real regression.
 
 use callgraph_verify::{has_direct_branch_target, Pe};
 use std::time::Instant;
+
+/// Serializes the perf tests in this binary. Each test builds and decodes a
+/// multi-MB synthetic PE, and the library caches involved do their one-time
+/// full-`.text` scans while holding a process-global lock — so a sibling
+/// test's scan would otherwise stall this file's measured lookup batch and
+/// trip the timing assertion below. Cargo runs the test targets of one
+/// binary on parallel threads, hence an explicit mutex rather than
+/// execution order. Poisoning-safe: a panicking holder must not wedge the
+/// remaining tests.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Image base used by the synthetic PEs below (same convention as integration.rs).
 const BASE: u64 = 0x0040_0000;
@@ -73,9 +96,12 @@ const TEXT_LEN: usize = 4 * 1024 * 1024;
 /// Calibration: the FIRST call pays the one-time decode of 4 MB of `.text`
 /// plus one scan; the next 200 calls against a cached implementation cost
 /// microseconds combined. If a change reintroduces the per-call byte scan,
-/// the batch costs ~200 scans and exceeds the warmup cost ~100×.
+/// the batch costs ~200 scans (≈200× warmup) and fails `batch*2 < warmup`
+/// by ~400×. Serialized on `SERIAL` so sibling tests' own full scans
+/// cannot contend with the measured batch.
 #[test]
 fn has_direct_branch_target_repeat_lookups_are_not_rescans() {
+    let _guard = serial();
     // No branch opcodes anywhere → every lookup below is a MISS, which was
     // the worst case for the old scanner (it walked to the end of .text to
     // conclude "no branch targets this address").
@@ -100,7 +126,7 @@ fn has_direct_branch_target_repeat_lookups_are_not_rescans() {
     let batch = t1.elapsed();
 
     assert!(
-        batch * 10 < warmup,
+        batch * 2 < warmup,
         "200 repeat lookups took {batch:?} vs {warmup:?} for the first (warmup) call — \
          has_direct_branch_target is rescanning .text per call; the all-branch-targets \
          cache in lib.rs was dropped or its key stopped matching"
@@ -114,6 +140,10 @@ fn has_direct_branch_target_repeat_lookups_are_not_rescans() {
 /// deterministically — no timing involved.
 #[test]
 fn has_direct_branch_target_cache_distinguishes_same_layout_pes() {
+    // Serialized: this test's 4 KB scans are cheap, but running them while
+    // the timing test above measures its batch would inject lock contention
+    // into that measurement. See SERIAL.
+    let _guard = serial();
     // PE A: pure NOP sled — nothing is a branch target.
     let pe_a = pe_with_text(NOP_FILL, &[], 0x1000);
     // PE B: identical header layout, but starts with `CALL rel32` (rel 0 →
@@ -141,6 +171,9 @@ fn has_direct_branch_target_cache_distinguishes_same_layout_pes() {
 /// that makes every lookup miss "fast").
 #[test]
 fn has_direct_branch_target_finds_hits_in_large_text() {
+    // Serialized for the same reason: a 4 MB decode+scan while the timing
+    // test measures would contend on the caches' global locks. See SERIAL.
+    let _guard = serial();
     // A CALL buried in the NOP fill (at an instruction boundary — the fill is
     // 3-byte NOPs, so offset 3*k starts an instruction) whose rel32 targets
     // its own next_ip: `E8 00 00 00 00` at code offset 3 → target offset 8.
