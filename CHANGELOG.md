@@ -40,21 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   costs the batch ~200 scans ≈ 200× warmup, so it still fails by ~400×;
   a cached batch passes with ~500× headroom).
 
-### Fixed
-
-- `referenced_addrs` (the ORIGIN-UNREFERENCED scan) now indexes `JMP
-  short rel8` (`0xEB`) targets alongside CALL/JMP rel32 and Jcc rel32.
-  A function reached solely via short jump was invisible to the scan
-  and needed an `unreferenced` waiver (real instance: FALL.EXE
-  `0x9dbe2`, reached only by `EB F0` from `0x9dbeb` — E006 fired on a
-  genuine entry). Over-approximation is unchanged: a stray `0xEB`
-  only ever widens the accept set. Regression tests:
-  `test_referenced_addrs_indexes_jmp_short`,
-  `test_referenced_addrs_still_indexes_call_rel32`.
-- Real-binary before/after (FALL.EXE, dagger-engine-rs @ 1753 fns):
-  before, `#[origin(0x9dbe2)]` failed E006; after, it passes with no
-  waiver and no other diagnostic delta (`cargo check` green, count
-  unchanged).
+## [0.1.3] - 2026-10-24
 
 ### Added
 
@@ -89,6 +75,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   widens acceptance, mirroring the call-side wide set; existing E015
   snapshots are unchanged.
 
+## [0.1.2] - 2026-10-24
+
+### Fixed
+
+- `referenced_addrs` (the ORIGIN-UNREFERENCED scan) now indexes `JMP
+  short rel8` (`0xEB`) targets alongside CALL/JMP rel32 and Jcc rel32.
+  A function reached solely via short jump was invisible to the scan
+  and needed an `unreferenced` waiver (real instance: FALL.EXE
+  `0x9dbe2`, reached only by `EB F0` from `0x9dbeb` — E006 fired on a
+  genuine entry). Over-approximation is unchanged: a stray `0xEB`
+  only ever widens the accept set. Regression tests:
+  `test_referenced_addrs_indexes_jmp_short`,
+  `test_referenced_addrs_still_indexes_call_rel32`.
+- Real-binary before/after (FALL.EXE, dagger-engine-rs @ 1753 fns):
+  before, `#[origin(0x9dbe2)]` failed E006; after, it passes with no
+  waiver and no other diagnostic delta (`cargo check` green, count
+  unchanged).
+
 ## [0.1.1] - 2026-10-24
 
 ### Fixed
@@ -118,6 +122,8 @@ Initial crates.io release.
 - `vtable_table!` declaration support with indirectly-called slot
   verification.
 
-[Unreleased]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/stackmator/callgraph-verify-macro/releases/tag/v0.1.0
