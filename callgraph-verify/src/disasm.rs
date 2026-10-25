@@ -560,6 +560,28 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
                     let unindexed_switch =
                         !has_index && base_written && is_switch_dispatch(&block_buf);
                     follow_jump_table(&instr, pe, lo, hi, unindexed_switch, &mut cases);
+                    // GCC -O0 switch lowering keeps the scale in a separate
+                    // `shl`, adds the table base as an immediate, loads the
+                    // entry, then jumps through a register:
+                    //   shl $2,%eax; add $TABLE,%eax; mov (%eax),%eax; jmp *%eax
+                    // The JMP itself has no memory operand, so the readers
+                    // above see nothing (MinGW `c_callgraph_od` classify:
+                    // 1 indirect jump, 0 cases, 0 calls). Recover the table
+                    // base from the `add` and read it like any other table,
+                    // gated on the same switch evidence so a vtable
+                    // `mov eax,[ecx+slot]; jmp eax` (no bound check, `this`
+                    // never `add`ed with an in-image base) stays untouched.
+                    if cases.is_empty()
+                        && instr.op_count() > 0
+                        && instr.op_kind(0) == OpKind::Register
+                        && is_switch_dispatch(&block_buf)
+                    {
+                        if let Some(table) =
+                            register_table_base(&block_buf, pe, instr.op_register(0))
+                        {
+                            read_table_entries(pe, table, lo, hi, &mut cases);
+                        }
+                    }
                     for c in &cases {
                         branch_seed.entry(*c).or_insert_with(|| block_buf.clone());
                         work.push(*c);
@@ -642,23 +664,105 @@ pub(crate) fn follow_jump_table(
         if pe.section_of(disp).is_none() {
             return;
         }
-        let mut k = 0u64;
-        while k < 1024 {
-            let Some(b) = pe.read(disp + k * 4, 4) else {
-                break;
-            };
-            if b.len() < 4 {
-                break;
-            }
-            let target = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64;
-            if !(lo..hi).contains(&target) {
-                break; // first entry outside the function ends the table
-            }
-            work.push(target);
-            k += 1;
-        }
+        read_table_entries(pe, disp, lo, hi, work);
         return;
     }
+}
+
+/// Read a u32 VA jump table at `table_va`, pushing entries while they point
+/// back into the function `[lo, hi)` (the terminator shared by every table
+/// shape: switch cases always target the function's own bodies).
+fn read_table_entries(pe: &Pe, table_va: u64, lo: u64, hi: u64, work: &mut Vec<u64>) {
+    let mut k = 0u64;
+    while k < 1024 {
+        let Some(b) = pe.read(table_va + k * 4, 4) else {
+            break;
+        };
+        if b.len() < 4 {
+            break;
+        }
+        let target = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64;
+        if !(lo..hi).contains(&target) {
+            break; // first entry outside the function ends the table
+        }
+        work.push(target);
+        k += 1;
+    }
+}
+
+/// Table base for a register-indirect switch dispatch (`jmp *%reg`).
+/// Finds the entry load `mov %reg,[%base]` nearest the jump, then the
+/// `add %base,$TABLE` / `lea %base,[...]` / `mov %base,$TABLE` that
+/// established it with an in-image table address. Returns `None` when the
+/// jump register comes straight from memory with no locally-built table
+/// (e.g. a vtable `mov %eax,[%ecx+slot]; jmp *%eax`, whose `%ecx` is an
+/// incoming `this` never `add`ed with an in-image base).
+fn register_table_base(block: &[Instruction], pe: &Pe, jump_reg: Register) -> Option<u64> {
+    // Nearest load into the jump register: `mov %reg,[%base]`.
+    let mut load_base: Option<Register> = None;
+    for b in block.iter().rev() {
+        if matches!(
+            b.mnemonic(),
+            Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx
+        ) && b.op0_kind() == OpKind::Register
+            && b.op0_register() == jump_reg
+            && b.op1_kind() == OpKind::Memory
+        {
+            load_base = Some(b.memory_base());
+            break;
+        }
+    }
+    let base = load_base?;
+    // The table address built into the base register further up.
+    for b in block.iter().rev() {
+        match b.mnemonic() {
+            Mnemonic::Add => {
+                if b.op0_kind() == OpKind::Register && b.op0_register() == base {
+                    for i in 0..b.op_count() {
+                        if matches!(
+                            b.op_kind(i),
+                            OpKind::Immediate8
+                                | OpKind::Immediate8to16
+                                | OpKind::Immediate8to32
+                                | OpKind::Immediate16
+                                | OpKind::Immediate32
+                        ) && pe.section_of(b.immediate(i)).is_some()
+                        {
+                            return Some(b.immediate(i));
+                        }
+                    }
+                }
+            }
+            Mnemonic::Lea => {
+                if b.op0_kind() == OpKind::Register
+                    && b.op0_register() == base
+                    && b.op1_kind() == OpKind::Memory
+                    && pe.section_of(b.memory_displacement64()).is_some()
+                {
+                    return Some(b.memory_displacement64());
+                }
+            }
+            Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx => {
+                if b.op0_kind() == OpKind::Register && b.op0_register() == base {
+                    for i in 0..b.op_count() {
+                        if matches!(
+                            b.op_kind(i),
+                            OpKind::Immediate8
+                                | OpKind::Immediate8to16
+                                | OpKind::Immediate8to32
+                                | OpKind::Immediate16
+                                | OpKind::Immediate32
+                        ) && pe.section_of(b.immediate(i)).is_some()
+                        {
+                            return Some(b.immediate(i));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Switch-dispatch evidence: a compare/test plus a conditional branch in

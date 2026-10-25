@@ -220,3 +220,78 @@ fn sib_indexed_table_still_recovers_case_calls() {
         );
     }
 }
+
+/// Layout C (GCC -O0 form, the MinGW `c_callgraph_od` classify shape):
+/// the scale lives in a `shl`, the table base is added as an immediate,
+/// the entry is loaded, then a bare register jump dispatches -- the JMP
+/// itself has NO memory operand for `follow_jump_table` to read:
+///   switch @0x401300: push ebp; mov ebp,esp; sub esp,8; mov eax,[ebp+8];
+///     cmp eax,2; ja DEFAULT; mov eax,[ebp+8]; shl eax,2; add eax,TABLE;
+///     mov eax,[eax]; jmp eax
+///   case0 @fallthrough: call t0; jmp OUT
+///   case1: call t1; jmp OUT
+///   case2: call t2; jmp OUT
+///   DEFAULT: mov eax,-1 (falls into OUT)
+///   OUT: ret
+///   TABLE @0x401380: [case0, case1, case2]
+///   t0 @0x4013A0, t1 @0x4013B0, t2 @0x4013C0: ret
+fn image_register_table() -> Vec<u8> {
+    let mut a = Asm::new();
+    const B: usize = 0x300; // function base (file offset within .text)
+    const TABLE: usize = 0x380;
+    a.bytes_at(B + 0x00, &[0x55, 0x89, 0xE5]); // push ebp; mov ebp,esp
+    a.bytes_at(B + 0x03, &[0x83, 0xEC, 0x08]); // sub esp,8
+    a.bytes_at(B + 0x06, &[0x8B, 0x45, 0x08]); // mov eax,[ebp+8]
+    a.bytes_at(B + 0x09, &[0x83, 0xF8, 0x02]); // cmp eax,2
+    a.emit_ja(B + 0x0C, 0x401000 + (B + 0x35) as u32); // -> DEFAULT
+    a.bytes_at(B + 0x0E, &[0x8B, 0x45, 0x08]); // mov eax,[ebp+8]
+    a.bytes_at(B + 0x11, &[0xC1, 0xE0, 0x02]); // shl eax,2
+    // add eax,TABLE_va (05 imm32).
+    let table_va = 0x401000 + TABLE as u32;
+    let mut add = vec![0x05u8];
+    add.extend_from_slice(&table_va.to_le_bytes());
+    a.bytes_at(B + 0x14, &add);
+    a.bytes_at(B + 0x19, &[0x8B, 0x00]); // mov eax,[eax]
+    a.bytes_at(B + 0x1B, &[0xFF, 0xE0]); // jmp eax
+    // case bodies (first tiles the fallthrough, like GCC -O0).
+    let t0 = 0x3A0u32;
+    let t1 = 0x3B0u32;
+    let t2 = 0x3C0u32;
+    let out = B + 0x3A;
+    a.emit_call(B + 0x1D, 0x401000 + t0);
+    a.emit_jmp8(B + 0x22, 0x401000 + out as u32);
+    a.emit_call(B + 0x24, 0x401000 + t1);
+    a.emit_jmp8(B + 0x29, 0x401000 + out as u32);
+    a.emit_call(B + 0x2B, 0x401000 + t2);
+    a.emit_jmp8(B + 0x30, 0x401000 + out as u32);
+    // DEFAULT @B+0x35: mov eax,-1 (falls into OUT).
+    a.bytes_at(B + 0x35, &[0xB8, 0xFF, 0xFF, 0xFF, 0xFF]);
+    // OUT @B+0x3A.
+    a.bytes_at(B + 0x3A, &[0xC3]);
+    // TABLE.
+    a.emit_u32(TABLE + 0x0, 0x401000 + (B + 0x1D) as u32);
+    a.emit_u32(TABLE + 0x4, 0x401000 + (B + 0x24) as u32);
+    a.emit_u32(TABLE + 0x8, 0x401000 + (B + 0x2B) as u32);
+    // targets.
+    a.bytes_at(t0 as usize, &[0xC3]);
+    a.bytes_at(t1 as usize, &[0xC3]);
+    a.bytes_at(t2 as usize, &[0xC3]);
+    a.finish()
+}
+
+#[test]
+fn gcc_o0_register_table_recovers_case_calls() {
+    let pe = load_bytes("jump_table_reg.exe", &image_register_table());
+    let cg = analyze(&pe, 0x401300).expect("analyze register switch fn");
+    assert_eq!(
+        cg.indirect_jumps, 1,
+        "expected exactly one indirect dispatch jump"
+    );
+    for target in [0x4013A0u64, 0x4013B0, 0x4013C0] {
+        assert!(
+            cg.direct_calls.contains_key(&target),
+            "case call to {target:#x} missing from call set (found: {:?})",
+            cg.direct_calls.keys().collect::<Vec<_>>(),
+        );
+    }
+}

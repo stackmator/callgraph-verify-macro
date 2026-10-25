@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Entry-stub tail blindness: a function whose whole body is one unconditional
+  `JMP` (MSVC sibling-call `tail_caller -> JMP tail_target`, ICF forwarders)
+  was followed as intra-function flow because the target sits inside the 64 KB
+  walk span, hiding the tail edge (`calls={} tails={}`) and leaking the
+  callee's globals into the caller. A single-instruction entry block ending in
+  an in-range unconditional `JMP` is now a tail call (never followed). Scoped
+  to exactly one instruction so a `JMP` over an inline table after a prologue
+  keeps the old follow behavior.
+- Register-indirect switch blindness (MinGW `-O0`): GCC lowers the unoptimized
+  `classify` switch to `shl; add $TABLE; mov (%reg),%reg; jmp *%reg`, whose
+  `JMP` carries no memory operand for `follow_jump_table` to read (1 indirect
+  jump, 0 cases, 0 calls). The harvest now recovers the table base from the
+  `add`/`lea`/`mov` that built the load register, gated on the same switch
+  evidence (`cmp`/`test` + conditional branch) so vtable
+  `mov %eax,[%ecx+slot]; jmp *%eax` sequences stay untouched.
+
 ## [0.1.4] - 2026-10-25
 
 ### Fixed
