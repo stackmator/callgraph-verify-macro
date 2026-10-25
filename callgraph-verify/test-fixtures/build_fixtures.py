@@ -145,10 +145,11 @@ def write_manifest(
     raw_symbols: dict[str, int],
     wanted: list[str],
     aliases: dict[str, list[str]] | None = None,
+    toolchain: str = "unknown",
 ) -> None:
     # Normalized lookup (first raw spelling wins); aliases resolve against
     # RAW names so toolchain-decorated forms (`??_7Circle@@6B@`,
-    # `_ZTV6Circle`) match without going through underscore-stripping.
+    # `__ZTV6Circle`) match without going through underscore-stripping.
     symbols: dict[str, int] = {}
     for raw, va in raw_symbols.items():
         symbols.setdefault(demangle_symbol(raw), va)
@@ -187,7 +188,10 @@ def write_manifest(
             f"from main and marked NOINLINE)"
         )
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
+        # `toolchain` lets tests condition on codegen idioms (e.g. MSVC
+        # passes args with PUSH, MinGW with MOV-to-stack — only the former
+        # is harvested by `recover_call_site` today).
+        json.dump({"toolchain": toolchain, "symbols": manifest}, f, indent=2)
         f.write("\n")
     print(f"wrote {path} ({len(manifest)} symbols)", flush=True)
 
@@ -267,7 +271,7 @@ def build_msvc(out: str) -> None:
             + lflags,
             cwd=out,
         )
-        write_manifest(manifest, parse_msvc_map(map_path), wanted, aliases)
+        write_manifest(manifest, parse_msvc_map(map_path), wanted, aliases, "msvc")
 
 
 def build_mingw(out: str) -> None:
@@ -332,7 +336,7 @@ def build_mingw(out: str) -> None:
             raise SystemExit(f"ERROR: {nm} not found")
         with open(nm_path, "w", encoding="utf-8") as f:
             subprocess.run([nm, "-n", exe], cwd=out, check=True, stdout=f)
-        write_manifest(manifest, parse_nm(nm_path), wanted, aliases)
+        write_manifest(manifest, parse_nm(nm_path), wanted, aliases, "mingw")
 
 
 def build_dos(out: str) -> bool:
