@@ -24,7 +24,7 @@ categories = ["development-tools"]
 proc-macro = true
 
 [dependencies]
-callgraph-verify = { version = "0.1.4", path = "../callgraph-verify" }
+callgraph-verify = { version = "0.1.5", path = "../callgraph-verify" }
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
 proc-macro2 = "1"
