@@ -15,10 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifier over that output — C and C++ to 32-bit PE via MSVC `cl` (Windows)
   and MinGW-w64 (Ubuntu), plus a DOS4GW linear executable via Open Watcom
   `owcc -bdos4g` (Ubuntu). New suites: `tests/c_cpp_integration.rs`
-  (symbol-anchored call-graph, Spec, operand, and CFG checks via linker-map
-  / `nm` manifests) and `tests/dos_le_integration.rs` (shape-discovered
-  coverage of the `parse_le` path: sweep, byte-scan agreement, Spec gates,
-  leaf/loop existence). Missing fixtures skip locally but fail under
+  (symbol-anchored call-graph, Spec, operand, CFG, vtable, and IAT checks
+  via linker-map / `nm` manifests — including unoptimized `/Od` twins for
+  weak-optimizer shapes and an incremental-linking twin whose ILT thunks pin
+  `resolve_thunk` on real output), `tests/dos_le_integration.rs`
+  (shape-discovered coverage of the `parse_le` path: sweep, byte-scan
+  agreement, Spec gates, leaf/loop existence), and
+  `tests/real_binary_sweep.rs` (local-only whole-image sweeps over a
+  user-provided period binary such as an Oblivion-era exe, via
+  `CALLGRAPH_REAL_EXE`). Missing fixtures skip locally but fail under
   `CALLGRAPH_REQUIRE_FIXTURES=1` (set in CI) so a broken build step can
   never silently green the suite. DOS tests pin call/CFG facts only —
   absolute globals/vtables stay out until LE fixup support lands.

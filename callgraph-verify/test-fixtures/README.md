@@ -10,6 +10,19 @@ vtables, Watcom codegen — not just hand-assembled byte strings.
 | C | `c/callgraph.c` | 32-bit PE | MSVC `cl` / MinGW `gcc` | `tests/c_cpp_integration.rs` |
 | C++ | `cpp/callgraph.cpp` | 32-bit PE | MSVC `cl` / MinGW `g++` | `tests/c_cpp_integration.rs` |
 | DOS | `dos/callgraph.c` | DOS/4GW LE | Open Watcom `owcc -bdos4g` | `tests/dos_le_integration.rs` |
+| C-od | `c/callgraph.c` | 32-bit PE, `/Od`/`-O0` | MSVC `cl` / MinGW `gcc` | `c_od_*` in `c_cpp_integration.rs` |
+| C-dbg | `c/callgraph.c` | 32-bit PE, `/Od`+ILT | MSVC `cl`+`link /INCREMENTAL` only | `c_dbg_*` in `c_cpp_integration.rs` |
+
+The `-od`/`-dbg` twins cover old-compiler shapes no version-pinned toolchain
+in CI could: VS2005-era installers don't run on modern runners, and no
+maintained action ships MSVC 8.0/9.0. Instead: `/Od` gives EBP frames, no
+inlining, and naive codegen (the weak-optimizer proxy, on both toolchains),
+and `/INCREMENTAL` routes every call through ILT `JMP real` thunks (the
+old-debug-build shape; exercises `resolve_thunk` and the diff's
+thunk-tolerant wide set). GNU ld has no incremental linking, so the `-dbg`
+twin is MSVC-only and its tests skip elsewhere. Watcom already builds
+without optimization flags, so the DOS fixture is inherently weak-optimizer
+output.
 
 ## Build
 
@@ -35,11 +48,22 @@ map parsing is not worth the fragility.
 ## Consuming tests
 
 Tests resolve fixtures via `$CALLGRAPH_{C,CPP,DOS}_EXE` (+ `$..._ADDRS` for
-the manifests), falling back to `<repo>/target/fixtures/`. When nothing is
-found they SKIP (plain `cargo test` without a C toolchain stays green).
-CI exports `CALLGRAPH_REQUIRE_FIXTURES=1`, which turns a missing fixture
-into a hard failure so a broken build step can never silently green the
-suite by skipping.
+the manifests, plus `$CALLGRAPH_C_{OD,DBG}_EXE/ADDRS` for the `/Od` and
+`/INCREMENTAL` C twins), falling back to `<repo>/target/fixtures/`. When
+nothing is found they SKIP (plain `cargo test` without a C toolchain stays
+green). CI exports `CALLGRAPH_REQUIRE_FIXTURES=1`, which turns a missing
+fixture into a hard failure so a broken build step can never silently
+green the suite by skipping. Two deliberate exceptions, documented at
+their use sites: the MSVC-only `c_callgraph_dbg` twin (GNU ld cannot emit
+ILT thunks) and `CALLGRAPH_REAL_EXE` below.
+
+## Sweeping your own period binaries
+
+`tests/real_binary_sweep.rs` runs the whole-image agreement + diff-clean
+sweeps over any 32-bit PE/LE pointed at by `CALLGRAPH_REAL_EXE` — e.g. an
+Oblivion-era exe built with MSVC 2005/2008, the crate's actual domain,
+which can never be committed (size + licensing). Local-only by design:
+it skips when the variable is unset, even under REQUIRE.
 
 ## Rules for editing fixture sources
 

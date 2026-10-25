@@ -180,10 +180,50 @@ def build_msvc(out: str) -> None:
             "ERROR: cl/link not on PATH — run from an x86 VS dev prompt "
             "(vcvarsall x86) or use ilammy/msvc-dev-cmd with arch: x86"
         )
-    for stem, src, wanted, aliases in (
-        ("c_callgraph", C_SRC, C_SYMBOLS, None),
-        ("cpp_callgraph", CPP_SRC, CPP_SYMBOLS, VTABLE_ALIASES),
-    ):
+    # (stem, src, wanted, aliases, cl_flags, link_flags)
+    variants = [
+        (
+            "c_callgraph",
+            C_SRC,
+            C_SYMBOLS,
+            None,
+            ["/O2"],
+            ["/INCREMENTAL:NO"],
+        ),
+        # Unoptimized: EBP frames, no inlining, naive codegen — the closest
+        # feasible proxy for a weak/old optimizer. /INCREMENTAL:NO keeps this
+        # build thunk-free so it isolates optimization-shape coverage.
+        (
+            "c_callgraph_od",
+            C_SRC,
+            C_SYMBOLS,
+            None,
+            ["/Od"],
+            ["/INCREMENTAL:NO"],
+        ),
+        # Debug + incremental linking: every function call routes through an
+        # ILT `JMP real_fn` thunk — the old-debug-build shape (2005-era
+        # binaries are full of these). Exercises `resolve_thunk` and the
+        # diff's thunk-tolerant wide set on real output. PDB/ILK/EXP land
+        # next to the exe (gitignored via target/).
+        (
+            "c_callgraph_dbg",
+            C_SRC,
+            C_SYMBOLS,
+            None,
+            ["/Od", "/Zi"],
+            ["/INCREMENTAL", "/DEBUG"],
+        ),
+        (
+            "cpp_callgraph",
+            CPP_SRC,
+            CPP_SYMBOLS,
+            VTABLE_ALIASES,
+            ["/O2"],
+            ["/INCREMENTAL:NO"],
+        ),
+    ]
+    for stem, src, wanted, aliases, cflags, lflags in variants:
         obj = os.path.join(out, stem + ".obj")
         exe = os.path.join(out, stem + ".exe")
         map_path = os.path.join(out, stem + ".map")
@@ -192,7 +232,8 @@ def build_msvc(out: str) -> None:
             # /MD (dynamic CRT): printf resolves through the IAT, which the
             # iat_calls tests pin. Default /MT links the CRT statically, so
             # main would show no import edges at all.
-            ["cl", "/nologo", "/O2", "/GS-", "/MD", "/W3", "/c", src, "/Fo" + obj],
+            ["cl", "/nologo", "/GS-", "/MD", "/W3", "/c", src, "/Fo" + obj]
+            + cflags,
             cwd=out,
         )
         run(
@@ -204,14 +245,15 @@ def build_msvc(out: str) -> None:
                 "/MAP:" + map_path,
                 "/OUT:" + exe,
                 obj,
-            ],
+            ]
+            + lflags,
             cwd=out,
         )
         write_manifest(manifest, parse_msvc_map(map_path), wanted, aliases)
 
 
 def build_mingw(out: str) -> None:
-    for cc, nm, stem, src, wanted, aliases in (
+    for cc, nm, stem, src, wanted, aliases, opt in (
         (
             "i686-w64-mingw32-gcc",
             "i686-w64-mingw32-nm",
@@ -219,6 +261,19 @@ def build_mingw(out: str) -> None:
             C_SRC,
             C_SYMBOLS,
             None,
+            "-O2",
+        ),
+        # Unoptimized twin of the MSVC /Od build (weak-optimizer shapes on
+        # the GNU side). No incremental-linking equivalent exists for GNU
+        # ld, so the ILT-thunk variant stays MSVC-only.
+        (
+            "i686-w64-mingw32-gcc",
+            "i686-w64-mingw32-nm",
+            "c_callgraph_od",
+            C_SRC,
+            C_SYMBOLS,
+            None,
+            "-O0",
         ),
         (
             "i686-w64-mingw32-g++",
@@ -227,6 +282,7 @@ def build_mingw(out: str) -> None:
             CPP_SRC,
             CPP_SYMBOLS,
             VTABLE_ALIASES,
+            "-O2",
         ),
     ):
         if shutil.which(cc) is None:
@@ -241,7 +297,7 @@ def build_mingw(out: str) -> None:
         run(
             [
                 cc,
-                "-O2",
+                opt,
                 "-fno-stack-protector",
                 "-o",
                 exe,

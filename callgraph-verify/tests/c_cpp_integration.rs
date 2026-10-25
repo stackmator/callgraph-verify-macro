@@ -21,7 +21,7 @@
 
 use callgraph_verify::{
     analyze, cfg_fingerprint, diff_body_calls, diff_calls, has_direct_branch_target, reg_params,
-    ArgKind, Pe, Spec,
+    resolve_thunk, ArgKind, Pe, Spec,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -112,6 +112,60 @@ fn cpp_fixture() -> Option<Fixture> {
     )
 }
 
+/// Unoptimized twin (`/Od` / `-O0`): EBP frames, no inlining, naive
+/// codegen — the closest feasible proxy for a weak/old optimizer. Built on
+/// both toolchains, so REQUIRE-aware like the release fixtures.
+fn c_od_fixture() -> Option<Fixture> {
+    load_fixture(
+        "C-od",
+        "c_callgraph_od",
+        "CALLGRAPH_C_OD_EXE",
+        "CALLGRAPH_C_OD_ADDRS",
+    )
+}
+
+/// Debug + incremental-linking twin (MSVC-only: GNU ld has no ILT).
+/// Skips when absent EVEN under CALLGRAPH_REQUIRE_FIXTURES — MinGW CI can
+/// never produce this artifact, so requiring it would red the ubuntu job.
+fn c_dbg_fixture() -> Option<Fixture> {
+    let exe = std::env::var("CALLGRAPH_C_DBG_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| fixtures_dir().join("c_callgraph_dbg.exe"));
+    let json = std::env::var("CALLGRAPH_C_DBG_ADDRS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| fixtures_dir().join("c_callgraph_dbg_addrs.json"));
+    if !exe.exists() || !json.exists() {
+        eprintln!(
+            "skipping ILT-thunk tests: {exe} not present (MSVC-only artifact; build with cl to run locally)",
+            exe = exe.display(),
+        );
+        let _ = json;
+        return None;
+    }
+    let text = std::fs::read_to_string(&json).expect("read dbg addrs manifest");
+    let raw: BTreeMap<String, String> =
+        serde_json::from_str(&text).expect("parse dbg addrs manifest");
+    let addrs: BTreeMap<String, u64> = raw
+        .into_iter()
+        .map(|(k, v)| {
+            let n = if let Some(h) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                u64::from_str_radix(h, 16)
+            } else {
+                v.parse()
+            }
+            .unwrap_or_else(|_| panic!("bad VA {v:?} for {k}"));
+            (k, n)
+        })
+        .collect();
+    let pe = Pe::load(exe.to_str().unwrap()).expect("load dbg fixture PE");
+    Some(Fixture {
+        label: "C-dbg",
+        exe,
+        pe,
+        addrs,
+    })
+}
+
 fn addr(fx: &Fixture, name: &str) -> u64 {
     *fx
         .addrs
@@ -193,8 +247,7 @@ fn cpp_fixture_is_pe32_with_text() {
 // --- C call graph: exact edges the compilers must have preserved ------------
 
 #[test]
-fn c_branch_caller_calls_both_leaves() {
-    let Some(fx) = c_fixture() else {
+fn c_branch_caller_calls_both_leaves() {    let Some(fx) = c_fixture() else {
         return;
     };
     let edges = call_edges(&fx, addr(&fx, "branch_caller"));
@@ -661,6 +714,142 @@ fn cpp_analyze_and_byte_scan_agree() {
         }
     }
     assert!(checked > 0, "sweep found no analyzable functions");
+}
+
+// --- unoptimized (/Od / -O0) twin: weak-optimizer shapes -------------------
+
+#[test]
+fn c_od_branch_caller_calls_both_leaves() {
+    let Some(fx) = c_od_fixture() else {
+        return;
+    };
+    // Same contract as release, without any optimizer help: EBP frames, no
+    // inlining, naive branches. A weak/old optimizer must preserve these
+    // edges exactly like /O2 does.
+    let edges = call_edges(&fx, addr(&fx, "branch_caller"));
+    for leaf in [addr(&fx, "leaf_add"), addr(&fx, "leaf_const")] {
+        assert!(
+            edges.contains(&leaf),
+            "od branch_caller edges {edges:#x?} miss {leaf:#x}"
+        );
+    }
+    Spec::new(addr(&fx, "branch_caller"))
+        .calls_superset(&[addr(&fx, "leaf_add"), addr(&fx, "leaf_const")])
+        .check(&fx.pe)
+        .expect("superset of the real call set must pass on /Od too");
+    let err = Spec::new(addr(&fx, "branch_caller"))
+        .calls_superset(&[0xDEADBEEF])
+        .check(&fx.pe)
+        .expect_err("invented call must fail on /Od too");
+    assert!(err.contains("HALLUCINATED"), "error: {err}");
+}
+
+#[test]
+fn c_od_sweeps_agree_and_diff_clean() {
+    let Some(fx) = c_od_fixture() else {
+        return;
+    };
+    // Unoptimized binaries are denser with calls and stack traffic: the
+    // byte-scan/decoder agreement and diff-cleanliness must hold there too.
+    let addrs = sweep_functions(&fx.pe, 512);
+    let mut checked = 0u32;
+    for caller in &addrs {
+        if let Ok(cg) = analyze(&fx.pe, *caller) {
+            let real: Vec<u64> = cg.call_targets().into_iter().collect();
+            let d = diff_calls(&fx.pe, *caller, &real, true)
+                .unwrap_or_else(|e| panic!("diff_calls at {caller:#x} failed: {e}"));
+            assert!(
+                d.hallucinated.is_empty() && d.missing.is_empty(),
+                "{caller:#x} not clean: {d:?}"
+            );
+            for &t in cg.direct_calls.keys() {
+                checked += 1;
+                assert!(
+                    has_direct_branch_target(&fx.pe, t),
+                    "CALL target {t:#x} from {caller:#x} missing in byte scan"
+                );
+            }
+        }
+    }
+    assert!(checked > 0, "od sweep found no direct calls");
+}
+
+// --- incremental-linking (ILT thunk) twin: MSVC-only -------------------------
+
+#[test]
+fn c_dbg_calls_route_through_thunks() {
+    let Some(fx) = c_dbg_fixture() else {
+        return;
+    };
+    // /INCREMENTAL routes every function call through an ILT `JMP real_fn`
+    // stub — the old-debug-build shape. At least one swept direct edge must
+    // resolve through such a thunk to a different executable VA.
+    let addrs = sweep_functions(&fx.pe, 512);
+    let mut resolved = Vec::new();
+    for caller in &addrs {
+        if let Ok(cg) = analyze(&fx.pe, *caller) {
+            for &t in cg.direct_calls.keys() {
+                if let Some(u) = resolve_thunk(&fx.pe, t) {
+                    if u != t && fx.pe.is_executable_section_va(u) {
+                        resolved.push((*caller, t, u));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        !resolved.is_empty(),
+        "no ILT thunk edges in the dbg build — is incremental linking on?"
+    );
+}
+
+#[test]
+fn c_dbg_diff_accepts_real_callee_through_thunk() {
+    let Some(fx) = c_dbg_fixture() else {
+        return;
+    };
+    // The binary CALLs ILT stubs, but a faithful port calls the REAL
+    // functions: `diff_body_calls` must accept that via its thunk-tolerant
+    // wide set instead of flagging HALLUCINATED.
+    let caller = addr(&fx, "branch_caller");
+    let bin: Vec<u64> = analyze(&fx.pe, caller)
+        .expect("analyze dbg branch_caller")
+        .call_targets()
+        .into_iter()
+        .collect();
+    assert!(
+        !bin.is_empty(),
+        "dbg branch_caller has no direct calls — incremental linking off?"
+    );
+    let corpus: BTreeSet<u64> = [addr(&fx, "leaf_add"), addr(&fx, "leaf_const")]
+        .into_iter()
+        .collect();
+    let rust_idents = vec![
+        ("leaf_add".to_string(), vec![addr(&fx, "leaf_add")]),
+        ("leaf_const".to_string(), vec![addr(&fx, "leaf_const")]),
+    ];
+    let d = diff_body_calls(
+        &fx.pe,
+        &[caller],
+        &corpus,
+        &rust_idents,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
+    .expect("diff_body_calls");
+    assert!(
+        d.hallucinated.is_empty(),
+        "real callees reached through ILT stubs must be accepted: {:?}",
+        d.hallucinated
+    );
+    // Sanity: the test is not vacuous — the binary really does call stubs,
+    // not the manifest VAs directly.
+    for t in &bin {
+        assert!(
+            !corpus.contains(t),
+            "dbg build calls {t:#x} directly (no thunk?) — test premise broken"
+        );
+    }
 }
 
 /// Read the first 8 vtable slots at `vt`, keeping only slots that point

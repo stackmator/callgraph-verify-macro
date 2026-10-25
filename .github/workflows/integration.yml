@@ -45,8 +45,13 @@ jobs:
         with:
           targets: i686-pc-windows-msvc
 
-      - name: Build C/C++ fixtures to 32-bit PEs
+      - name: Build C/C++/DOS fixtures to 32-bit binaries
         run: python callgraph-verify/test-fixtures/build_fixtures.py --out target/fixtures
+
+      - name: Assert all fixture artifacts exist
+        run: |
+          Get-ChildItem target/fixtures/
+          foreach ($f in @('c_callgraph.exe', 'c_callgraph_addrs.json', 'c_callgraph_od.exe', 'c_callgraph_od_addrs.json', 'c_callgraph_dbg.exe', 'c_callgraph_dbg_addrs.json', 'cpp_callgraph.exe', 'cpp_callgraph_addrs.json')) { if (!(Test-Path "target/fixtures/$f")) { throw "missing $f" } }
 
       - name: Full test suite
         run: cargo test --workspace --verbose
@@ -80,9 +85,13 @@ jobs:
           ls -la target/fixtures/
           test -f target/fixtures/c_callgraph.exe
           test -f target/fixtures/c_callgraph_addrs.json
+          test -f target/fixtures/c_callgraph_od.exe
+          test -f target/fixtures/c_callgraph_od_addrs.json
           test -f target/fixtures/cpp_callgraph.exe
           test -f target/fixtures/cpp_callgraph_addrs.json
           test -f target/fixtures/dos_callgraph.exe
+          # No c_callgraph_dbg.* here: ILT incremental linking is MSVC-only,
+          # so the thunk tests skip on MinGW (see c_dbg_fixture).
 
       - name: C/C++ fixture integration tests
         run: cargo test -p callgraph-verify --test c_cpp_integration --verbose
