@@ -379,6 +379,37 @@ fn c_loop_has_back_edge() {
 }
 
 #[test]
+fn c_nested_loops_have_two_back_edges() {
+    let Some(fx) = c_fixture() else {
+        return;
+    };
+    // The macro's E016 CFG gate fires at `loops >= 2` — previously pinned
+    // only by hand-written bytes (tests/ui/e016_cfg.rs). The inner + outer
+    // loop must each leave a dominance-confirmed back-edge on both toolchains.
+    let fp = cfg_fingerprint(&fx.pe, addr(&fx, "nested_sum")).expect("cfg nested_sum");
+    assert!(
+        fp.loops >= 2,
+        "nested_sum's two for-loops must leave two back-edges: {fp:?}"
+    );
+}
+
+#[test]
+fn c_switch_compiles_to_jump_table() {
+    let Some(fx) = c_fixture() else {
+        return;
+    };
+    // First coverage of the fingerprint's `switch_cases` prong anywhere:
+    // 8 dense cases must lower to `JMP [table+idx*4]`, and
+    // `follow_jump_table` must resolve the table to >= 3 case entries
+    // (the macro's E016 switch threshold).
+    let fp = cfg_fingerprint(&fx.pe, addr(&fx, "classify")).expect("cfg classify");
+    assert!(
+        fp.switch_cases >= 3,
+        "classify's 8-case switch must resolve a jump table: {fp:?}"
+    );
+}
+
+#[test]
 fn c_manifest_functions_are_referenced() {
     let Some(fx) = c_fixture() else {
         return;

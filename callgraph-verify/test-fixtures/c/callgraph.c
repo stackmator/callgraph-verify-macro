@@ -60,6 +60,39 @@ NOINLINE int loop_sum(int n) {
     return s;
 }
 
+// --- nested loops: two natural back-edges (inner + outer) ------------------
+// This is the macro's E016 CFG firing threshold (`loops >= 2`), pinned here
+// on real compiler output instead of only hand-written bytes (e016_cfg.rs).
+
+NOINLINE int nested_sum(int n, int m) {
+    int s = 0;
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < m; j++) {
+            s += i + j;
+        }
+    }
+    return s;
+}
+
+// --- dense switch: 8 consecutive cases lower to a jump table ---------------
+// First coverage of the fingerprint's `switch_cases` prong: both toolchains
+// emit `JMP [table+idx*4]` for this shape, which `follow_jump_table` must
+// resolve to >= 3 case entries.
+
+NOINLINE int classify(int v) {
+    switch (v) {
+        case 0: return 10;
+        case 1: return 11;
+        case 2: return 12;
+        case 3: return 13;
+        case 4: return 14;
+        case 5: return 15;
+        case 6: return 16;
+        case 7: return 17;
+        default: return -1;
+    }
+}
+
 // --- a global: `read_global`/`write_global` must reference `g_counter` -----
 
 int g_counter = 0;
@@ -116,6 +149,9 @@ int main(void) {
     total += branch_caller(7);   // takes the leaf_const side
     total += parent_fn(5);
     total += loop_sum(10);
+    total += nested_sum(10, 10);
+    total += classify(3);
+    total += classify(99);
     total += read_global();
     total += field_read(&pt);
     field_write(&pt, 9);

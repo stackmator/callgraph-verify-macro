@@ -45,10 +45,12 @@ suite by skipping.
 
 * Every function must be reachable from `main` (or the linker discards it)
   and marked NOINLINE (C/C++; the DOS build relies on no-opt instead).
-* Keep at least one of each shape the tests discover: a 2-callee caller
-  (`branch_caller`), a leaf (`leaf_const`), a loop (`loop_sum`), an
-  indirect call (`apply_twice`), a global (`g_counter`), a struct field
-  pair (`field_read`/`field_write`), and — C++ only — a virtual call
+* Keep at least one of each shape the tests pin: a 2-callee caller
+  (`branch_caller`), a leaf (`leaf_const`), a loop (`loop_sum`), a nested
+  loop (`nested_sum`, the E016 `loops >= 2` threshold), a dense 8-case
+  switch (`classify`, the `switch_cases >= 3` threshold), an indirect call
+  (`apply_twice`), a global (`g_counter`), a struct field pair
+  (`field_read`/`field_write`), and — C++ only — a virtual call
   (`cpp_use_virtual_fn`).
 * DOS scope: LE fixups are not applied yet (`Pe::parse_le` docs), so only
   call edges / indirect counts / CFG shape are pinned on LE — never

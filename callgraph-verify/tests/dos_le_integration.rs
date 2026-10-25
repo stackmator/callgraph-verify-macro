@@ -218,6 +218,50 @@ fn dos_spec_gates_on_discovered_caller() {
 }
 
 #[test]
+fn dos_nested_loops_have_two_back_edges() {
+    let Some(_) = load_dos() else {
+        return;
+    };
+    let (_, pe) = load_dos().unwrap();
+    // Back-edges are rel32-based, hence fixup-independent: safe to pin on LE.
+    let addrs = sweep_functions(&pe, 512);
+    let mut best = 0usize;
+    for a in &addrs {
+        if let Ok(fp) = cfg_fingerprint(&pe, *a) {
+            best = best.max(fp.loops);
+        }
+    }
+    assert!(
+        best >= 2,
+        "no swept LE function has two loop back-edges (want nested_sum); max loops = {best}"
+    );
+}
+
+#[test]
+fn dos_switch_table_resolves() {
+    let Some(_) = load_dos() else {
+        return;
+    };
+    let (_, pe) = load_dos().unwrap();
+    // Watcom lowers the dense 8-case `classify` switch to a jump table;
+    // `follow_jump_table` must resolve >= 3 case entries. Caveat: LE fixups
+    // are unapplied, so if wlink leaves table entries as pre-fixup values
+    // outside the function span this finds nothing — that outcome confirms
+    // the pe.rs caveat with real evidence (relax and document it then).
+    let addrs = sweep_functions(&pe, 512);
+    let mut best = 0usize;
+    for a in &addrs {
+        if let Ok(fp) = cfg_fingerprint(&pe, *a) {
+            best = best.max(fp.switch_cases);
+        }
+    }
+    assert!(
+        best >= 3,
+        "no swept LE function resolves a jump table (want classify); max switch_cases = {best}"
+    );
+}
+
+#[test]
 fn dos_leaf_and_loop_exist() {
     let Some(_) = load_dos() else {
         return;

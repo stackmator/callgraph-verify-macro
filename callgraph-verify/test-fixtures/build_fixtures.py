@@ -47,6 +47,8 @@ C_SYMBOLS = [
     "branch_caller",
     "parent_fn",
     "loop_sum",
+    "nested_sum",
+    "classify",
     "g_counter",
     "read_global",
     "write_global",
