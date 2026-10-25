@@ -34,10 +34,11 @@ python3 build_fixtures.py --out <dir>   # default: <repo>/target/fixtures
   `ilammy/msvc-dev-cmd` action with `arch: x86` — needs `cl`/`link` on PATH.
 * Linux: needs `i686-w64-mingw32-gcc` / `-g++` (`gcc-mingw-w64-i686`,
   `g++-mingw-w64-i686` packages).
-* DOS: built automatically when `owcc` is on PATH (CI installs it via
-  `open-watcom/setup-watcom` with `target: dos`); skipped with a note
-  otherwise. No optimization flags on purpose — `wcc386` does not inline
-  without `-oe`, so every call edge survives.
+* DOS: built automatically when `owcc` is on PATH (CI installs it on the
+  ubuntu job via `open-watcom/setup-watcom` with `target: dos`; skipped
+  elsewhere — the dos tests skip even under REQUIRE, since Windows CI can
+  never have Watcom; the   ubuntu job is the DOS gate). No optimization flags on purpose — `wcc386`
+  does not inline without `-oe`, so every call edge survives.
 
 Each PE fixture also gets a `<stem>_addrs.json` manifest
 (`{"leaf_add": "0x401000", ...}`) with preferred VAs extracted from the

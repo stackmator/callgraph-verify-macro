@@ -161,7 +161,21 @@ def write_manifest(
     for alias, raws in (aliases or {}).items():
         hit = next((r for r in raws if r in raw_symbols), None)
         if hit is None:
-            missing.append(f"{alias} (one of {'/'.join(raws)})")
+            # Show near-misses so a toolchain spelling difference (e.g. a
+            # new MinGW nm decoration) is diagnosable from the CI log
+            # without re-running the build.
+            probes = ("tv", "6b@", "??_", "_ztv", "vtbl", "vtable", "typeinfo")
+            near = sorted(
+                {
+                    r
+                    for r in raw_symbols
+                    if any(p in r.lower() for p in probes)
+                }
+            )
+            missing.append(
+                f"{alias} (one of {'/'.join(raws)}; {len(raw_symbols)} symbols "
+                f"parsed, near-misses: {near[:15]})"
+            )
         else:
             manifest[alias] = hex(raw_symbols[hit])
     if missing:
