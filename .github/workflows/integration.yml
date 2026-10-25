@@ -1,0 +1,97 @@
+# Real-compiler integration tests.
+#
+# Builds the fixtures in `callgraph-verify/test-fixtures/` with genuine
+# toolchains, then runs the verifier's test suite over that compiler output:
+#
+# * Windows: MSVC `cl`/`link` (x86) -> full `cargo test --workspace`
+#   (includes the Rust `test-bin` i686 suite and the trybuild UI suite).
+# * Ubuntu: `i686-w64-mingw32-gcc`/`g++` cross-compile C/C++ to 32-bit PE,
+#   Open Watcom (`owcc -bdos4g`) builds the DOS4GW LE fixture -> the
+#   host-independent suites (`c_cpp_integration`, `dos_le_integration`,
+#   `perf`, macro tests). The `test-bin`-backed `integration` suite needs
+#   the MSVC linker, so it only runs on Windows.
+#
+# DOS scope: LE fixups are not applied yet (see `pe.rs`), so the LE tests
+# pin call-graph/CFG facts only — never absolute globals/vtables/IAT.
+#
+# `CALLGRAPH_REQUIRE_FIXTURES=1` turns a missing fixture into a hard test
+# failure: a broken build step must never silently green the suite by
+# skipping every fixture test.
+
+name: integration
+
+on:
+  push:
+  pull_request:
+
+env:
+  CALLGRAPH_REQUIRE_FIXTURES: "1"
+
+jobs:
+  integration-windows:
+    name: windows (MSVC fixtures + full suite)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC x86 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+
+      - name: Build C/C++ fixtures to 32-bit PEs
+        run: python callgraph-verify/test-fixtures/build_fixtures.py --out target/fixtures
+
+      - name: Full test suite
+        run: cargo test --workspace --verbose
+
+  integration-ubuntu:
+    name: ubuntu (MinGW + Watcom fixtures + host suites)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 32-bit toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-i686 g++-mingw-w64-i686
+
+      - name: Set up Open Watcom (DOS4GW LE fixture)
+        uses: open-watcom/setup-watcom@v1
+        with:
+          version: "2.0"
+          target: "dos"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cross-compile fixtures (PE via MinGW, LE via Watcom)
+        run: python3 callgraph-verify/test-fixtures/build_fixtures.py --out target/fixtures
+
+      - name: Assert all fixture artifacts exist
+        run: |
+          ls -la target/fixtures/
+          test -f target/fixtures/c_callgraph.exe
+          test -f target/fixtures/c_callgraph_addrs.json
+          test -f target/fixtures/cpp_callgraph.exe
+          test -f target/fixtures/cpp_callgraph_addrs.json
+          test -f target/fixtures/dos_callgraph.exe
+
+      - name: C/C++ fixture integration tests
+        run: cargo test -p callgraph-verify --test c_cpp_integration --verbose
+
+      - name: DOS4GW LE fixture integration tests
+        run: cargo test -p callgraph-verify --test dos_le_integration --verbose
+
+      - name: Perf regression tests (synthetic PEs, host-only)
+        run: cargo test -p callgraph-verify --test perf --verbose
+
+      - name: Macro unit + trybuild UI tests (host-only)
+        run: cargo test -p callgraph-verify-macro --verbose

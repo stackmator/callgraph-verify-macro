@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Real-compiler integration tests in GitHub Actions
+  (`.github/workflows/integration.yml`): CI compiles
+  `callgraph-verify/test-fixtures/` with genuine toolchains and runs the
+  verifier over that output — C and C++ to 32-bit PE via MSVC `cl` (Windows)
+  and MinGW-w64 (Ubuntu), plus a DOS4GW linear executable via Open Watcom
+  `owcc -bdos4g` (Ubuntu). New suites: `tests/c_cpp_integration.rs`
+  (symbol-anchored call-graph, Spec, operand, and CFG checks via linker-map
+  / `nm` manifests) and `tests/dos_le_integration.rs` (shape-discovered
+  coverage of the `parse_le` path: sweep, byte-scan agreement, Spec gates,
+  leaf/loop existence). Missing fixtures skip locally but fail under
+  `CALLGRAPH_REQUIRE_FIXTURES=1` (set in CI) so a broken build step can
+  never silently green the suite. DOS tests pin call/CFG facts only —
+  absolute globals/vtables stay out until LE fixup support lands.
+
 ### Fixed
 
 - `referenced_addrs` (the ORIGIN-UNREFERENCED scan) now indexes `JMP

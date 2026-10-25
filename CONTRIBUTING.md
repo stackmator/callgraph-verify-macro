@@ -34,3 +34,23 @@ All green, plus a `CHANGELOG.md` entry under `[Unreleased]` following
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). If the change
 alters gate behavior on a real binary, say which one and show the
 before/after (`--summary` deltas, new/moved diagnostics, or lack thereof).
+
+## Real-compiler fixture tests
+
+`callgraph-verify/test-fixtures/` holds small C, C++, and DOS programs
+that CI compiles with genuine toolchains (MSVC, MinGW, Open Watcom) and
+that `tests/c_cpp_integration.rs` / `tests/dos_le_integration.rs` verify
+(see `test-fixtures/README.md`). To run them locally:
+
+```sh
+# Windows (x86 dev prompt): MSVC build; Linux: MinGW cross-build.
+python3 callgraph-verify/test-fixtures/build_fixtures.py
+cargo test -p callgraph-verify --test c_cpp_integration
+cargo test -p callgraph-verify --test dos_le_integration   # needs owcc; skips without it
+```
+
+If you touch fixture sources, keep every function reachable from `main`
+and preserve the shapes the tests pin (caller/leaf/loop/indirect/global/
+field/virtual — see the fixtures README). If you touch the verifier's
+PE/LE parsing or call harvesting, these suites plus the GitHub
+`integration` workflow are the acceptance bar.

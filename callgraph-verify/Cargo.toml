@@ -34,3 +34,8 @@ path = "src/main.rs"
 # `nasm` adds the formatter used by the reference-skeleton emitter (host-only build dep).
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info", "nasm"] }
 
+[dev-dependencies]
+# Only used by tests/c_cpp_integration.rs to read the address manifests that
+# test-fixtures/build_fixtures.py writes (never linked into the library/CLI).
+serde_json = "1"
+
