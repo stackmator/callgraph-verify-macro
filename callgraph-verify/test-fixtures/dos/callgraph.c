@@ -105,10 +105,24 @@ int g_counter = 0;
 
 int read_global(void) {
     return g_counter;
+}void write_global(int v) {
+    g_counter = v;
 }
 
-void write_global(int v) {
-    g_counter = v;
+/* Parity with the C fixture's inlining pair (Watcom builds -od only, so
+ * both stay real calls here; the /O2-vs-/Od differential is PE-only). */
+int g_k2 = 7;
+
+int tiny_sum(void) {
+    return g_counter + g_k2;
+}
+
+typedef int (*sum_fn)(void);
+
+sum_fn g_sum_fn = 0;
+
+int uses_tiny(int x) {
+    return tiny_sum() + tiny_sum() + x;
 }
 
 struct Point {
@@ -150,6 +164,9 @@ int main(void) {
     total += classify(99);
     total += decision_chain(5);
     total += decision_chain(99);
+    g_sum_fn = tiny_sum;
+    total += uses_tiny(3);
+    total += g_sum_fn();
     total += read_global();
     total += field_read(&pt);
     field_write(&pt, 9);

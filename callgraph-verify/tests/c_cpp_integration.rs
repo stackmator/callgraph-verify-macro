@@ -774,6 +774,110 @@ fn c_od_sweeps_agree_and_diff_clean() {
     assert!(checked > 0, "od sweep found no direct calls");
 }
 
+// --- /O2-vs-/Od inlining differential ----------------------------------------
+// Same source, two optimizers: any call edge the /Od build has but the /O2
+// build lacks is a REAL compiler inlining event with ground truth on both
+// sides (od callee VA + standalone O2 copy). Each one must satisfy the
+// inlining rule through the production `diff_body_calls` path — this
+// calibrates `is_inlined_into`/footprint-subset on optimizer behavior,
+// not hand-written bytes. Alignment is by manifest name; unnamed CRT
+// callees can't be matched across builds and are skipped.
+
+#[test]
+fn c_o2_vs_od_inlining_differential() {
+    let Some(fx) = c_fixture() else {
+        return;
+    };
+    let Some(od) = c_od_fixture() else {
+        return;
+    };
+    // Reverse map: od VA -> source name.
+    let od_names: std::collections::HashMap<u64, &str> = od
+        .addrs
+        .iter()
+        .map(|(k, &v)| (v, k.as_str()))
+        .collect();
+    // (caller_name, callee_name) pairs inlined at /O2 but called at /Od.
+    let mut events: Vec<(String, String)> = Vec::new();
+    let mut compared = 0u32;
+    for (name, &o2_va) in fx.addrs.iter() {
+        let (Some(&od_va)) = od.addrs.get(name) else {
+            continue;
+        };
+        // Data symbols and vtables have no code to compare.
+        if !fx.pe.is_executable_section_va(o2_va)
+            || !od.pe.is_executable_section_va(od_va)
+        {
+            continue;
+        }
+        let (Ok(cg_o2), Ok(cg_od)) =
+            (analyze(&fx.pe, o2_va), analyze(&od.pe, od_va))
+        else {
+            continue;
+        };
+        compared += 1;
+        let o2_edges = call_edges(&fx, o2_va);
+        let od_edges = call_edges(&od, od_va);
+        for t_od in &od_edges {
+            let (Some(callee_name)) = od_names.get(t_od).copied() else {
+                continue; // unnamed CRT/internal helper — can't align
+            };
+            let (Some(&o2_target)) = fx.addrs.get(callee_name) else {
+                continue;
+            };
+            if !o2_edges.contains(&o2_target) {
+                events.push((name.clone(), callee_name.to_string()));
+            }
+        }
+    }
+    assert!(
+        compared > 0,
+        "no manifest functions analyzable in both builds"
+    );
+    eprintln!("O2-vs-Od: compared {compared} functions, inlining events: {events:?}");
+    // The flagship must be there: `tiny_sum` is called twice at /Od and
+    // inlined at /O2 (verified by asm inspection), with a standalone copy
+    // emitted (address taken). If a toolchain stops inlining this shape,
+    // the count below drops and this trips — check its build flags, don't
+    // just delete the assertion.
+    assert!(
+        events
+            .iter()
+            .any(|(f, c)| f == "uses_tiny" && c == "tiny_sum"),
+        "expected uses_tiny->tiny_sum inlining event; got {events:?}"
+    );
+    // Every event must satisfy the rule through the production path: a
+    // faithful port calling the real callee is `inlined_ok`, never
+    // HALLUCINATED. (A failure here is either a triage-worthy rule gap or
+    // a misaligned edge — the message carries both VAs.)
+    for (caller_name, callee_name) in &events {
+        let f_o2 = addr(&fx, caller_name);
+        let c_o2 = addr(&fx, callee_name);
+        let corpus: BTreeSet<u64> = [c_o2].into_iter().collect();
+        let d = diff_body_calls(
+            &fx.pe,
+            &[f_o2],
+            &corpus,
+            &[(callee_name.clone(), vec![c_o2])],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap_or_else(|e| panic!("diff for {caller_name}->{callee_name}: {e}"));
+        assert!(
+            d.inlined_ok.iter().any(|n| n == callee_name),
+            "{caller_name}->{callee_name} (O2 {f_o2:#x}->{c_o2:#x}) must be \
+             inlined_ok, got hallucinated={:?} missing={:?}",
+            d.hallucinated,
+            d.missing
+        );
+        assert!(
+            d.hallucinated.is_empty(),
+            "{caller_name}->{callee_name}: unexpected hallucinations: {:?}",
+            d.hallucinated
+        );
+    }
+}
+
 // --- incremental-linking (ILT thunk) twin: MSVC-only -------------------------
 
 #[test]

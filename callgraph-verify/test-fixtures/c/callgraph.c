@@ -130,6 +130,30 @@ NOINLINE void write_global(int v) {
     g_counter = v;
 }
 
+// --- inlining ground truth: tiny_sum is inlined at /O2, called at /Od ----
+// `tiny_sum` reads two globals, so its footprint has the >= 2 distinct
+// in-image references the inlining rule requires. `uses_tiny` calls it
+// twice. At /O2 the calls are inlined (no CALL in uses_tiny) while a
+// standalone copy is still emitted (address taken into `g_sum_fn` +
+// external linkage, no /GL) — so the /O2-vs-/Od differential below has a
+// REAL optimizer inlining event with a resolvable callee VA. At /Od the
+// calls are real. Deliberately NO noinline/inline markers: the point is
+// what the optimizer does on its own. (Placed after the globals it reads.)
+
+int g_k2 = 7;
+
+int tiny_sum(void) {
+    return g_counter + g_k2;
+}
+
+typedef int (*sum_fn)(void);
+
+sum_fn g_sum_fn = 0;
+
+NOINLINE int uses_tiny(int x) {
+    return tiny_sum() + tiny_sum() + x;
+}
+
 // --- struct fields: offsets 0 (`x`) and 4 (`y`) -----------------------------
 
 struct Point {
@@ -179,6 +203,9 @@ int main(void) {
     total += classify(99);
     total += decision_chain(5);
     total += decision_chain(99);
+    g_sum_fn = tiny_sum;
+    total += uses_tiny(3);
+    total += g_sum_fn();
     total += read_global();
     total += field_read(&pt);
     field_write(&pt, 9);

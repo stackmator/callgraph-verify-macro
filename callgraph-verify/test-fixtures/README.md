@@ -72,10 +72,12 @@ it skips when the variable is unset, even under REQUIRE.
 * Keep at least one of each shape the tests pin: a 2-callee caller
   (`branch_caller`), a leaf (`leaf_const`), a loop (`loop_sum`), a nested
   loop (`nested_sum`, the E016 `loops >= 2` threshold), a dense 8-case
-  switch (`classify`, the `switch_cases >= 3` threshold), a 12-strong
+  switch (`classify`, the `switch_cases >= 3` threshold), a 14-strong
   if-chain (`decision_chain`, the `conditionals >= 12` threshold), an
-  indirect call (`apply_twice`), a global (`g_counter`), a struct field
-  pair (`field_read`/`field_write`), and — C++ only — a virtual call
+  inlinable pair (`tiny_sum` called twice by `uses_tiny`, address taken —
+  the /O2-vs-/Od inlining differential), an indirect call (`apply_twice`),
+  globals (`g_counter`, `g_k2`), a struct field pair
+  (`field_read`/`field_write`), and — C++ only — a virtual call
   (`cpp_use_virtual_fn`) plus a member-reading method (`Circle::kind`,
   the thiscall/vtable-only pins).
 * DOS scope: LE fixups are not applied yet (`Pe::parse_le` docs), so only
