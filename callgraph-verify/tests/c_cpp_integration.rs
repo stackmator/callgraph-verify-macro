@@ -650,8 +650,12 @@ fn c_od_switch_case_calls_recovered() {
         .collect();
     assert!(
         sites.len() >= 7,
-        "od classify must call leaf_add in (nearly) every case: {:?}",
-        cg.direct_calls
+        "od classify must call leaf_add in (nearly) every case: toolchain={} direct={:?} tails={:?} ind_jumps={} fp={:?}",
+        od.toolchain,
+        cg.direct_calls,
+        cg.tail_calls,
+        cg.indirect_jumps,
+        cfg_fingerprint(&od.pe, addr(&od, "classify")).ok(),
     );
     if od.toolchain == "msvc" {
         assert_eq!(

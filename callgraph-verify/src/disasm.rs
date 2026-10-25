@@ -488,8 +488,22 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
                 FlowControl::UnconditionalBranch => {
                     let t = instr.near_branch_target();
                     if (lo..hi).contains(&t) {
-                        branch_seed.entry(t).or_insert_with(|| block_buf.clone());
-                        work.push(t);
+                        // Single-JMP entry stub: a function whose entire
+                        // entry block is one unconditional JMP (sibling-call
+                        // `JMP tail_target`, ICF forwarder, `jmp` over no
+                        // bytes) transfers control elsewhere instead of
+                        // containing its own body. Following it would merge
+                        // the callee's body (and globals) into the caller,
+                        // hiding the tail edge the gate checks. Scoped to
+                        // exactly one instruction so a `JMP` that skips an
+                        // inline jump table after a prologue (multi-instr
+                        // entry block) keeps the follow behavior below.
+                        if start == lo && block_buf.len() == 1 {
+                            cg.tail_calls.insert(t);
+                        } else {
+                            branch_seed.entry(t).or_insert_with(|| block_buf.clone());
+                            work.push(t);
+                        }
                     } else {
                         cg.tail_calls.insert(t);
                     }
