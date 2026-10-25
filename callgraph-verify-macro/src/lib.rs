@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Expr, ExprArray, Ident, Lit, LitInt, Token};
 
-use callgraph_verify::{analyze, cfg_fingerprint, diff_body_calls, reg_params, ArgKind, Pe, Spec};
+use callgraph_verify::{analyze, cfg_fingerprint, diff_body_calls, reg_params, tail_referenced, ArgKind, Pe, Spec};
 
 mod body;
 mod corpus;
@@ -214,6 +214,34 @@ fn note(msg: &str) {
     {
         eprintln!("callgraph_verify_macro: {msg}");
     }
+}
+
+/// Render the "skipped files" suffix for E008. A single broken file makes
+/// every origin inside it report a misleading CORPUS-GAP with no hint at
+/// the real cause; naming the skipped files turns it actionable. Capped so
+/// a mass-broken tree doesn't flood the diagnostic. `None` when the corpus
+/// scanned clean (existing E008 wording is untouched in that case).
+fn parse_errors_note(parse_errors: &[String]) -> Option<String> {
+    if parse_errors.is_empty() {
+        return None;
+    }
+    const SHOW: usize = 5;
+    let mut listed: String = parse_errors
+        .iter()
+        .take(SHOW)
+        .map(|s| format!("\n  - {s}"))
+        .collect();
+    if parse_errors.len() > SHOW {
+        listed.push_str(&format!(
+            "\n  - ... and {} more",
+            parse_errors.len() - SHOW
+        ));
+    }
+    Some(format!(
+        ". Scanner skipped {} unreadable/unparseable file(s):{listed}. Fix these \
+         first — every origin inside them reports this same gap",
+        parse_errors.len()
+    ))
 }
 
 /// `#[origin(0xADDR)]` — provenance tag + compile-time call-graph verifier.
@@ -594,17 +622,18 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         // body-diff below would pass trivially: no rust_idents resolve, no
         // MISSING can fire, DUP-ADDR has no owners. Fail loudly instead.
         if !map.corpus.contains(&args.addr) {
+            let mut msg = format!(
+                "origin {:#010x} is not in the corpus scanned from \
+                 REBUILD_ROOT={root} — wrong root, empty/missing directory, or \
+                 the owning file failed to parse. Body-call verification \
+                 cannot run",
+                args.addr
+            );
+            if let Some(note) = parse_errors_note(&map.parse_errors) {
+                msg.push_str(&note);
+            }
             errors.push(
-                error::RichError::new(
-                    error::Code::CorpusGap,
-                    format!(
-                        "origin {:#010x} is not in the corpus scanned from \
-                         REBUILD_ROOT={root} — wrong root, empty/missing directory, or \
-                         the owning file failed to parse. Body-call verification \
-                         cannot run",
-                        args.addr
-                    ),
-                )
+                error::RichError::new(error::Code::CorpusGap, msg)
                 .with_span(fn_like.attr_target_span())
                 .with_fix(
                     "fix REBUILD_ROOT so it contains the source with this #[origin] tag, \
@@ -854,6 +883,17 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             referenced.extend(&cg.globals);
             referenced.extend(&cg.imm_addrs);
             referenced.extend(&cg.iat_calls);
+            // Fold in each tail target's own referenced addresses (globals,
+            // immediates, IAT slots) — the address-side mirror of the
+            // call-side wide set in `diff_body_calls`, which already counts
+            // a tail target's callees as acceptable spellings. A tail-call
+            // `JMP G` transfers control to G, so G's data references execute
+            // as part of THIS function; a port that duplicates a shared tail
+            // body (e.g. a predicate tail-jumped into from two origins)
+            // bakes G's addresses faithfully. Without this fold the gate
+            // demands duplication (no MISSING) yet forbids the addresses
+            // (E015) — an unsatisfiable pair. Only ever ADDS acceptance.
+            referenced.extend(tail_referenced(&pe, &cg));
             let mut reported: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
             // Collect hex-literal spans so each HALLUCINATED-ADDR error can
             // be attached to the literal that bakes the invented address.
@@ -1237,7 +1277,7 @@ pub fn vtable_table(input: TokenStream) -> TokenStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{vtable_method_map, vtable_only_dispatch_msg, CacheKey};
+    use super::{parse_errors_note, vtable_method_map, vtable_only_dispatch_msg, CacheKey};
     use crate::Pe;
     use quote::{quote, ToTokens};
 
@@ -1263,6 +1303,25 @@ mod tests {
             facts.ifs >= 1,
             "function body conditional was not preserved"
         );
+    }
+
+    #[test]
+    fn parse_errors_note_names_skipped_files() {
+        // Clean corpus: no suffix (existing E008 wording untouched).
+        assert_eq!(parse_errors_note(&[]), None);
+        // One broken file: named, with count.
+        let one = parse_errors_note(&["gen/broken.rs: unparseable (expected one of `!` or `::`)".to_string()]);
+        let text = one.expect("note for one broken file");
+        assert!(text.contains("1 unreadable/unparseable file(s)"), "{text}");
+        assert!(text.contains("gen/broken.rs"), "{text}");
+        // Capped listing with overflow count.
+        let many: Vec<String> = (0..8).map(|i| format!("f{i}.rs: unparseable (e)").to_string()).collect();
+        let text = parse_errors_note(&many).expect("note for many broken files");
+        assert!(text.contains("... and 3 more"), "{text}");
+        for i in 0..5 {
+            assert!(text.contains(&format!("f{i}.rs")), "{text}");
+        }
+        assert!(!text.contains("f7.rs"), "beyond the cap: {text}");
     }
 
     #[test]

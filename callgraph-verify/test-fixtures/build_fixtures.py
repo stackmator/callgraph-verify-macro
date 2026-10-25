@@ -61,6 +61,9 @@ C_SYMBOLS = [
     "field_write",
     "apply_twice",
     "use_apply",
+    "g_tail_tag",
+    "tail_target",
+    "tail_caller",
 ]
 
 CPP_SYMBOLS = [

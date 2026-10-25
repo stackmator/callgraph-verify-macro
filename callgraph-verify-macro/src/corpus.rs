@@ -37,6 +37,12 @@ pub struct Corpus {
     /// Harvested by the same file scan so the body check can see through
     /// unambiguous local macros (see `expand`).
     pub macro_defs: HashMap<String, Vec<expand::MacroDef>>,
+    /// Source files the scanner had to skip (`"<relpath>: <reason>"`),
+    /// i.e. unreadable or unparseable. Every `#[origin]` inside them is
+    /// invisible to the corpus, so their functions report a misleading
+    /// CORPUS-GAP instead of the real cause. The verifier surfaces this
+    /// list on every E008 so the actual breakage is actionable.
+    pub parse_errors: Vec<String>,
 }
 
 /// Scan `root` for the corpus map, caching the result per root path.
@@ -70,27 +76,47 @@ fn build(root: &str) -> Corpus {
         corpus: BTreeSet::new(),
         declared_vtables: Vec::new(),
         macro_defs: HashMap::new(),
+        parse_errors: Vec::new(),
     };
     let root_path = std::path::Path::new(root);
     for path in rust_files(root_path) {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                c.parse_errors.push(format!(
+                    "{}: unreadable ({e})",
+                    disp_of(root_path, &path)
+                ));
+                continue;
+            }
         };
-        let disp = path
-            .strip_prefix(root_path)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let disp = disp_of(root_path, &path);
         // syn-based scan: the Rust parser resolves every comment-vs-attribute-vs-code
         // ambiguity; only structured attributes carry provenance facts, never comments.
-        let Ok(file) = syn_parse_file(&text) else {
-            continue;
-        };
-        for item in &file.items {
-            scan_item(item, &disp, &mut c);
+        // A file that fails to parse is recorded (not silently skipped): every
+        // #[origin] inside it would otherwise report a misleading CORPUS-GAP.
+        match syn_parse_file(&text) {
+            Ok(file) => {
+                for item in &file.items {
+                    scan_item(item, &disp, &mut c);
+                }
+            }
+            Err(e) => {
+                // syn errors are multi-line; keep the first line (file:line + kind).
+                let first = e.to_string().lines().next().unwrap_or("parse error").to_string();
+                c.parse_errors.push(format!("{disp}: unparseable ({first})"));
+            }
         }
     }
     c
+}
+
+/// Display path of `path` relative to the corpus `root`, `/`-separated.
+fn disp_of(root_path: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(root_path)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// Recursively walk one top-level item. Free functions and impl-block / trait-
@@ -291,6 +317,7 @@ mod tests {
             corpus: std::collections::BTreeSet::new(),
             declared_vtables: Vec::new(),
             macro_defs: std::collections::HashMap::new(),
+            parse_errors: Vec::new(),
         };
         let file = syn::parse_file(text).expect("parse");
         for item in &file.items {
@@ -722,6 +749,41 @@ mod b {
             !c.free_fns.contains_key("bad_fn"),
             "bad_fn should be skipped: {:?}",
             c.free_fns
+        );
+    }
+
+    // B-05b: A `.rs` file with a syntax error is RECORDED, not silently
+    // skipped — `parse_errors` names it so the verifier can point at the
+    // real breakage instead of emitting a misleading CORPUS-GAP per origin.
+    #[test]
+    fn b05b_parse_error_is_recorded_not_silent() {
+        let dir = std::env::temp_dir().join("callgraph_b05b");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("good.rs"),
+            "#[origin(0x004028d0)]\npub unsafe fn good_fn() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("bad.rs"), "pub unsafe fn bad_fn( {}\n").unwrap();
+
+        let c = build_cached(dir.to_str().unwrap());
+        assert!(
+            c.corpus.contains(&0x004028d0),
+            "good.rs origin not picked up: {:?}",
+            c.corpus
+        );
+        assert_eq!(
+            c.parse_errors.len(),
+            1,
+            "exactly the bad file should be recorded: {:?}",
+            c.parse_errors
+        );
+        assert!(
+            c.parse_errors[0].starts_with("bad.rs:"),
+            "entry names the file: {:?}",
+            c.parse_errors
         );
     }
 

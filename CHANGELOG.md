@@ -56,6 +56,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waiver and no other diagnostic delta (`cargo check` green, count
   unchanged).
 
+### Added
+
+- `callgraph_verify::tail_referenced`: the address-side half of the
+  tail-call wide set — union of a tail target's globals, immediates, and
+  IAT slots, for the E015 referenced set. Mirrors `diff_body_calls`'
+  folding of tail-callees' direct calls. Regression tests: synthetic-PE
+  `test_tail_referenced_includes_tail_target_globals`, real-compiler
+  `c_tail_caller_global_covered` (new `tail_caller`/`tail_target` pair
+  plus `g_tail_tag` global in `test-fixtures/c/callgraph.c`, wired
+  through `build_fixtures.py` manifests; asserts the fold on the -O2
+  JMP shape and the direct edge on the -O0 CALL shape).
+
+### Fixed
+
+- E008 CORPUS-GAP now names the skipped files: the corpus scanner
+  records unreadable/unparseable inputs in `Corpus::parse_errors`
+  instead of silently dropping them, and the E008 diagnostic appends
+  the list. Previously a single broken file produced one misleading
+  gap per contained origin with no hint at the real cause (real
+  instance: 121 E008s for one unbalanced brace). The E008 trybuild
+  fixtures (`e005`, `e006`, `e008`) now run against a corpus containing
+  a deliberately broken file and pin the appended note. Regression
+  tests: `b05b_parse_error_is_recorded_not_silent`,
+  `parse_errors_note_names_skipped_files`.
+- E015 HALLUCINATED-ADDR accepts addresses referenced by a tail-call
+  target (via `tail_referenced`). Previously the gate demanded
+  duplicating a shared tail body (no MISSING) yet forbade its addresses
+  (not in the duplicating function's own extent, and `globals=[...]`
+  pins are present-checks that would themselves fail) — an
+  unsatisfiable pair with no faithful encoding. The fold only ever
+  widens acceptance, mirroring the call-side wide set; existing E015
+  snapshots are unchanged.
+
 ## [0.1.1] - 2026-10-24
 
 ### Fixed

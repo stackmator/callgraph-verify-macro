@@ -15,7 +15,8 @@ error:   [CG-VERIFY-E007 DECLARED-FACTS] 0xffff0000 is not inside any PE section
 10 | pub fn f() {}
    |     ^^
 
-error:   [CG-VERIFY-E008 CORPUS-GAP] origin 0xffff0000 is not in the corpus scanned from REBUILD_ROOT=$DIR/tests/testdata/corpus — wrong root, empty/missing directory, or the owning file failed to parse. Body-call verification cannot run
+error:   [CG-VERIFY-E008 CORPUS-GAP] origin 0xffff0000 is not in the corpus scanned from REBUILD_ROOT=$DIR/tests/testdata/corpus — wrong root, empty/missing directory, or the owning file failed to parse. Body-call verification cannot run. Scanner skipped 1 unreadable/unparseable file(s):
+         - broken_for_e008_note.rs: unparseable (cannot parse string into token stream). Fix these first — every origin inside them reports this same gap
            -> fix: fix REBUILD_ROOT so it contains the source with this #[origin] tag, and re-run `cargo build` so the corpus re-scans
   --> tests/ui/e005_origin_outside_section.rs:10:5
    |

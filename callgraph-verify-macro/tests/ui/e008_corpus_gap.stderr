@@ -5,7 +5,8 @@ error:   [CG-VERIFY-E006 ORIGIN-UNREFERENCED] 0x00401100 is never called, jumped
 11 | pub fn f() {}
    |     ^^
 
-error:   [CG-VERIFY-E008 CORPUS-GAP] origin 0x00401100 is not in the corpus scanned from REBUILD_ROOT=$DIR/tests/testdata/corpus — wrong root, empty/missing directory, or the owning file failed to parse. Body-call verification cannot run
+error:   [CG-VERIFY-E008 CORPUS-GAP] origin 0x00401100 is not in the corpus scanned from REBUILD_ROOT=$DIR/tests/testdata/corpus — wrong root, empty/missing directory, or the owning file failed to parse. Body-call verification cannot run. Scanner skipped 1 unreadable/unparseable file(s):
+         - broken_for_e008_note.rs: unparseable (cannot parse string into token stream). Fix these first — every origin inside them reports this same gap
            -> fix: fix REBUILD_ROOT so it contains the source with this #[origin] tag, and re-run `cargo build` so the corpus re-scans
   --> tests/ui/e008_corpus_gap.rs:11:5
    |

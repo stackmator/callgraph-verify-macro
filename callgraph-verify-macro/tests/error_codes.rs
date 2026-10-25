@@ -237,6 +237,16 @@ fn setup_testdata(manifest_dir: &Path) -> (PathBuf, PathBuf) {
         "#[allow(unused_macros)]\nmacro_rules! sneaky {\n    ($x:expr) => { oob_fn($x) };\n}\n#[allow(unused_macros)]\nmacro_rules! caller {\n    ($x:expr) => { real_call($x) };\n}\n",
     )
     .expect("write corpus macro_defs.rs");
+    // Deliberately UNPARSEABLE: exercises the E008 "skipped files" note.
+    // The corpus scanner must record (not silently drop) this file, and any
+    // fixture whose origin is missing from the corpus (e005/e006/e008) must
+    // name it in the E008 diagnostic. Keep it broken: fixing the syntax
+    // would silently delete that coverage (the stderr snapshots pin it).
+    std::fs::write(
+        corpus_dir.join("broken_for_e008_note.rs"),
+        "pub unsafe fn broken( {}\n",
+    )
+    .expect("write corpus broken_for_e008_note.rs");
     (pe_path, corpus_dir)
 }
 

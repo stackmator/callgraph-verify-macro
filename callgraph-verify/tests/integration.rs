@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
     use callgraph_verify::{
-        analyze, cfg_fingerprint, diff_body_calls, has_direct_branch_target, reg_params, ArgKind,
-        Pe, Spec,
+        analyze, cfg_fingerprint, diff_body_calls, has_direct_branch_target, reg_params,
+        tail_referenced, ArgKind, Pe, Spec,
     };
     use std::process::Command;
 
@@ -2226,5 +2226,68 @@ mod tests {
             d.inlined_ok
         );
         assert!(d.missing.is_empty(), "missing: {:?}", d.missing);
+    }
+
+    /// `tail_referenced()` fold: function A tail-jumps into B, and B reads
+    /// an absolute global G. A's own analysis never references G, but G
+    /// executes as part of A — the E015 referenced set must include it,
+    /// mirroring how `diff_body_calls` counts a tail target's callees.
+    /// Without the fold the gate demands duplication of the shared tail
+    /// (no MISSING) yet forbids its addresses (E015) — unsatisfiable.
+    #[test]
+    fn test_tail_referenced_includes_tail_target_globals() {
+        // Layout at base 0x401000 (.text):
+        //   B @0x401000: A1 80 10 40 00  MOV EAX, [0x401080] (absolute global)
+        //                C3              RET
+        //   A @0x401020: E9 DB FF FF FF  JMP 0x401000 (backward — outside A's
+        //                extent, so a tail edge, not inlined code)
+        //   G = 0x401080 (in-image: inside .text's VirtualSize, never code).
+        let base: u64 = 0x0040_0000 + 0x1000;
+        let b: u64 = base;
+        let a: u64 = base + 0x20;
+        let g: u64 = base + 0x80;
+        assert_eq!(0x401000, b);
+        assert_eq!(0x401020, a);
+        assert_eq!(0x401080, g);
+        let mut code = vec![0u8; 0x30];
+        // B: MOV EAX, [G]; RET
+        code[0] = 0xA1;
+        code[1..5].copy_from_slice(&(g as u32).to_le_bytes());
+        code[5] = 0xC3;
+        // A: JMP rel32 -> B (target = next_ip + rel).
+        let rel = (b as i64 - (a as i64 + 5)) as i32;
+        code[0x20] = 0xE9;
+        code[0x21..0x25].copy_from_slice(&rel.to_le_bytes());
+        let pe = pe_with_code(&code);
+
+        let cg_a = analyze(&pe, a).expect("analyze A");
+        // Backward JMP out of A's extent must be a tail edge, not a call.
+        assert!(
+            cg_a.tail_calls.contains(&b),
+            "A should tail-call B, got tails={:?}",
+            cg_a.tail_calls
+        );
+        assert!(
+            cg_a.direct_calls.is_empty(),
+            "A has no direct calls, got {:?}",
+            cg_a.direct_calls
+        );
+        // A's own harvest never references G ...
+        assert!(
+            !cg_a.globals.contains(&g),
+            "A's own globals must not contain G (that's the point): {:?}",
+            cg_a.globals
+        );
+        // ... but the fold over the tail target does.
+        let refs = tail_referenced(&pe, &cg_a);
+        assert!(
+            refs.contains(&g),
+            "tail_referenced(A) must include B's global G: {refs:?}"
+        );
+        // No false acceptance: an unrelated in-image address stays out.
+        assert!(
+            !refs.contains(&(g + 4)),
+            "unrelated address must not be accepted: {refs:?}"
+        );
     }
 }

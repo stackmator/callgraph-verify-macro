@@ -519,6 +519,28 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
     Ok(cg)
 }
 
+/// Addresses a tail-call target references (its globals, baked immediates,
+/// and IAT slots), unioned over every `JMP`-out edge of `cg`.
+///
+/// A tail-call `JMP G` transfers control to G, so G's data references execute
+/// as part of THIS function. The call-graph diff (`diff_body_calls`) already
+/// counts a tail target's *callees* as acceptable spellings; this is the
+/// address-side mirror for the HALLUCINATED-ADDR check: a port that
+/// duplicates a shared tail body (e.g. a predicate tail-jumped into from two
+/// origins) bakes the tail's addresses faithfully. Only ever ADDS acceptance
+/// — a target that fails to analyze is skipped, never an error.
+pub fn tail_referenced(pe: &Pe, cg: &CallGraph) -> BTreeSet<u64> {
+    let mut out = BTreeSet::new();
+    for t in &cg.tail_calls {
+        if let Ok(tcg) = analyze(pe, *t) {
+            out.extend(&tcg.globals);
+            out.extend(&tcg.imm_addrs);
+            out.extend(&tcg.iat_calls);
+        }
+    }
+    out
+}
+
 /// Follow an MSVC-style `switch` jump table: `JMP dword ptr [idx*4 + TABLE_VA]`.
 /// `TABLE_VA` (the operand displacement, an in-image .rdata address) holds an
 /// array of u32 case addresses. We read entries until one falls outside the

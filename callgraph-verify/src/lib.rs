@@ -18,7 +18,7 @@ pub mod disasm;
 pub mod pe;
 pub mod skel;
 
-pub use disasm::{analyze, reg_params, resolve_thunk, ArgKind, CallGraph, CallSite};
+pub use disasm::{analyze, reg_params, resolve_thunk, tail_referenced, ArgKind, CallGraph, CallSite};
 pub use pe::Pe;
 pub use skel::{cfg_fingerprint, CfgFingerprint};
 

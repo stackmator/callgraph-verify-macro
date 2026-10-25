@@ -21,7 +21,7 @@
 
 use callgraph_verify::{
     analyze, cfg_fingerprint, diff_body_calls, diff_calls, has_direct_branch_target, reg_params,
-    resolve_thunk, ArgKind, Pe, Spec,
+    resolve_thunk, tail_referenced, ArgKind, Pe, Spec,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -406,6 +406,60 @@ fn c_global_referenced() {
         addr(&fx, "g_counter"),
         cg.globals
     );
+}
+
+#[test]
+fn c_tail_caller_global_covered() {
+    // Runs against both the -O2 fixture (typically a JMP tail edge) and the
+    // -O0 twin (typically CALL+RET), asserting edge-appropriate coverage.
+    for fx in [c_fixture(), c_od_fixture()].into_iter().flatten() {
+        // Skip (don't fail) when the local fixtures predate the tail-pair
+        // symbols: CI rebuilds fixtures every run (and its build script
+        // fails hard on missing symbols), so a miss here can only mean a
+        // stale local target/fixtures dir — rebuild it via
+        // test-fixtures/build_fixtures.py instead of failing.
+        let (Some(&caller), Some(&target), Some(&g)) = (
+            fx.addrs.get("tail_caller"),
+            fx.addrs.get("tail_target"),
+            fx.addrs.get("g_tail_tag"),
+        ) else {
+            eprintln!(
+                "[{}] skipping: manifest lacks tail_caller/tail_target/g_tail_tag (stale fixtures?)",
+                fx.label
+            );
+            continue;
+        };
+        let cg = analyze(&fx.pe, caller).expect("analyze tail_caller");
+        let is_tail = cg.tail_calls.contains(&target);
+        let is_call = cg.direct_calls.contains_key(&target);
+        assert!(
+            is_tail || is_call,
+            "[{}] tail_caller must transfer control to tail_target (JMP or CALL): calls={:?} tails={:?}",
+            fx.label, cg.direct_calls, cg.tail_calls
+        );
+        if is_tail {
+            // Jump edge: the caller's own harvest cannot see the global,
+            // so the E015 tail-target fold must cover it (this is the fix).
+            assert!(
+                !cg.globals.contains(&g),
+                "[{}] tail path: caller must not reference the global directly: {:?}",
+                fx.label, cg.globals
+            );
+            assert!(
+                tail_referenced(&fx.pe, &cg).contains(&g),
+                "[{}] tail path: fold must cover g_tail_tag {:#x}",
+                fx.label, g
+            );
+        }
+        // Sanity in both cases: the callee really does reference the global
+        // (guards against fixture rot where the read gets optimized away).
+        let cg_t = analyze(&fx.pe, target).expect("analyze tail_target");
+        assert!(
+            cg_t.globals.contains(&g),
+            "[{}] tail_target must reference g_tail_tag {:#x}: {:?}",
+            fx.label, g, cg_t.globals
+        );
+    }
 }
 
 #[test]

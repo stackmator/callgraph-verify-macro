@@ -191,6 +191,24 @@ NOINLINE int use_apply(int x) {
     return apply_twice(inc_fn, x);
 }
 
+// --- tail-call pair: `tail_caller` forwards to `tail_target` ---------------
+// in tail position (no work left after the call). At -O2 the sibling-call
+// optimization typically turns this into a JMP (tail edge); at -O0 it stays
+// CALL+RET. `tail_target` reads global `g_tail_tag`, so whichever edge the
+// optimizer emits, the E015 referenced set must cover the global — directly
+// for a call edge (the body spells the call), via the tail-target fold for
+// a jump edge. The result feeds `total` so DCE cannot drop the call.
+
+int g_tail_tag = 5;
+
+NOINLINE int tail_target(int x) {
+    return g_tail_tag + x;
+}
+
+NOINLINE int tail_caller(int x) {
+    return tail_target(x);
+}
+
 // --- entry point: keeps every function above alive for the linker -----------
 
 int main(void) {
@@ -222,6 +240,7 @@ int main(void) {
     // MSVC keeps dead calls, which is why this only ever failed on MinGW.
     total += pt.x + pt.y + pt.z;
     total += use_apply(41);
+    total += tail_caller(7);
     printf("%d\n", total);
     return 0;
 }
