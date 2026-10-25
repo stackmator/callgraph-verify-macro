@@ -70,8 +70,25 @@ int nested_sum(int n, int m) {
     return s;
 }
 
-int classify(int v) {
-    switch (v) {
+int decision_chain(int x) {
+    if (x == 3) return 30;
+    if (x == 17) return -4;
+    if (x == 42) return 7;
+    if (x == 99) return 1000;
+    if (x == 101) return -991;
+    if (x == 1009) return 5;
+    if (x == -7) return 77;
+    if (x == 65536) return 1;
+    if (x == -100000) return 2;
+    if (x == 1234567) return 3;
+    if (x == (-2147483647 - 1)) return 4;
+    if (x == 2147483647) return 5;
+    if (x == 555) return 6;
+    if (x == 777) return 7;
+    return -1;
+}
+
+int classify(int v) {    switch (v) {
         case 0: return 10;
         case 1: return 11;
         case 2: return 12;
@@ -131,6 +148,8 @@ int main(void) {
     total += nested_sum(10, 10);
     total += classify(3);
     total += classify(99);
+    total += decision_chain(5);
+    total += decision_chain(99);
     total += read_global();
     total += field_read(&pt);
     field_write(&pt, 9);

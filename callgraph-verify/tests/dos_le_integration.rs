@@ -262,6 +262,27 @@ fn dos_switch_table_resolves() {
 }
 
 #[test]
+fn dos_decision_chain_has_many_conditionals() {
+    let Some(_) = load_dos() else {
+        return;
+    };
+    let (_, pe) = load_dos().unwrap();
+    // Watcom -od preserves each `if` as its own Jcc: the 12-strong chain
+    // must show up as >= 12 conditionals on some swept function.
+    let addrs = sweep_functions(&pe, 512);
+    let mut best = 0usize;
+    for a in &addrs {
+        if let Ok(fp) = cfg_fingerprint(&pe, *a) {
+            best = best.max(fp.conditionals);
+        }
+    }
+    assert!(
+        best >= 12,
+        "no swept LE function has 12 conditionals (want decision_chain); max = {best}"
+    );
+}
+
+#[test]
 fn dos_leaf_and_loop_exist() {
     let Some(_) = load_dos() else {
         return;

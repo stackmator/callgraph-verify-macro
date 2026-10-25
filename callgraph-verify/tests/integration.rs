@@ -2150,8 +2150,7 @@ mod tests {
     /// behaviour so a future "strict-less-than" → "strict-less-or-equal"
     /// drift doesn't change the count.
     #[test]
-    fn cfg_fingerprint_self_loop_jmp_thunk_is_one_loop() {
-        // 0x1000: EB FE   JMP 0x1000 (self-loop)
+    fn cfg_fingerprint_self_loop_jmp_thunk_is_one_loop() {        // 0x1000: EB FE   JMP 0x1000 (self-loop)
         let code = [0xEB, 0xFE, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90];
         let pe = pe_with_code(&code);
         let entry = pe.image_base + 0x1000;
@@ -2172,5 +2171,60 @@ mod tests {
             "self-loop JMP is a back-edge, not a return; got {:?}",
             fp
         );
+    }
+
+    /// `inlined_ok` reclassification: a Rust call to a ported fn the binary
+    /// never CALLs is faithful (not HALLUCINATED) when the callee's whole
+    /// footprint also appears in the caller — the engine pasted the body
+    /// inline, so the binary shows the work, not the call. Footprint-subset
+    /// needs >= 2 distinct in-image references (a single shared global is
+    /// coincidence, not inlining), so both functions below touch the same
+    /// TWO globals (0x401000, 0x401010 — both inside the synthetic .text).
+    #[test]
+    fn test_diff_body_calls_inlined_callee_reclassified() {
+        let b = 0x0040_1000u64; // == image_base + 0x1000 in pe_with_code
+        let mut code = vec![
+            0xA1, 0x00, 0x10, 0x40, 0x00, // F+0: MOV EAX, [0x401000]
+            0xA1, 0x10, 0x10, 0x40, 0x00, // F+5: MOV EAX, [0x401010]
+            0xE8, 0x01, 0x00, 0x00, 0x00, // F+10: CALL F+16 (helper)
+            0xC3, // F+15: RET
+            0xC3, // F+16: helper RET
+        ];
+        while code.len() < 32 {
+            code.push(0xC3); // RET padding up to C
+        }
+        code.extend_from_slice(&[
+            0xA1, 0x00, 0x10, 0x40, 0x00, // C+32: MOV EAX, [0x401000]
+            0xA1, 0x10, 0x10, 0x40, 0x00, // C+37: MOV EAX, [0x401010]
+            0xC3, // C+42: RET
+        ]);
+        let pe = pe_with_code(&code);
+        let (f, h, c) = (b, b + 16, b + 32);
+        let corpus: std::collections::BTreeSet<u64> = [h, c].into_iter().collect();
+        let rust_idents = vec![
+            ("helper_fn".to_string(), vec![h]),
+            ("inlined_helper".to_string(), vec![c]),
+        ];
+        let d = diff_body_calls(
+            &pe,
+            &[f],
+            &corpus,
+            &rust_idents,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("diff_body_calls");
+        assert!(
+            d.hallucinated.is_empty(),
+            "inlined callee must not be hallucinated: {:?}",
+            d.hallucinated
+        );
+        assert_eq!(
+            d.inlined_ok,
+            vec!["inlined_helper".to_string()],
+            "inlined callee must be reclassified: {:?}",
+            d.inlined_ok
+        );
+        assert!(d.missing.is_empty(), "missing: {:?}", d.missing);
     }
 }

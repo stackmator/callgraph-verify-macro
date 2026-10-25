@@ -49,6 +49,8 @@ C_SYMBOLS = [
     "loop_sum",
     "nested_sum",
     "classify",
+    "decision_chain",
+    "main",
     "g_counter",
     "read_global",
     "write_global",
@@ -65,7 +67,17 @@ CPP_SYMBOLS = [
     "cpp_field_fn",
     "cpp_use_virtual_fn",
     "cpp_shapes_fn",
+    "main",
 ]
+
+# Vtable addresses have toolchain-decorated names (MSVC `??_7Circle@@6B@`,
+# Itanium `_ZTV6Circle`), so they are resolved by alias list: the first raw
+# symbol that hits wins. Normalized-name matching would mangle the Itanium
+# form (leading-underscore strip), so aliases match RAW map/nm names.
+VTABLE_ALIASES = {
+    "circle_vt": ["??_7Circle@@6B@", "_ZTV6Circle"],
+    "square_vt": ["??_7Square@@6B@", "_ZTV6Square"],
+}
 
 
 def run(cmd: list[str], cwd: str) -> None:
@@ -85,7 +97,11 @@ def demangle_symbol(raw: str) -> str:
 
 
 def parse_msvc_map(map_path: str) -> dict[str, int]:
-    """Parse MSVC linker's "Publics by Value" section: `seg:off name VA ...`."""
+    """Parse MSVC linker's "Publics by Value" section: `seg:off name VA ...`.
+
+    Returns RAW symbol names (leading underscores, stdcall suffixes intact);
+    `write_manifest` normalizes and resolves aliases.
+    """
     out: dict[str, int] = {}
     in_publics = False
     pat = re.compile(r"^\s*[0-9A-Fa-f]{4}:[0-9A-Fa-f]{8}\s+(\S+)\s+([0-9A-Fa-f]{8})\b")
@@ -100,13 +116,15 @@ def parse_msvc_map(map_path: str) -> dict[str, int]:
                 continue
             m = pat.match(line)
             if m:
-                name, va = demangle_symbol(m.group(1)), int(m.group(2), 16)
-                out.setdefault(name, va)
+                out.setdefault(m.group(1), int(m.group(2), 16))
     return out
 
 
 def parse_nm(nm_path: str) -> dict[str, int]:
-    """Parse `nm -n` output: `VVVVVVVV <type> name` (skip undefined `U`)."""
+    """Parse `nm -n` output: `VVVVVVVV <type> name` (skip undefined `U`).
+
+    Returns RAW symbol names; see `parse_msvc_map`.
+    """
     out: dict[str, int] = {}
     pat = re.compile(r"^([0-9A-Fa-f]+)\s+([A-Za-z?])\s+(\S+)")
     with open(nm_path, encoding="utf-8", errors="replace") as f:
@@ -114,12 +132,35 @@ def parse_nm(nm_path: str) -> dict[str, int]:
             m = pat.match(line.strip())
             if not m or m.group(2) == "U":
                 continue
-            out.setdefault(demangle_symbol(m.group(3)), int(m.group(1), 16))
+            out.setdefault(m.group(3), int(m.group(1), 16))
     return out
 
 
-def write_manifest(path: str, symbols: dict[str, int], wanted: list[str]) -> None:
-    missing = [w for w in wanted if w not in symbols]
+def write_manifest(
+    path: str,
+    raw_symbols: dict[str, int],
+    wanted: list[str],
+    aliases: dict[str, list[str]] | None = None,
+) -> None:
+    # Normalized lookup (first raw spelling wins); aliases resolve against
+    # RAW names so toolchain-decorated forms (`??_7Circle@@6B@`,
+    # `_ZTV6Circle`) match without going through underscore-stripping.
+    symbols: dict[str, int] = {}
+    for raw, va in raw_symbols.items():
+        symbols.setdefault(demangle_symbol(raw), va)
+    manifest: dict[str, str] = {}
+    missing: list[str] = []
+    for w in wanted:
+        if w in symbols:
+            manifest[w] = hex(symbols[w])
+        else:
+            missing.append(w)
+    for alias, raws in (aliases or {}).items():
+        hit = next((r for r in raws if r in raw_symbols), None)
+        if hit is None:
+            missing.append(f"{alias} (one of {'/'.join(raws)})")
+        else:
+            manifest[alias] = hex(raw_symbols[hit])
     if missing:
         raise SystemExit(
             f"ERROR: {path}: {len(missing)} wanted symbols missing from the "
@@ -127,7 +168,6 @@ def write_manifest(path: str, symbols: dict[str, int], wanted: list[str]) -> Non
             f"(the optimizer may have discarded them — check they are called "
             f"from main and marked NOINLINE)"
         )
-    manifest = {w: hex(symbols[w]) for w in wanted}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
@@ -140,16 +180,19 @@ def build_msvc(out: str) -> None:
             "ERROR: cl/link not on PATH — run from an x86 VS dev prompt "
             "(vcvarsall x86) or use ilammy/msvc-dev-cmd with arch: x86"
         )
-    for stem, src, wanted in (
-        ("c_callgraph", C_SRC, C_SYMBOLS),
-        ("cpp_callgraph", CPP_SRC, CPP_SYMBOLS),
+    for stem, src, wanted, aliases in (
+        ("c_callgraph", C_SRC, C_SYMBOLS, None),
+        ("cpp_callgraph", CPP_SRC, CPP_SYMBOLS, VTABLE_ALIASES),
     ):
         obj = os.path.join(out, stem + ".obj")
         exe = os.path.join(out, stem + ".exe")
         map_path = os.path.join(out, stem + ".map")
         manifest = os.path.join(out, stem + "_addrs.json")
         run(
-            ["cl", "/nologo", "/O2", "/GS-", "/W3", "/c", src, "/Fo" + obj],
+            # /MD (dynamic CRT): printf resolves through the IAT, which the
+            # iat_calls tests pin. Default /MT links the CRT statically, so
+            # main would show no import edges at all.
+            ["cl", "/nologo", "/O2", "/GS-", "/MD", "/W3", "/c", src, "/Fo" + obj],
             cwd=out,
         )
         run(
@@ -164,18 +207,26 @@ def build_msvc(out: str) -> None:
             ],
             cwd=out,
         )
-        write_manifest(manifest, parse_msvc_map(map_path), wanted)
+        write_manifest(manifest, parse_msvc_map(map_path), wanted, aliases)
 
 
 def build_mingw(out: str) -> None:
-    for cc, nm, stem, src, wanted in (
-        ("i686-w64-mingw32-gcc", "i686-w64-mingw32-nm", "c_callgraph", C_SRC, C_SYMBOLS),
+    for cc, nm, stem, src, wanted, aliases in (
+        (
+            "i686-w64-mingw32-gcc",
+            "i686-w64-mingw32-nm",
+            "c_callgraph",
+            C_SRC,
+            C_SYMBOLS,
+            None,
+        ),
         (
             "i686-w64-mingw32-g++",
             "i686-w64-mingw32-nm",
             "cpp_callgraph",
             CPP_SRC,
             CPP_SYMBOLS,
+            VTABLE_ALIASES,
         ),
     ):
         if shutil.which(cc) is None:
@@ -203,7 +254,7 @@ def build_mingw(out: str) -> None:
             raise SystemExit(f"ERROR: {nm} not found")
         with open(nm_path, "w", encoding="utf-8") as f:
             subprocess.run([nm, "-n", exe], cwd=out, check=True, stdout=f)
-        write_manifest(manifest, parse_nm(nm_path), wanted)
+        write_manifest(manifest, parse_nm(nm_path), wanted, aliases)
 
 
 def build_dos(out: str) -> bool:

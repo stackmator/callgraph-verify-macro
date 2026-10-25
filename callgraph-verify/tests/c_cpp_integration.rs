@@ -20,7 +20,8 @@
 //! hard failure so a broken build step can never silently green the suite.
 
 use callgraph_verify::{
-    analyze, cfg_fingerprint, diff_body_calls, diff_calls, has_direct_branch_target, Pe, Spec,
+    analyze, cfg_fingerprint, diff_body_calls, diff_calls, has_direct_branch_target, reg_params,
+    ArgKind, Pe, Spec,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -410,6 +411,72 @@ fn c_switch_compiles_to_jump_table() {
 }
 
 #[test]
+fn c_decision_chain_has_twelve_conditionals() {
+    let Some(fx) = c_fixture() else {
+        return;
+    };
+    // Third E016 prong (`conditionals >= 12` + straight-line body): pin the
+    // INPUT on real output. Each `if` must survive as its own conditional
+    // branch on both toolchains — nothing covered this count before.
+    let fp = cfg_fingerprint(&fx.pe, addr(&fx, "decision_chain")).expect("cfg");
+    assert!(
+        fp.conditionals >= 12,
+        "decision_chain's 12 ifs must yield 12 conditionals: {fp:?}"
+    );
+}
+
+#[test]
+fn c_call_site_recovers_pushed_imm_arg() {
+    let Some(fx) = c_fixture() else {
+        return;
+    };
+    // `branch_caller` calls `leaf_add(x, 1)`: the `1` is PUSHed, and
+    // `recover_call_site` must see `Imm(1)` in source position — this is the
+    // exact input the macro's ARG-SHAPE check consumes, pinned on real
+    // MSVC/MinGW codegen instead of hand-written bytes.
+    let cg = analyze(&fx.pe, addr(&fx, "branch_caller")).expect("analyze");
+    let leaf = addr(&fx, "leaf_add");
+    let sites: Vec<_> = cg.call_sites.iter().filter(|s| s.target == leaf).collect();
+    assert_eq!(
+        sites.len(),
+        1,
+        "branch_caller must call leaf_add exactly once: {:?}",
+        cg.call_sites
+    );
+    assert!(
+        sites[0].stack.iter().any(|a| matches!(a, ArgKind::Imm(1))),
+        "pushed literal 1 must be recovered as Imm(1): {:?}",
+        sites[0].stack
+    );
+}
+
+#[test]
+fn c_main_reaches_iat_imports() {
+    let Some(fx) = c_fixture() else {
+        return;
+    };
+    // The hosted entry point calls `printf`, which must resolve to an
+    // import — directly (`CALL [IAT]`, MinGW) or through one direct callee
+    // (MSVC's UCRT `printf` inline expands to a local wrapper that calls
+    // `__stdio_common_vfprintf` via the IAT). Either way the entry point
+    // reaches imports within one hop on a dynamically-linked binary.
+    let cg = analyze(&fx.pe, addr(&fx, "main")).expect("analyze main");
+    let direct = !cg.iat_calls.is_empty();
+    let mut via_callee = Vec::new();
+    for t in cg.call_targets() {
+        if let Ok(c) = analyze(&fx.pe, t) {
+            if !c.iat_calls.is_empty() {
+                via_callee.push(t);
+            }
+        }
+    }
+    assert!(
+        direct || !via_callee.is_empty(),
+        "main must reach imports directly or via a direct callee: {cg:?}"
+    );
+}
+
+#[test]
 fn c_manifest_functions_are_referenced() {
     let Some(fx) = c_fixture() else {
         return;
@@ -594,4 +661,77 @@ fn cpp_analyze_and_byte_scan_agree() {
         }
     }
     assert!(checked > 0, "sweep found no analyzable functions");
+}
+
+/// Read the first 8 vtable slots at `vt`, keeping only slots that point
+/// into executable code. Both toolchains lay method pointers forward from
+/// the symbol (MSVC `??_7Circle@@6B@`, Itanium `_ZTV6Circle` already points
+/// past the offset-to-top/RTTI prefix), but MSVC parks RTTI-adjacent DATA
+/// right after the table — trailing slots may be data pointers, not methods.
+fn vtable_slots(fx: &Fixture, vt_name: &str) -> Vec<u64> {
+    let vt = addr(fx, vt_name);
+    (0..8u64)
+        .filter_map(|slot| {
+            let b = fx.pe.read(vt + slot * 4, 4)?;
+            if b.len() < 4 {
+                return None;
+            }
+            let va = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64;
+            (va != 0 && fx.pe.is_executable_section_va(va)).then_some(va)
+        })
+        .collect()
+}
+
+#[test]
+fn cpp_vtable_slots_are_executable_methods() {
+    let Some(fx) = cpp_fixture() else {
+        return;
+    };
+    // The method slots of a real compiler-generated vtable must be function
+    // pointers into executable code — the exact bytes `vtable_table!`
+    // verifies at compile time. (Trailing non-code dwords are RTTI-adjacent
+    // data; `vtable_slots` filters those out.)
+    for vt in ["circle_vt", "square_vt"] {
+        let slots = vtable_slots(&fx, vt);
+        assert!(
+            slots.len() >= 2,
+            "{vt} must have at least 2 method slots: {slots:#x?}"
+        );
+    }
+}
+
+#[test]
+fn cpp_kind_slot_is_vtable_only_and_thiscall() {
+    let Some(fx) = cpp_fixture() else {
+        return;
+    };
+    // `Circle::kind` reads `radius` (field offset 4 off `this`) — the only
+    // Circle method that does — so the slot whose function touches offset 4
+    // IS kind, with no layout assumptions. On it, pin two gates at once:
+    // the macro's VTABLE-ONLY DISPATCH warning condition (referenced but
+    // never directly branched to) and thiscall detection via `reg_params`.
+    let slots = vtable_slots(&fx, "circle_vt");
+    let mut kind_va = None;
+    for va in &slots {
+        if let Ok(cg) = analyze(&fx.pe, *va) {
+            if cg.field_offsets.contains(&4) {
+                kind_va = Some(*va);
+                break;
+            }
+        }
+    }
+    let kind_va = kind_va.expect("no circle_vt slot reads field offset 4 (want kind)");
+    assert!(
+        !has_direct_branch_target(&fx.pe, kind_va),
+        "kind {kind_va:#x} must be reached only via its vtable slot"
+    );
+    assert!(
+        fx.pe.referenced_addrs().contains(&(kind_va as u32)),
+        "kind {kind_va:#x} must be referenced (stored in the vtable)"
+    );
+    assert_eq!(
+        reg_params(&fx.pe, kind_va),
+        (true, false),
+        "kind must be detected as thiscall (reads ECX, never EDX)"
+    );
 }

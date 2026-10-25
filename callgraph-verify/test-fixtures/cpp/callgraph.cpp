@@ -71,8 +71,11 @@ struct Shape {
 struct Circle : Shape {
     int radius;
     explicit Circle(int r) : radius(r) {}
+    // Reads the member through `this` (offset 4): the shape `reg_params`
+    // must recognize as thiscall, and the field harvester as offset 4.
+    // Behavior is unchanged (radius is always > 0 at every call site).
     int kind() const override {
-        return 1;
+        return radius > 0 ? 1 : 0;
     }
     int sides() const override {
         return 0;
