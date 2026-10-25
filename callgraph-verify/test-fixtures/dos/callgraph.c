@@ -169,8 +169,11 @@ int main(void) {
     total += g_sum_fn();
     total += read_global();
     total += field_read(&pt);
-    field_write(&pt, 9);
-    total += pt.x;
+    field_write(&pt, total);
+    /* Same liveness shape as the C fixture: y/z are read back so the
+     * stores are never dead (GCC would DCE a dead-storing call even
+     * through noinline; Watcom -od keeps it either way). */
+    total += pt.x + pt.y + pt.z;
     total += use_apply(41);
     printf("%d\n", total);
     return 0;

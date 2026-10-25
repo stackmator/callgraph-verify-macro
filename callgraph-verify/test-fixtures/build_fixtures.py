@@ -271,7 +271,7 @@ def build_msvc(out: str) -> None:
 
 
 def build_mingw(out: str) -> None:
-    for cc, nm, stem, src, wanted, aliases, opt in (
+    for cc, nm, stem, src, wanted, aliases, opts in (
         (
             "i686-w64-mingw32-gcc",
             "i686-w64-mingw32-nm",
@@ -279,11 +279,15 @@ def build_mingw(out: str) -> None:
             C_SRC,
             C_SYMBOLS,
             None,
-            "-O2",
+            ["-O2"],
         ),
         # Unoptimized twin of the MSVC /Od build (weak-optimizer shapes on
-        # the GNU side). No incremental-linking equivalent exists for GNU
-        # ld, so the ILT-thunk variant stays MSVC-only.
+        # the GNU side). -O0 alone does NOT restore PUSH sequences: modern
+        # GCC accumulates outgoing args with MOV even unoptimized, so
+        # -mno-accumulate-outgoing-args is needed for the classic PUSH
+        # idiom the strict arg-recovery test pins. No incremental-linking
+        # equivalent exists for GNU ld, so the ILT-thunk variant stays
+        # MSVC-only.
         (
             "i686-w64-mingw32-gcc",
             "i686-w64-mingw32-nm",
@@ -291,7 +295,7 @@ def build_mingw(out: str) -> None:
             C_SRC,
             C_SYMBOLS,
             None,
-            "-O0",
+            ["-O0", "-mno-accumulate-outgoing-args"],
         ),
         (
             "i686-w64-mingw32-g++",
@@ -300,7 +304,7 @@ def build_mingw(out: str) -> None:
             CPP_SRC,
             CPP_SYMBOLS,
             VTABLE_ALIASES,
-            "-O2",
+            ["-O2"],
         ),
     ):
         if shutil.which(cc) is None:
@@ -313,9 +317,9 @@ def build_mingw(out: str) -> None:
         nm_path = os.path.join(out, stem + ".nm")
         manifest = os.path.join(out, stem + "_addrs.json")
         run(
-            [
-                cc,
-                opt,
+            [cc]
+            + opts
+            + [
                 "-fno-stack-protector",
                 "-o",
                 exe,

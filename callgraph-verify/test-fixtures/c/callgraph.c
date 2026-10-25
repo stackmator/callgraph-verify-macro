@@ -216,7 +216,11 @@ int main(void) {
     // Opaque arg (not a constant): a constant here invites constprop
     // cloning (`field_write.constprop`), orphaning the manifest VA.
     field_write(&pt, total);
-    total += pt.x;
+    // Read back y AND z: without this the stores are dead, and GCC's
+    // IPA-driven DCE deletes the whole call (noinline only blocks
+    // inlining, not dead-call elimination) — orphaning the VA again.
+    // MSVC keeps dead calls, which is why this only ever failed on MinGW.
+    total += pt.x + pt.y + pt.z;
     total += use_apply(41);
     printf("%d\n", total);
     return 0;
