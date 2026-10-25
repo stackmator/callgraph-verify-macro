@@ -73,13 +73,14 @@ CPP_SYMBOLS = [
     "main",
 ]
 
-# Vtable addresses have toolchain-decorated names (MSVC `??_7Circle@@6B@`,
-# Itanium `_ZTV6Circle`), so they are resolved by alias list: the first raw
-# symbol that hits wins. Normalized-name matching would mangle the Itanium
-# form (leading-underscore strip), so aliases match RAW map/nm names.
+# Vtable addresses have toolchain-decorated names. MSVC map Publics use
+# `??_7Circle@@6B@`. Itanium mangling proper starts with `_Z`, and 32-bit
+# PE objects prepend one more underscore to every symbol — so i686 MinGW
+# `nm` shows `__ZTV6Circle` (double underscore), while ELF / x86-64 PE
+# (no prefix) show `_ZTV6Circle`. Try each spelling in order.
 VTABLE_ALIASES = {
-    "circle_vt": ["??_7Circle@@6B@", "_ZTV6Circle"],
-    "square_vt": ["??_7Square@@6B@", "_ZTV6Square"],
+    "circle_vt": ["??_7Circle@@6B@", "__ZTV6Circle", "_ZTV6Circle"],
+    "square_vt": ["??_7Square@@6B@", "__ZTV6Square", "_ZTV6Square"],
 }
 
 

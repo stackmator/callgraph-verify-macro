@@ -244,7 +244,12 @@ fn setup_testdata(manifest_dir: &Path) -> (PathBuf, PathBuf) {
 /// E004 fixture can point TARGET_EXE at it. The file exists (so the macro's
 /// "exists but corrupt" branch fires) but isn't a valid PE image.
 fn setup_not_a_pe(manifest_dir: &Path) -> PathBuf {
-    let path = manifest_dir.join("tests").join("testdata").join("not_a_pe.bin");
+    let testdata = manifest_dir.join("tests").join("testdata");
+    // `ui()` calls this BEFORE `setup_testdata` creates the directory —
+    // without this, the write fails on a fresh checkout (where lingering
+    // testdata/ from a previous run doesn't exist yet).
+    std::fs::create_dir_all(&testdata).expect("create tests/testdata");
+    let path = testdata.join("not_a_pe.bin");
     std::fs::write(&path, b"definitely not a PE image\n").expect("write not_a_pe.bin");
     path
 }
