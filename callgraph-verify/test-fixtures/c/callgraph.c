@@ -99,21 +99,26 @@ NOINLINE int decision_chain(int x) {
     return -1;
 }
 
-// --- dense switch: 8 consecutive cases lower to a jump table ---------------
-// First coverage of the fingerprint's `switch_cases` prong: both toolchains
-// emit `JMP [table+idx*4]` for this shape, which `follow_jump_table` must
-// resolve to >= 3 case entries.
+// --- dense switch: 8 cases with call bodies lower to control flow ---------
+// First coverage of the fingerprint's `switch_cases` prong: dense ranges
+// lower to `JMP [table+idx*4]` (MSVC always; GCC when bodies are
+// non-trivial), which `follow_jump_table` must resolve to >= 3 case entries.
+// Each case calls `leaf_add` with distinct args (never executed — the
+// fixture binaries are only parsed): calls can't be predicated away, so the
+// switch must survive as control flow on both toolchains. If a toolchain
+// emits a compare chain instead of a table, the test accepts that too
+// (conditionals prong) — but branchless mush fails it.
 
 NOINLINE int classify(int v) {
     switch (v) {
-        case 0: return 10;
-        case 1: return 11;
-        case 2: return 12;
-        case 3: return 13;
-        case 4: return 14;
-        case 5: return 15;
-        case 6: return 16;
-        case 7: return 17;
+        case 0: return leaf_add(100, 0);
+        case 1: return leaf_add(101, 1);
+        case 2: return leaf_add(102, 2);
+        case 3: return leaf_add(103, 3);
+        case 4: return leaf_add(104, 4);
+        case 5: return leaf_add(105, 5);
+        case 6: return leaf_add(106, 6);
+        case 7: return leaf_add(107, 7);
         default: return -1;
     }
 }
@@ -208,7 +213,9 @@ int main(void) {
     total += g_sum_fn();
     total += read_global();
     total += field_read(&pt);
-    field_write(&pt, 9);
+    // Opaque arg (not a constant): a constant here invites constprop
+    // cloning (`field_write.constprop`), orphaning the manifest VA.
+    field_write(&pt, total);
     total += pt.x;
     total += use_apply(41);
     printf("%d\n", total);

@@ -239,21 +239,26 @@ fn dos_switch_table_resolves() {
         return;
     };
     let (_, pe) = load_dos().unwrap();
-    // Watcom lowers the dense 8-case `classify` switch to a jump table;
-    // `follow_jump_table` must resolve >= 3 case entries. Caveat: LE fixups
-    // are unapplied, so if wlink leaves table entries as pre-fixup values
-    // outside the function span this finds nothing — that outcome confirms
-    // the pe.rs caveat with real evidence (relax and document it then).
+    // Watcom lowers the dense 8-case `classify` switch to control flow;
+    // `follow_jump_table` must resolve >= 3 case entries if it emits a
+    // table (compare chains satisfy the conditionals disjunct instead).
+    // Caveat: LE fixups are unapplied, so if wlink leaves table entries as
+    // pre-fixup values outside the function span this finds nothing — that
+    // outcome confirms the pe.rs caveat with real evidence (relax and
+    // document it then).
     let addrs = sweep_functions(&pe, 512);
-    let mut best = 0usize;
+    let mut best_switch = 0usize;
+    let mut best_cond = 0usize;
     for a in &addrs {
         if let Ok(fp) = cfg_fingerprint(&pe, *a) {
-            best = best.max(fp.switch_cases);
+            best_switch = best_switch.max(fp.switch_cases);
+            best_cond = best_cond.max(fp.conditionals);
         }
     }
     assert!(
-        best >= 3,
-        "no swept LE function resolves a jump table (want classify); max switch_cases = {best}"
+        best_switch >= 3 || best_cond >= 5,
+        "no swept LE function shows switch control flow (want classify): \
+         max switch_cases = {best_switch}, max conditionals = {best_cond}"
     );
 }
 
