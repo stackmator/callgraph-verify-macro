@@ -499,10 +499,63 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
                     cg.indirect_jumps += 1;
                     record_indirect_target(&instr, pe, &mut cg);
                     let mut cases: Vec<u64> = Vec::new();
-                    follow_jump_table(&instr, pe, lo, hi, &mut cases);
+                    // Indirect-jump target recovery, by operand shape:
+                    // * SIB-indexed `[base+idx*s+TABLE]` (MSVC-style): the
+                    //   existing follow_jump_table read below. Unchanged.
+                    // * Unindexed `[reg+TABLE]` with NO base register, i.e.
+                    //   an absolute `[disp]` (IAT thunks, import jumps):
+                    //   NEVER followed. The disp names data, not code, and
+                    //   the fallthrough past a non-returning jump is dead
+                    //   code -- decoding it attributes neighboring
+                    //   functions' calls here (verified: 9KB/20-call blowup
+                    //   on noivilbo 0x006ff480, whose IAT tail-jmps sit
+                    //   after cmp/jcc).
+                    // * Unindexed `[reg+TABLE]` WITH a base register: Watcom
+                    //   switch lowering (`shl reg,2` then `jmp [reg+TABLE]`,
+                    //   e.g. FALL.EXE 0x602c0). The table entries are
+                    //   pre-fixup bytes on LE, so the read below yields
+                    //   nothing; instead continue decoding at the fallthrough
+                    //   address -- the case bodies tile the bytes right after
+                    //   the dispatch (verified: 602c0's five hidden 7d6ae
+                    //   calls, previously mis-reported as HALLUCINATED).
+                    //   Gated on switch evidence (a compare/test plus a
+                    //   conditional branch in this block) so vtable tail-jumps
+                    //   like `jmp [ecx+0x44]` keep today's behavior.
+                    let has_index = instr.memory_index() != Register::None;
+                    // The base must be produced locally (e.g. the scaled
+                    // index): an incoming register like a vtable `this`
+                    // is never a switch table.
+                    let mut base_written = false;
+                    if instr.memory_base() != Register::None {
+                        // CMP/TEST only write flags, not their operands --
+                        // without this carve-out the evidence check itself
+                        // (`cmp reg,...`) would trivially satisfy "written".
+                        for b in block_buf.iter() {
+                            match b.mnemonic() {
+                                Mnemonic::Cmp | Mnemonic::Test => continue,
+                                _ => {}
+                            }
+                            if b.op0_kind() == OpKind::Register
+                                && b.op0_register() == instr.memory_base()
+                            {
+                                base_written = true;
+                                break;
+                            }
+                        }
+                    }
+                    let unindexed_switch =
+                        !has_index && base_written && is_switch_dispatch(&block_buf);
+                    follow_jump_table(&instr, pe, lo, hi, unindexed_switch, &mut cases);
                     for c in &cases {
                         branch_seed.entry(*c).or_insert_with(|| block_buf.clone());
                         work.push(*c);
+                    }
+                    if unindexed_switch {
+                        let ft = instr.next_ip();
+                        if (lo..hi).contains(&ft) {
+                            branch_seed.entry(ft).or_insert_with(|| block_buf.clone());
+                            work.push(ft);
+                        }
                     }
                     break;
                 }
@@ -544,14 +597,24 @@ pub fn tail_referenced(pe: &Pe, cg: &CallGraph) -> BTreeSet<u64> {
 /// Follow an MSVC-style `switch` jump table: `JMP dword ptr [idx*4 + TABLE_VA]`.
 /// `TABLE_VA` (the operand displacement, an in-image .rdata address) holds an
 /// array of u32 case addresses. We read entries until one falls outside the
-/// function's `[lo, hi)` span — switch cases always point back into the function,
+/// function `[lo, hi)` span -- switch cases always point back into the function,
 /// so that's a reliable terminator. Recovers the case bodies (and their `CALL`s)
 /// that a plain recursive descent, unable to follow an indirect jump, would miss.
+///
+/// `allow_unindexed` covers Watcom-style lowering where the scale lives in a
+/// separate `shl` and the dispatch is a plain `[reg+TABLE]` with no SIB index
+/// (e.g. FALL.EXE `0x602c0`: `jmp dword ptr cs:[eax+0x502D8]`). Only set it
+/// when the block already looks like a switch (see `is_switch_dispatch`):
+/// without that evidence a vtable tail-jump would read arbitrary words as
+/// "cases". On LE binaries the table entries are pre-fixup bytes, so the
+/// read yields no in-range targets and the fallthrough arm below carries
+/// the recovery instead.
 pub(crate) fn follow_jump_table(
     instr: &Instruction,
     pe: &Pe,
     lo: u64,
     hi: u64,
+    allow_unindexed: bool,
     work: &mut Vec<u64>,
 ) {
     for i in 0..instr.op_count() {
@@ -559,8 +622,10 @@ pub(crate) fn follow_jump_table(
             continue;
         }
         let disp = instr.memory_displacement64();
-        // Need a scaled index (the case selector) and an in-image table base.
-        if instr.memory_index() == Register::None || pe.section_of(disp).is_none() {
+        if instr.memory_index() == Register::None && !allow_unindexed {
+            return;
+        }
+        if pe.section_of(disp).is_none() {
             return;
         }
         let mut k = 0u64;
@@ -580,6 +645,26 @@ pub(crate) fn follow_jump_table(
         }
         return;
     }
+}
+
+/// Switch-dispatch evidence: a compare/test plus a conditional branch in
+/// the current straight-line block (e.g. `cmp edx,6; ja default` ahead of
+/// `jmp [reg+TABLE]`). Used to license fallthrough decoding past an
+/// indirect jump only where a switch table is plausible, so vtable
+/// tail-jumps (no bound check) never gain fallthrough coverage.
+fn is_switch_dispatch(block: &[Instruction]) -> bool {
+    let mut has_cmp = false;
+    let mut has_jcc = false;
+    for i in block {
+        match i.mnemonic() {
+            Mnemonic::Cmp | Mnemonic::Test => has_cmp = true,
+            _ => {}
+        }
+        if matches!(i.flow_control(), FlowControl::ConditionalBranch) {
+            has_jcc = true;
+        }
+    }
+    has_cmp && has_jcc
 }
 
 /// Classify an indirect `CALL`/`JMP [...]` target: `[reg+disp]` is a vtable slot

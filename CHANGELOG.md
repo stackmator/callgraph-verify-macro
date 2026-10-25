@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-10-25
+
+### Fixed
+
+- Indirect-jump gate blindness for Watcom-style switches: `follow_jump_table`
+  required a SIB index, so `shl reg,2` + `jmp [reg+TABLE]` (e.g. FALL.EXE
+  `0x602c0`, `0x6077f`) recovered zero case bodies -- callers spelling the
+  hidden calls tripped E012 HALLUCINATED, and omitting them could never trip
+  E013 MISSING. The harvest now accepts the unindexed `[reg+TABLE]` shape
+  when the block carries switch evidence (a `cmp`/`test` plus a conditional
+  branch) and the base register is written in-block (excluding `cmp`/`test`
+  self-satisfaction), so vtable tail-jumps like `jmp [ecx+0x44]` keep
+  today's behavior. On LE binaries the table entries are pre-fixup bytes,
+  so the table read yields no in-range targets and decoding continues at
+  the fallthrough address, where Watcom lays the case bodies contiguously
+  (verified: `0x602c0`'s five hidden `0x7d6ae` calls). Absolute `[disp]`
+  IAT jumps are never followed: the disp names data, not code, and
+  fallthrough past a non-returning jump attributes neighboring functions'
+  calls here (verified: 9 KB / 20-call blowup on `noivilbo.exe 0x006ff480`
+  with a naive fix). The CFG leader walk, block builder, and
+  `cfg_fingerprint` keep the SIB-only read so fingerprints stay
+  byte-stable; only the call harvest gains the fallthrough arm.
+- Regression tests: synthetic-PE `tests/jump_tables.rs` (Watcom no-index
+  plus SIB images via a tiny `Asm` helper, no toolchain, fail-before /
+  pass-after verified by stash), real-compiler `c_switch_case_calls_recovered`
+  / `c_od_switch_case_calls_recovered` / `cpp_switch_dispatch_recognized`
+  in `tests/c_cpp_integration.rs` (MSVC SIB table recovers 8x `leaf_add`;
+  MSVC folds C++ cases to a shared tail so the table side pins
+  `indirect_jumps >= 1` and `switch_cases >= 8`), and an elder-engine-rs
+  real-world check (`cargo check --workspace --all-targets` on
+  `noivilbo.exe`: 0 errors before on 0.1.1, 0 errors after with the fix).
+
 ### Added
 
 - Real-compiler integration tests in GitHub Actions
@@ -122,7 +154,8 @@ Initial crates.io release.
 - `vtable_table!` declaration support with indirectly-called slot
   verification.
 
-[Unreleased]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.0...v0.1.1

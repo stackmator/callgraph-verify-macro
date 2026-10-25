@@ -95,7 +95,12 @@ fn decode_all(pe: &Pe, entry: u64) -> (BTreeMap<u64, Instruction>, BTreeSet<u64>
                 }
                 FlowControl::IndirectBranch => {
                     let mut cases = Vec::new();
-                    follow_jump_table(&instr, pe, lo, hi, &mut cases);
+                    // Keep the SIB-only table read here: this is the CFG
+                    // leader walk, and the disasm.rs fallthrough recovery
+                    // (for index-less Watcom dispatches) is deliberately
+                    // scoped to call harvesting so CFG fingerprints stay
+                    // byte-stable (see is_switch_dispatch there).
+                    follow_jump_table(&instr, pe, lo, hi, false, &mut cases);
                     for c in cases {
                         leaders.insert(c);
                         work.push(c);
@@ -199,9 +204,9 @@ fn build_cfg(pe: &Pe, entry: u64) -> (BTreeMap<u64, Instruction>, Vec<Block>) {
                         // case is a successor of this block. The
                         // dominator set can then see the indirect
                         // dispatch as a forward fan-out (no back-edge
-                        // through a switch).
+                        // through a switch). SIB-only read (see above).
                         let mut cases = Vec::new();
-                        follow_jump_table(&instr, pe, lo, hi, &mut cases);
+                        follow_jump_table(&instr, pe, lo, hi, false, &mut cases);
                         for c in cases {
                             if (lo..hi).contains(&c) {
                                 succ.push(c);
@@ -343,7 +348,9 @@ pub fn cfg_fingerprint(pe: &Pe, entry: u64) -> Result<CfgFingerprint, String> {
             FlowControl::Return | FlowControl::Interrupt => fp.returns += 1,
             FlowControl::IndirectBranch => {
                 let mut cases = Vec::new();
-                follow_jump_table(&instr, pe, lo, hi, &mut cases);
+                // SIB-only read (see above): keeps switch_cases
+                // byte-stable for LE tables with pre-fixup entries.
+                follow_jump_table(&instr, pe, lo, hi, false, &mut cases);
                 fp.switch_cases += cases.len();
             }
             _ => {}

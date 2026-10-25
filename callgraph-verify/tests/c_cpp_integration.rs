@@ -553,7 +553,7 @@ fn c_call_site_targets_leaf_add_once() {
     };
     // Structural half: branch_caller must call leaf_add exactly once. The
     // strict half (recovering the pushed literal `1` as Imm(1)) lives on
-    // the unoptimized twin below — MinGW -O2 stores stack args with MOV
+    // the unoptimized twin below - MinGW -O2 stores stack args with MOV
     // instead of PUSH, which `recover_call_site` doesn't harvest yet.
     let cg = analyze(&fx.pe, addr(&fx, "branch_caller")).expect("analyze");
     let leaf = addr(&fx, "leaf_add");
@@ -564,6 +564,103 @@ fn c_call_site_targets_leaf_add_once() {
         "branch_caller must call leaf_add exactly once: {:?}",
         cg.call_sites
     );
+}
+
+/// Switch case-call recovery on a REAL compiler jump table: `classify`
+/// lowers to `JMP [table+idx*4]` with 8 case bodies that each CALL
+/// `leaf_add`. Before the Watcom-table fix, an indirect dispatch whose
+/// table read failed yielded zero case calls (mis-reported as
+/// HALLUCINATED when spelled, invisible to MISSING when omitted); this
+/// pins the full harvest -- all 8 targets plus their per-site pushed
+/// constants -- on real MSVC output. MinGW may emit compare chains
+/// instead of a table, so only the MSVC run pins the exact count and
+/// shapes; other toolchains just need every case call present.
+#[test]
+fn c_switch_case_calls_recovered() {
+    let Some(fx) = c_fixture() else {
+        return;
+    };
+    let cg = analyze(&fx.pe, addr(&fx, "classify")).expect("analyze classify");
+    let leaf = addr(&fx, "leaf_add");
+    let sites: Vec<_> = cg
+        .call_sites
+        .iter()
+        .filter(|s| s.target == leaf)
+        .collect();
+    // Tail-merging could in principle fuse identical calls, so the
+    // toolchain-neutral bar is "nearly all cases found"; MSVC pins the
+    // exact eight below.
+    assert!(
+        sites.len() >= 7,
+        "classify must call leaf_add in (nearly) every case: {:?}",
+        cg.direct_calls
+    );
+    if fx.toolchain == "msvc" {
+        assert_eq!(
+            sites.len(),
+            8,
+            "MSVC lowers the 8-case switch to a jump table with one call per case: {:?}",
+            cg.direct_calls
+        );
+        assert!(
+            cg.indirect_jumps >= 1,
+            "the switch dispatch itself must be recognized: {:?}",
+            cg.direct_calls
+        );
+        // Each case pushes its own first-arg constant (100+i); the second
+        // arg is the case index i. Both must survive per-site recovery.
+        let mut first_args: Vec<u64> = sites
+            .iter()
+            .filter_map(|s| match s.stack.as_slice() {
+                [ArgKind::Imm(a), ..] => Some(*a),
+                _ => None,
+            })
+            .collect();
+        first_args.sort_unstable();
+        assert_eq!(
+            first_args,
+            (100u64..108).collect::<Vec<_>>(),
+            "each case's pushed first-arg constant must be recovered: {:?}",
+            sites
+                .iter()
+                .map(|s| &s.stack)
+                .collect::<Vec<_>>()
+        );
+    } else {
+        eprintln!(
+            "note: skipping exact switch shape asserts on {} (compare-chain lowering unpinned)",
+            fx.toolchain
+        );
+    }
+}
+
+/// Same as above on the unoptimized twin: no inlining, naive control
+/// flow, still 8 `leaf_add` calls to recover.
+#[test]
+fn c_od_switch_case_calls_recovered() {
+    let Some(od) = c_od_fixture() else {
+        return;
+    };
+    let cg = analyze(&od.pe, addr(&od, "classify")).expect("analyze classify");
+    let leaf = addr(&od, "leaf_add");
+    let sites: Vec<_> = cg
+        .call_sites
+        .iter()
+        .filter(|s| s.target == leaf)
+        .collect();
+    assert!(
+        sites.len() >= 7,
+        "od classify must call leaf_add in (nearly) every case: {:?}",
+        cg.direct_calls
+    );
+    if od.toolchain == "msvc" {
+        assert_eq!(
+            sites.len(),
+            8,
+            "MSVC -Od keeps one call per case: {:?}",
+            cg.direct_calls
+        );
+    }
 }
 
 #[test]
@@ -744,6 +841,44 @@ fn cpp_caller_calls_leaf_and_counter() {
         assert!(
             edges.contains(&want),
             "cpp_caller_fn edges {edges:#x?} miss {want:#x}"
+        );
+    }
+}
+
+/// Switch dispatch recovery on a REAL C++ jump table: `cpp_classify`
+/// lowers to `JMP [table+idx*4]` with 8 case bodies (each sets up its
+/// `cpp_leaf_fn` argument and tail-jumps to the shared body, so there
+/// are no per-case direct calls to harvest -- the cases are control
+/// flow, not calls). This pins the table side of the recovery: the
+/// dispatch must be recognized and every table entry must resolve to
+/// analyzed code, on real compiler output rather than hand-built bytes.
+/// MSVC emits the SIB-indexed table; other toolchains may use compare
+/// chains instead, so only the MSVC run pins the exact table shape.
+#[test]
+fn cpp_switch_dispatch_recognized() {
+    let Some(fx) = cpp_fixture() else {
+        return;
+    };
+    let cg = analyze(&fx.pe, addr(&fx, "cpp_classify")).expect("analyze");
+    if fx.toolchain == "msvc" {
+        assert!(
+            cg.indirect_jumps >= 1,
+            "cpp_classify's switch dispatch must be recognized: {:?}",
+            cg.direct_calls
+        );
+        let fp = cfg_fingerprint(&fx.pe, addr(&fx, "cpp_classify")).expect("cfg");
+        eprintln!("cpp_classify fingerprint: {fp:?}");
+        assert!(
+            fp.switch_cases >= 8,
+            "all 8 MSVC jump-table cases must resolve to code: {fp:?}"
+        );
+    } else {
+        // Non-MSVC lowering unpinned by hand: require surviving control
+        // flow (table or compare chain), same bar as the C switch test.
+        let fp = cfg_fingerprint(&fx.pe, addr(&fx, "cpp_classify")).expect("cfg");
+        assert!(
+            fp.switch_cases >= 3 || fp.conditionals >= 5,
+            "cpp_classify's switch must survive as control flow: {fp:?}"
         );
     }
 }

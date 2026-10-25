@@ -69,6 +69,7 @@ C_SYMBOLS = [
 CPP_SYMBOLS = [
     "cpp_leaf_fn",
     "cpp_caller_fn",
+    "cpp_classify",
     "cpp_counter_fn",
     "cpp_field_fn",
     "cpp_use_virtual_fn",

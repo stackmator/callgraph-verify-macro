@@ -60,6 +60,27 @@ extern "C" NOINLINE int cpp_caller_fn(int x) {
     return a + b;
 }
 
+// --- dense switch: 8 cases with calls, mirroring the C fixture ---------
+// `cpp_classify` must lower to control flow carrying one `cpp_leaf_fn`
+// call per case (MSVC emits `JMP [table+idx*4]` like the C fixture;
+// whatever lowering wins, all 8 call sites must survive so the
+// jump-table case-call recovery has real compiler output to prove
+// itself on). Reachable from `main`, NOINLINE, distinct immediates
+// per case so no two cases can merge.
+extern "C" NOINLINE int cpp_classify(int v) {
+    switch (v) {
+        case 0: return cpp_leaf_fn(100);
+        case 1: return cpp_leaf_fn(101);
+        case 2: return cpp_leaf_fn(102);
+        case 3: return cpp_leaf_fn(103);
+        case 4: return cpp_leaf_fn(104);
+        case 5: return cpp_leaf_fn(105);
+        case 6: return cpp_leaf_fn(106);
+        case 7: return cpp_leaf_fn(107);
+        default: return -1;
+    }
+}
+
 // --- virtual dispatch: `use_virtual` must reach `kind()` only indirectly ----
 
 struct Shape {
@@ -107,6 +128,7 @@ int main() {
     int total = 0;
     total += cpp_caller_fn(21);
     total += cpp_counter_fn(100, 23);
+    total += cpp_classify(3);
     total += cpp_shapes_fn();
     Circle c(9);
     total += cpp_use_virtual_fn(&c);
