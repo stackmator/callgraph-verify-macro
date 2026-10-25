@@ -128,6 +128,7 @@ int uses_tiny(int x) {
 struct Point {
     int x;
     int y;
+    int z;
 };
 
 int field_read(struct Point *p) {
