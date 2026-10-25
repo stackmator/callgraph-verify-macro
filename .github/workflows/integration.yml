@@ -95,11 +95,10 @@ jobs:
 
       - name: TEMPORARY debug MinGW od classify codegen
         run: |
-          i686-w64-mingw32-objdump -d target/fixtures/c_callgraph_od.exe | grep -A 120 "<classify>:" | head -n 140
-          echo "--- addrs ---"
-          cat target/fixtures/c_callgraph_od_addrs.json
+          echo "--- od classify ---"
+          i686-w64-mingw32-objdump -d target/fixtures/c_callgraph_od.exe | grep -A 150 "classify>:" | head -n 160
           echo "--- O2 classify for comparison ---"
-          i686-w64-mingw32-objdump -d target/fixtures/c_callgraph.exe | grep -A 80 "<classify>:" | head -n 100
+          i686-w64-mingw32-objdump -d target/fixtures/c_callgraph.exe | grep -A 100 "classify>:" | head -n 110
 
       - name: C/C++ fixture integration tests
         run: cargo test -p callgraph-verify --test c_cpp_integration --verbose
