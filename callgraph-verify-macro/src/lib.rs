@@ -30,7 +30,7 @@
 //! configurable knob.
 
 use proc_macro::TokenStream;
-use quote::{quote, ToTokens};
+use quote::quote;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use syn::parse::{Parse, ParseStream};
