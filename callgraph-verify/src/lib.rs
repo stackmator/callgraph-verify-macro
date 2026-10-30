@@ -19,7 +19,7 @@ pub mod pe;
 pub mod skel;
 
 pub use disasm::{analyze, reg_params, resolve_thunk, tail_referenced, ArgKind, CallGraph, CallSite};
-pub use pe::Pe;
+pub use pe::{FixupStatus, Pe};
 pub use skel::{cfg_fingerprint, CfgFingerprint};
 
 use std::collections::BTreeSet;
@@ -276,9 +276,15 @@ impl Spec {
         }
         // The rest are present-checks: a declared item the binary doesn't exhibit
         // is the hallucination; we don't require enumerating the binary's full set.
+        // Data addresses accept their runtime (post-fixup) images too: DOS4GW
+        // applies the LE fixup tables at load, so a declared post-fixup value
+        // of a referenced pre-fixup address is faithful, not invented.
+        let post = pe.fixup_post_images(
+            &cg.globals.union(&cg.imm_addrs).copied().collect(),
+        );
         present_check("field offset", &self.fields, &cg.field_offsets, &mut v);
-        present_check("global", &self.globals, &cg.globals, &mut v);
-        present_check("vtable/imm addr", &self.vtables, &cg.imm_addrs, &mut v);
+        present_check_fixup("global", &self.globals, &cg.globals, &post, &mut v);
+        present_check_fixup("vtable/imm addr", &self.vtables, &cg.imm_addrs, &post, &mut v);
         present_check("vcall slot", &self.vcall_slots, &cg.vcall_slots, &mut v);
         present_check("IAT import", &self.iat, &cg.iat_calls, &mut v);
 
@@ -308,8 +314,22 @@ impl Spec {
 }
 
 fn present_check(kind: &str, declared: &[u64], real: &BTreeSet<u64>, out: &mut Vec<String>) {
+    present_check_fixup(kind, declared, real, &BTreeSet::new(), out)
+}
+
+/// Present-check with an LE-fixup escape: `post` holds the runtime images
+/// of the binary's referenced pre-fixup addresses (see
+/// `Pe::fixup_post_images`). A declared post-fixup value is faithful.
+/// Widening only — nothing previously passing can fail.
+fn present_check_fixup(
+    kind: &str,
+    declared: &[u64],
+    real: &BTreeSet<u64>,
+    post: &BTreeSet<u64>,
+    out: &mut Vec<String>,
+) {
     for d in declared {
-        if !real.contains(d) {
+        if !real.contains(d) && !post.contains(d) {
             out.push(format!(
                 "HALLUCINATED  declared {kind} {d:#x} — binary never references it"
             ));
@@ -368,6 +388,11 @@ pub struct CorpusDiff {
     pub vtable_dispatch: Vec<(String, Vec<u64>)>,
     /// Binary calls a ported fn the Rust body doesn't (often inlined; review).
     pub missing: Vec<u64>,
+    /// Binary calls with NO corpus origin (unported callees). The gate lets
+    /// bodies omit these with a `TODO`, so they never fire MISSING — but they
+    /// are real edges, and silently dropping them is the MISSING-unknown gap.
+    /// Informational only (feeds a macro NOTE, never a fatal).
+    pub unported: Vec<u64>,
     pub indirect_calls: u32,
 }
 
@@ -403,12 +428,18 @@ pub fn diff_body_calls(
 ) -> Result<CorpusDiff, String> {
     let primary = *own_addrs.first().ok_or("no origin address")?;
     let mut bin_calls = BTreeSet::new();
+    // Direct CALL targets only (no tail jumps): feeds the self-recursion
+    // check below. A direct self-call is genuine recursion and must be
+    // spelled; a self tail-JMP is a loop (covered by the CFG gate), so it
+    // stays out of this set.
+    let mut bin_direct = BTreeSet::new();
     let mut wide_extras = BTreeSet::new();
     let mut footprint = BTreeSet::new();
     let mut indirect = 0u32;
     let mut tail_targets: BTreeSet<u64> = BTreeSet::new();
     for &a in own_addrs {
         let cg = analyze(pe, a)?;
+        bin_direct.extend(cg.call_targets());
         bin_calls.extend(cg.call_targets());
         // A tail-call `JMP 0xADDR` out of the body is a real call edge (e.g. a
         // cache-wrapper that tail-calls the base getter), so count it as a call —
@@ -509,9 +540,32 @@ pub fn diff_body_calls(
     // spells it. `miss_satisfied` (both tables, DENY-inclusive, split-agnostic)
     // marks those addresses as satisfiable-by-name. Used ONLY here — never to
     // excuse a HALLUCINATED, which keeps the strict split + DENY filter.
-    let missing: Vec<u64> = bin_ported
+    let mut missing: Vec<u64> = bin_ported
         .difference(&resolved)
         .filter(|a| !miss_satisfied.contains(a))
+        .copied()
+        .collect();
+    // Self-recursion: `own` addrs are excluded from MISSING above (a
+    // faithful recursive body spells the self-call, which would otherwise
+    // look hallucinated), so a body that drops a direct self-CALL passes
+    // silently. Pin it: a binary self-call the body doesn't spell by name
+    // is a MISSING. Only DIRECT calls count — a self tail-JMP is a loop,
+    // covered by the CFG gate (a `loop {}` port is faithful there).
+    for o in &own {
+        if bin_direct.contains(o)
+            && !rust_idents
+                .iter()
+                .any(|(_, addrs)| addrs.contains(o))
+        {
+            missing.push(*o);
+        }
+    }
+    // Unported inventory (MISSING-unknown gap): real binary edges with no
+    // corpus origin. Never fatal — bodies may omit these with a `TODO` — but
+    // listing them keeps the omission visible instead of silently green.
+    let unported: Vec<u64> = bin_calls
+        .difference(corpus)
+        .filter(|a| !own.contains(a))
         .copied()
         .collect();
     Ok(CorpusDiff {
@@ -520,6 +574,7 @@ pub fn diff_body_calls(
         inlined_ok,
         vtable_dispatch,
         missing,
+        unported,
         indirect_calls: indirect,
     })
 }

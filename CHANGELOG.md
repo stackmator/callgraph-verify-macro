@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Branch-polarity ground truth in `CallGraph`: `signed_branches` /
+  `unsigned_branches` / `equality_branches` count every conditional branch
+  by condition class (`JL/JLE/JG/JGE` vs `JB/JBE/JA/JAE` vs `JE/JNE`),
+  harvested in `analyze` alongside the call set. The gate still checks CFG
+  *structure* only (an inverted `je`/`jne` mirror passes), but ports and
+  tests can now pin which class the binary uses. Pinned on real MSVC
+  output in `tests/c_cpp_integration.rs`: `branch_caller` (`x > 100`) and
+  `loop_sum` (`i <= n`) each keep a signed branch on `/O2` and `/Od`;
+  `decision_chain` keeps 13 equality branches.
+- Unported-call inventory in `CorpusDiff::unported`: binary edges with no
+  `#[origin]` in the corpus. Bodies may still omit these with a `TODO`
+  (never fatal — no new `MISSING`), but the macro now emits an
+  informational `UNPORTED-CALLS` note listing them instead of staying
+  silent-green. Pinned by `c_diff_body_calls_reports_unported` on the real
+  C fixture (partial corpus: `leaf_const` edge is `unported`, not `missing`).
+- ARG-SHAPE `let`-bound const propagation in `body.rs`: `let k = 0x10;`
+  records `k -> Imm(16)` so a later `f(k)` checks the value instead of
+  skipping as `Other`. Sound under-approximation — rebinding to anything
+  non-concrete, `=`/compound assignment, `ref` bindings, and shadowing
+  binders (`for`/`while`-`let`/`if`-`let`/closures/match arms/block scope/
+  `let`-`else`) all evict. Pinned by 11 `body.rs` unit tests plus
+  `tests/real_arg_shape.rs`: fixtures generated from the live MSVC Od
+  manifest (`branch_caller` stages `PUSH 1` before `CALL leaf_add`) prove
+  `let k = 1` stays clean while `let k = 0x99` fires E014
+  (`arg #1 is Imm(153), but the binary's call passes Imm(1)`).
+- E021 POLARITY (new fatal code): the binary tests one branch class the
+  body never tests — a wrong-class predicate the call/CFG checks can't see
+  (`==` ported as `>` passes the gate while mis-modeling the binary).
+  Binary side from the `CallGraph::{signed,unsigned,equality}_branches`
+  harvest; Rust side from the new `CondCounts` harvest (`==`/`!=`, match
+  literal arms, `matches!`, bare flag tests, `if`/`while` `let` ⇒ eq;
+  relational binops, match range arms, `for` loops ⇒ rel). Fires only on
+  gross divergence (equality ≥3 with body eq == 0; signed+unsigned ≥ 2 with
+  body rel == 0). Taken-arm inversions WITHIN a class (`==` vs `!=`) stay a
+  hand-audit (documented). Pinned by `tests/real_polarity.rs` on real MSVC
+  Od output (decision_chain eq=14, nested_sum signed=2) plus 8 `body.rs`
+  counting tests. New-code note for downstream trees: E021 can fire where
+  E016 stayed silent (branch classes with <12 total conditionals); re-bless
+  or port the predicate.
+- E016 third-prong tightening: `conditionals >= 12` now fires at
+  branchiness ≤ 1 (was == 0), where branchiness counts `if`/`match`/loops
+  plus `&&`/`||` (each short-circuits through its own JCC, so a fused
+  condition earns its keep). A single-`if` wrapper no longer defeats the
+  gate. Pinned by `tests/real_structure.rs` on the real Od decision_chain.
+- MISSING now covers self-recursion: a direct CALL to the function's own
+  entry with no same-name body call is E013 (own addrs were excluded
+  outright, so a dropped self-call passed silently). Self tail-JMPs stay
+  out (a loop port is faithful there; the CFG gate covers it). Pinned by
+  `c_recurse_sum_calls_itself` (new `recurse_sum` fixture fn, both MSVC
+  modes) plus `tests/real_structure.rs` (fail without / pass with the
+  self-call, real Od output).
+- LE fixup awareness (closes the "fixups TODO" caveat for data addresses):
+  `parse_le` now walks the fixup page/record tables and absorbs every
+  internal-07 (absolute) pair as `(pre, post)` content values; 08
+  (self-relative) records are parsed and validated without contributing
+  (a relative offset names no address); 02 (selector) records are skipped.
+  `Spec` present-checks and the E015 operand check accept post-fixup
+  images of referenced pre-fixup addresses — widening only, never a demand;
+  call-graph/CFG ground truth stays pre-fixup (code objects are not
+  relocated). A record kind outside the grammar skips the tables loudly
+  (`FixupStatus::Skipped` + macro NOTE, image stays pre-fixup) instead of
+  failing the parse; corruption stays fatal. Pinned by 4 synthetic-LE
+  `pe.rs` unit tests (narrow/list 07, 08 validation, unknown-kind skip,
+  table-adjacency proof) and `dos_fixup_post_images_accepted` (real Watcom
+  LE on CI; skips without the fixture).
+
 ## [0.1.5] - 2026-10-25
 
 ### Fixed

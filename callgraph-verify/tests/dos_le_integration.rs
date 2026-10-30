@@ -10,10 +10,12 @@
 //! That is enough to pin the LE path: parsing, CFG walk, call harvesting,
 //! the byte-scan gates, and the Spec HALLUCINATED/MISSING gates.
 //!
-//! Scope warning (mirrors `pe.rs`): LE fixups are NOT applied yet, so
-//! absolute-address facts (globals, immediates, IAT) are pre-fixup bytes on
-//! LE. These tests pin call edges, indirect counts, and CFG shape only —
-//! never absolute VAs.
+//! Scope note (mirrors `pe.rs`): direct CALL rel32 (the call graph) is
+//! fixup-independent, but absolute-address facts (globals, immediates) are
+//! pre-fixup bytes on LE — with post-fixup images accepted wherever a 07
+//! record maps them (`Pe::fixup_post_images`). Most tests pin call edges,
+//! indirect counts, and CFG shape only; `dos_fixup_post_images_accepted`
+//! pins the widening itself on real Watcom output.
 //!
 //! Fixture discovery mirrors `c_cpp_integration.rs`: `$CALLGRAPH_DOS_EXE`
 //! wins, else `<repo>/target/fixtures/dos_callgraph.exe`. Missing fixture
@@ -23,7 +25,10 @@
 //! never have; the ubuntu job is the DOS gate. Same precedent as the
 //! MSVC-only ILT-thunk fixture in the other direction.
 
-use callgraph_verify::{analyze, cfg_fingerprint, diff_calls, has_direct_branch_target, Pe, Spec};
+use callgraph_verify::{
+    analyze, cfg_fingerprint, diff_calls, has_direct_branch_target, FixupStatus, Pe, Spec,
+};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 fn load_dos() -> Option<(PathBuf, Pe)> {
@@ -311,6 +316,71 @@ fn dos_leaf_and_loop_exist() {
         !looped.is_empty(),
         "no function with a loop back-edge (want e.g. loop_sum)"
     );
+}
+
+#[test]
+fn dos_fixup_post_images_accepted() {
+    let Some(_) = load_dos() else {
+        return;
+    };
+    let (_, pe) = load_dos().unwrap();
+    // Coherence pin for the fixup-aware accept-set on a REAL Watcom LE:
+    // every post image of a referenced pre-fixup global must pass a Spec
+    // present-check (pre values keep passing; garbage keeps failing).
+    // If the fixture's tables hold no 07 pairs (or were skipped as a novel
+    // dialect), there is nothing post-fixup to pin — the synthetic-LE unit
+    // tests in pe.rs carry the proof in that case.
+    if pe.fixup_count() == 0 {
+        match pe.fixup_status() {
+            FixupStatus::Skipped { reason } => {
+                eprintln!("DOS fixture fixups skipped ({reason}); nothing post-fixup to pin")
+            }
+            FixupStatus::Applied { .. } => {
+                eprintln!("DOS fixture has no 07 pairs; nothing post-fixup to pin")
+            }
+            FixupStatus::Absent => eprintln!("DOS fixture has no fixup tables"),
+        }
+        return;
+    }
+    let addrs = sweep_functions(&pe, 512);
+    let mut validated = 0u32;
+    for a in &addrs {
+        let Ok(cg) = analyze(&pe, *a) else {
+            continue;
+        };
+        let pres: BTreeSet<u64> = cg.globals.union(&cg.imm_addrs).copied().collect();
+        if pres.is_empty() {
+            continue;
+        }
+        for post in pe.fixup_post_images(&pres) {
+            Spec::new(*a)
+                .globals(&[post])
+                .check(&pe)
+                .unwrap_or_else(|e| {
+                    panic!("post-fixup image {post:#x} of {a:#x} must be accepted: {e}")
+                });
+            validated += 1;
+        }
+        // Pre-fixup behavior is unchanged: the pre value passes, garbage fails.
+        for pre in pres.iter().take(1) {
+            Spec::new(*a)
+                .globals(&[*pre])
+                .check(&pe)
+                .expect("pre-fixup global must still pass");
+        }
+        if validated >= 4 {
+            break; // enough real-LE evidence; the sweep is not the point
+        }
+    }
+    assert!(
+        validated > 0,
+        "fixup pairs exist but no swept function references a patched pre value"
+    );
+    let err = Spec::new(addrs[0])
+        .globals(&[0xDEADBEEF])
+        .check(&pe)
+        .expect_err("garbage global must still fail");
+    assert!(err.contains("HALLUCINATED"), "error: {err}");
 }
 
 #[test]

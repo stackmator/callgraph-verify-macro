@@ -484,6 +484,41 @@ fn c_field_offsets() {
 }
 
 #[test]
+fn c_recurse_sum_calls_itself() {
+    // Self-recursion ground truth for the MISSING self-edge check: the
+    // binary must contain a DIRECT call to its own entry on both optimized
+    // and unoptimized MSVC output (not a tail-JMP — the add after the call
+    // keeps it a real CALL).
+    for fx in [c_fixture(), c_od_fixture()].into_iter().flatten() {
+        let me = addr(&fx, "recurse_sum");
+        let cg = analyze(&fx.pe, me).expect("analyze recurse_sum");
+        assert!(
+            cg.call_targets().contains(&me),
+            "[{}] recurse_sum must directly call itself: {:?}",
+            fx.label, cg.direct_calls
+        );
+    }
+}
+
+#[test]
+fn c_nested_sum_has_signed_branches() {
+    // Relational-class ground truth for E021: both toolchains lower the
+    // loop bounds to signed JCCs (Od: 2x JGE; O2: JL/JLE/JGE mix).
+    for fx in [c_fixture(), c_od_fixture()].into_iter().flatten() {
+        let cg = analyze(&fx.pe, addr(&fx, "nested_sum")).expect("analyze");
+        eprintln!(
+            "[{}] nested_sum polarity: signed={} unsigned={} equality={}",
+            fx.label, cg.signed_branches, cg.unsigned_branches, cg.equality_branches
+        );
+        assert!(
+            cg.signed_branches >= 2,
+            "[{}] nested_sum's loop bounds must survive as signed JCCs",
+            fx.label
+        );
+    }
+}
+
+#[test]
 fn c_loop_has_back_edge() {
     let Some(fx) = c_fixture() else {
         return;
@@ -543,6 +578,128 @@ fn c_decision_chain_has_twelve_conditionals() {
     assert!(
         fp.conditionals >= 12,
         "decision_chain's 12 ifs must yield 12 conditionals: {fp:?}"
+    );
+}
+
+// --- Branch-polarity ground truth -----------------------------------------
+// The gate checks CFG *structure* but never `==` vs `!=` or signed vs
+// unsigned — an inverted mirror passes. These pin the binary side (signed /
+// unsigned / equality `Jcc` counts from `analyze`) on real compiler output
+// so future gate work has truth to diff against. Thresholds are lower bounds:
+// optimizers may fuse or reorder branches, but the class must survive.
+
+#[test]
+fn c_branch_caller_uses_signed_branch() {
+    let Some(fx) = c_fixture() else {
+        return;
+    };
+    // `if (x > 100)` is a signed comparison — must lower to JL/JLE/JG/JGE,
+    // never to an unsigned JB/JA family branch.
+    let cg = analyze(&fx.pe, addr(&fx, "branch_caller")).expect("analyze");
+    eprintln!(
+        "branch_caller polarity: signed={} unsigned={} equality={}",
+        cg.signed_branches, cg.unsigned_branches, cg.equality_branches
+    );
+    assert!(
+        cg.signed_branches >= 1,
+        "branch_caller's signed `x > 100` must survive as a signed Jcc: signed={} unsigned={} equality={}",
+        cg.signed_branches,
+        cg.unsigned_branches,
+        cg.equality_branches
+    );
+}
+
+#[test]
+fn c_od_branch_caller_uses_signed_branch() {
+    let Some(od) = c_od_fixture() else {
+        return;
+    };
+    // Unoptimized twin: naive EBP-frame codegen, same signed class expected.
+    let cg = analyze(&od.pe, addr(&od, "branch_caller")).expect("analyze");
+    assert!(
+        cg.signed_branches >= 1,
+        "branch_caller -O0 signed `x > 100` must survive as a signed Jcc: signed={} unsigned={} equality={}",
+        cg.signed_branches,
+        cg.unsigned_branches,
+        cg.equality_branches
+    );
+}
+
+#[test]
+fn c_loop_sum_uses_signed_branch() {
+    let Some(fx) = c_fixture() else {
+        return;
+    };
+    // `for (i = 1; i <= n; i++)` bounds are signed ints — JLE family.
+    let cg = analyze(&fx.pe, addr(&fx, "loop_sum")).expect("analyze loop_sum");
+    assert!(
+        cg.signed_branches >= 1,
+        "loop_sum's signed `i <= n` must survive as a signed Jcc: signed={} unsigned={} equality={}",
+        cg.signed_branches,
+        cg.unsigned_branches,
+        cg.equality_branches
+    );
+}
+
+#[test]
+fn c_decision_chain_uses_equality_branches() {
+    let Some(fx) = c_fixture() else {
+        return;
+    };
+    // 14x `x == K` comparisons — each must lower to JE/JNE, not to a
+    // signed/unsigned relational branch.
+    let cg = analyze(&fx.pe, addr(&fx, "decision_chain")).expect("analyze");
+    eprintln!(
+        "decision_chain polarity: signed={} unsigned={} equality={}",
+        cg.signed_branches, cg.unsigned_branches, cg.equality_branches
+    );
+    assert!(
+        cg.equality_branches >= 12,
+        "decision_chain's `==` chain must survive as equality Jcc: signed={} unsigned={} equality={}",
+        cg.signed_branches,
+        cg.unsigned_branches,
+        cg.equality_branches
+    );
+}
+
+#[test]
+fn c_diff_body_calls_reports_unported() {
+    let Some(fx) = c_fixture() else {
+        return;
+    };
+    // MISSING-unknown gap: binary edges with no corpus origin were silently
+    // green (bodies may omit them with TODO). `CorpusDiff::unported` must
+    // list them. Corpus here is every fixture addr EXCEPT `leaf_const`, so
+    // `branch_caller`'s `leaf_const` edge is real-but-unported: not MISSING
+    // (nothing ported to spell), but present in `unported`.
+    let leaf_add = addr(&fx, "leaf_add");
+    let leaf_const = addr(&fx, "leaf_const");
+    let corpus: BTreeSet<u64> = fx
+        .addrs
+        .values()
+        .copied()
+        .filter(|&a| a != leaf_const)
+        .collect();
+    let rust_idents = vec![("leaf_add".to_string(), vec![leaf_add])];
+    let empty = BTreeSet::new();
+    let d = diff_body_calls(
+        &fx.pe,
+        &[addr(&fx, "branch_caller")],
+        &corpus,
+        &rust_idents,
+        &empty,
+        &BTreeSet::from([leaf_add]),
+    )
+    .expect("diff branch_caller");
+    assert!(
+        d.missing.is_empty(),
+        "leaf_const has no origin, so it must not fire MISSING: {:?}",
+        d.missing
+    );
+    assert!(
+        d.unported.contains(&leaf_const),
+        "branch_caller's real leaf_const edge must be inventoried as unported: {:?}",
+        d.unported
     );
 }
 
@@ -1053,7 +1210,7 @@ fn c_o2_vs_od_inlining_differential() {
     let mut events: Vec<(String, String)> = Vec::new();
     let mut compared = 0u32;
     for (name, &o2_va) in fx.addrs.iter() {
-        let (Some(&od_va)) = od.addrs.get(name) else {
+        let Some(&od_va) = od.addrs.get(name) else {
             continue;
         };
         // Data symbols and vtables have no code to compare.
@@ -1071,10 +1228,10 @@ fn c_o2_vs_od_inlining_differential() {
         let o2_edges = call_edges(&fx, o2_va);
         let od_edges = call_edges(&od, od_va);
         for t_od in &od_edges {
-            let (Some(callee_name)) = od_names.get(t_od).copied() else {
+            let Some(callee_name) = od_names.get(t_od).copied() else {
                 continue; // unnamed CRT/internal helper — can't align
             };
-            let (Some(&o2_target)) = fx.addrs.get(callee_name) else {
+            let Some(&o2_target) = fx.addrs.get(callee_name) else {
                 continue;
             };
             if !o2_edges.contains(&o2_target) {

@@ -80,6 +80,15 @@ pub struct CallGraph {
     pub globals: BTreeSet<u64>,
     /// In-image immediate values (vtable VAs, fn pointers, string addresses).
     pub imm_addrs: BTreeSet<u64>,
+    /// Conditional-branch polarity (by condition class): signed (`JL/JLE/JG/JGE`),
+    /// unsigned (`JB/JBE/JA/JAE`), equality (`JE/JNE`). Other conditions
+    /// (`JP/JS/JO/...`) are not counted. Ground truth for the polarity gap:
+    /// the gate checks CFG *structure* but never `==` vs `!=` or signed vs
+    /// unsigned, so an inverted mirror passes. These counts let ports and
+    /// tests pin which class the binary actually uses.
+    pub signed_branches: u32,
+    pub unsigned_branches: u32,
+    pub equality_branches: u32,
     /// Highest instruction-end VA reached — the function's apparent extent.
     pub max_end: u64,
     pub decode_errors: u32,
@@ -470,6 +479,20 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
                     block_buf.clear(); // an indirect call's args must not leak into the next call
                 }
                 FlowControl::ConditionalBranch => {
+                    // Polarity ground truth (one count per branch instruction;
+                    // each ip is visited once via `seen`, so no double-count).
+                    match instr.mnemonic() {
+                        Mnemonic::Jl | Mnemonic::Jle | Mnemonic::Jg | Mnemonic::Jge => {
+                            cg.signed_branches += 1;
+                        }
+                        Mnemonic::Jb | Mnemonic::Jbe | Mnemonic::Ja | Mnemonic::Jae => {
+                            cg.unsigned_branches += 1;
+                        }
+                        Mnemonic::Je | Mnemonic::Jne => {
+                            cg.equality_branches += 1;
+                        }
+                        _ => {}
+                    }
                     let t = instr.near_branch_target();
                     if (lo..hi).contains(&t) {
                         branch_seed.entry(t).or_insert_with(|| block_buf.clone());

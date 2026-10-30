@@ -78,9 +78,11 @@ it skips when the variable is unset, even under REQUIRE.
   inlinable pair (`tiny_sum` called twice by `uses_tiny`, address taken —
   the /O2-vs-/Od inlining differential), an indirect call (`apply_twice`),
   globals (`g_counter`, `g_k2`), a struct field pair
-  (`field_read`/`field_write`), and — C++ only — a virtual call
+  (`field_read`/`field_write`), a self-recursion (`recurse_sum`, the MISSING
+  self-edge pin), and — C++ only — a virtual call
   (`cpp_use_virtual_fn`) plus a member-reading method (`Circle::kind`,
   the thiscall/vtable-only pins).
-* DOS scope: LE fixups are not applied yet (`Pe::parse_le` docs), so only
-  call edges / indirect counts / CFG shape are pinned on LE — never
-  absolute globals, immediates, or IAT slots.
+* DOS scope: LE fixup tables are absorbed for post-fixup address facts
+  (`Pe::parse_le` docs), but jump-table entry reads stay pre-fixup bytes —
+  most DOS tests pin call edges / indirect counts / CFG shape, with post
+  images pinned via the accept-set (`dos_fixup_post_images_accepted`).

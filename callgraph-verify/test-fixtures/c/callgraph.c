@@ -209,6 +209,18 @@ NOINLINE int tail_caller(int x) {
     return tail_target(x);
 }
 
+// --- self-recursion: the call graph must contain the self edge ----------
+// `recurse_sum` calls itself (not tail-position: the add happens after the
+// call, so optimizers keep a real CALL). Tests pin that the self edge is
+// harvested — a port that drops the self-call is a MISSING, not clean.
+
+NOINLINE int recurse_sum(int n) {
+    if (n <= 0) {
+        return 0;
+    }
+    return n + recurse_sum(n - 1);
+}
+
 // --- entry point: keeps every function above alive for the linker -----------
 
 int main(void) {
@@ -241,6 +253,7 @@ int main(void) {
     total += pt.x + pt.y + pt.z;
     total += use_apply(41);
     total += tail_caller(7);
+    total += recurse_sum(5);
     printf("%d\n", total);
     return 0;
 }

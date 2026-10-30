@@ -3,13 +3,44 @@
 //! in `goblin`/`object`: the contract is "pure byte", and the only thing the
 //! disassembler needs is `va -> &[machine code bytes]`.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// LE fixup-table outcome for one loaded image.
+#[derive(Debug, Clone)]
+pub enum FixupStatus {
+    /// No LE fixup tables (PE binaries, or an LE with zeroed table offsets).
+    Absent,
+    /// Tables parsed; N internal-07 pairs absorbed (possibly zero: tables
+    /// present but nothing absolute to relocate).
+    Applied { pairs: usize },
+    /// Tables present but held a record kind outside the proven grammar;
+    /// the image stays pre-fixup (the historical behavior) with the reason
+    /// recorded. Loud, not silent: the macro surfaces this as a NOTE once
+    /// per build, and `fixup_post_images` is empty.
+    Skipped { reason: String },
+}
 
 /// A loaded PE image: the raw file plus the parsed section table.
 pub struct Pe {
     data: Vec<u8>,
     pub image_base: u64,
     sections: Vec<Section>,
+    /// LE fixup absorption (07 absolute records only): `(pre, post)` content
+    /// pairs for every patched dword — `pre` is the link-time dword in the
+    /// file bytes (what `--asm` shows and the harvesters record), `post` is
+    /// what DOS4GW maps at runtime. Always empty for PE (no LE fixup tables
+    /// there). Powers the fixup-aware address accept-set: a body may bake
+    /// the runtime value of an address the binary references pre-fixup.
+    /// Call-graph/CFG ground truth stays pre-fixup (code objects are not
+    /// relocated, so direct CALL rel32 is unaffected); only the data-address
+    /// accept-set widens. 08 (self-relative) and 02 (selector) records are
+    /// parsed and validated so the table walk stays proof-checked, but
+    /// contribute no pairs (relative offsets are not addresses; selectors
+    /// have no flat-model value).
+    fixup_posts: Vec<(u64, u64)>,
+    /// What happened with the LE fixup tables (see `FixupStatus`).
+    fixup_status: FixupStatus,
     /// Process-unique identity assigned at parse time. Whole-image derived
     /// caches (instruction starts, branch targets) key on this so two
     /// same-layout PEs with different bytes can never share an entry — the
@@ -139,17 +170,48 @@ impl Pe {
                 characteristics: u32(&data, s + 36),
             });
         }
-        Ok(Pe {
-            data,
-            image_base,
-            sections,
-            id: next_pe_id(),
-        })
-    }
+    Ok(Pe {
+        data,
+        image_base,
+        sections,
+        fixup_posts: Vec::new(),
+        fixup_status: FixupStatus::Absent,
+        id: next_pe_id(),
+    })
+}
 
     /// Process-unique id assigned at parse time (see the field docs).
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Runtime (post-fixup) images of link-time (pre-fixup) addresses: for
+    /// every `pre` in `pres` that an LE 07 fixup record patches, the mapped
+    /// runtime value. Empty for PE (no fixup tables) and for binaries whose
+    /// tables hold no 07 records. Used to widen address accept-sets (a body
+    /// may bake the runtime value of a referenced address); never a demand.
+    pub fn fixup_post_images(&self, pres: &BTreeSet<u64>) -> BTreeSet<u64> {
+        let mut out = BTreeSet::new();
+        if self.fixup_posts.is_empty() || pres.is_empty() {
+            return out;
+        }
+        for &(pre, post) in &self.fixup_posts {
+            if pres.contains(&pre) {
+                out.insert(post);
+            }
+        }
+        out
+    }
+
+    /// How many 07 absolute fixup records were absorbed at load (0 for PE
+    /// and for LE binaries without absolute fixups). Diagnostic/test use.
+    pub fn fixup_count(&self) -> usize {
+        self.fixup_posts.len()
+    }
+
+    /// What happened with the LE fixup tables (see `FixupStatus`).
+    pub fn fixup_status(&self) -> &FixupStatus {
+        &self.fixup_status
     }
 
     /// The section containing `va`, if any.
@@ -347,10 +409,12 @@ impl Pe {
 ///   sequential; iterated/zero pages are rejected for now.
 /// * `datapage` header field is a file-absolute offset (proven by
 ///   datapage + pages*pagesize - (pagesize-lastpagesize) == file size).
-/// * Fixups are NOT applied yet: direct CALL rel32 (the call graph) is
-///   unaffected, but absolute `globals`/`imm_addrs` are pre-fixup bytes.
-///   Call-graph + CFG gates are sound; treat globals/vtable facts as
-///   best-effort until fixup application lands.
+/// * Fixups are absorbed, not applied: direct CALL rel32 (the call graph)
+///   is unaffected, and absolute `globals`/`imm_addrs` harvest as pre-fixup
+///   bytes — with post-fixup images accepted wherever a 07 record maps them
+///   (`Pe::fixup_post_images`). Call-graph + CFG gates are sound; 08 records
+///   are validated, 02 selectors skipped, and novel record kinds skip the
+///   tables loudly (`FixupStatus::Skipped`) instead of failing the parse.
 fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
     let sz = data.len();
     let need = le_off + 0xAC;
@@ -441,6 +505,9 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
     }
     let mut new_data: Vec<u8> = Vec::new();
     let mut sections: Vec<Section> = Vec::with_capacity(objcnt);
+    // Retained for the fixup walk below: (reloc base, virtual size,
+    // 1-based first logical page, page count).
+    let mut objs: Vec<(u32, usize, usize, usize)> = Vec::with_capacity(objcnt);
     let mut exec_seen = 0usize;
     let mut data_seen = 0usize;
     for oi in 0..objcnt {
@@ -462,6 +529,7 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
                 page_idx + page_cnt
             ));
         }
+        objs.push((base, vsize, page_idx, page_cnt));
         let start = new_data.len();
         for j in 0..page_cnt {
             let (phys, _) = phys_of_logical[page_idx - 1 + j];
@@ -514,10 +582,394 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
             characteristics,
         });
     }
+    let (fixup_posts, fixup_status) = match collect_fixups(
+        &data, le_off, &objs, numpages, pagesize, &sections, &new_data,
+    ) {
+        Ok(pairs) => {
+            let n = pairs.len();
+            (pairs, FixupStatus::Applied { pairs: n })
+        }
+        Err(e) if e.starts_with(NOVEL_FIXUP_PREFIX) => {
+            (Vec::new(), FixupStatus::Skipped { reason: e })
+        }
+        Err(e) => return Err(e),
+    };
     Ok(Pe {
         data: new_data,
         image_base: 0,
         sections,
+        fixup_posts,
+        fixup_status,
         id: next_pe_id(),
     })
+}
+
+/// Marker prefix for the one non-fatal fixup-walk failure: a record kind
+/// outside the proven grammar (e.g. an import fixup another linker emits).
+/// `parse_le` matches on this prefix and skips the tables loudly (image
+/// stays pre-fixup, reason in `FixupStatus::Skipped`) instead of failing
+/// the whole parse. Everything else the walk reports is corruption
+/// (truncation, non-adjacent tables, out-of-range references) and stays
+/// fatal — a broken file must not load.
+const NOVEL_FIXUP_PREFIX: &str = "NOVEL-FIXUP-RECORD: ";
+
+/// Read-only LE fixup walk: `(pre, post)` content pairs for every internal
+/// 07 (absolute) record. The grammar mirrors the DOS4GW loader (dagger's
+/// `apply_fixups`, proven against FALL.EXE's record tables): page table at
+/// `le+0x68`, record table at `le+0x6C`, single-source or u8-counted source
+/// lists, narrow (u16) or wide (u32) target offsets, and the wlink
+/// page-straddler wrap (`0xFFFD/0xFFFE/0xFFFF` source offsets file under the
+/// next page — unwrapped here). 08 (self-relative) records are parsed and
+/// validated but contribute no pairs (a relative offset names no address);
+/// 02 (16-bit selector) records are counted past (no flat-model value).
+/// `pre` is read from the pre-fixup image (file bytes where present, zero
+/// where the loader maps BSS); a record patching nowhere is malformed.
+/// Zeroed table offsets mean "no tables" (empty walk, not an error).
+#[allow(clippy::too_many_arguments)]
+fn collect_fixups(
+    data: &[u8],
+    le_off: usize,
+    objs: &[(u32, usize, usize, usize)],
+    numpages: usize,
+    pagesize: usize,
+    sections: &[Section],
+    image: &[u8],
+) -> Result<Vec<(u64, u64)>, String> {
+    let pre_of = |va: u64| -> Option<u32> {
+        for s in sections {
+            let lo = s.virtual_address as u64;
+            let hi = lo + s.virtual_size as u64;
+            if (lo..hi).contains(&va) {
+                let off = s.raw_offset as u64 + (va - lo);
+                if off + 4 <= s.raw_offset as u64 + s.raw_size as u64 {
+                    let o = off as usize;
+                    return Some(u32::from_le_bytes([
+                        image[o],
+                        image[o + 1],
+                        image[o + 2],
+                        image[o + 3],
+                    ]));
+                }
+                // In virtual range but past raw data: loader-zeroed BSS.
+                return Some(0);
+            }
+        }
+        None
+    };
+    let at32 = |o: usize| -> Result<u32, String> {
+        if o + 4 > data.len() {
+            return Err(format!("LE fixup header read past EOF at {o:#x}"));
+        }
+        Ok(u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]))
+    };
+    let fpt_field = le_off
+        .checked_add(0x68)
+        .ok_or("LE fixup page-table field overflow")?;
+    let frt_field = le_off
+        .checked_add(0x6C)
+        .ok_or("LE fixup record-table field overflow")?;
+    let fpt = le_off
+        .checked_add(at32(fpt_field)? as usize)
+        .ok_or("LE fixup page-table offset overflow")?;
+    let frt = le_off
+        .checked_add(at32(frt_field)? as usize)
+        .ok_or("LE fixup record-table offset overflow")?;
+    if fpt == le_off && frt == le_off {
+        // Zeroed table offsets: the linker emitted no fixup tables.
+        return Ok(Vec::new());
+    }
+    let tab_len = (numpages + 1)
+        .checked_mul(4)
+        .ok_or("LE fixup page-table size overflow")?;
+    // Structural proof both offsets are right: the (numpages+1)-entry table
+    // abuts the record table exactly.
+    if fpt.checked_add(tab_len) != Some(frt) {
+        return Err(format!(
+            "LE fixup tables not adjacent: pagetab={fpt:#x} + {tab_len:#x} != rectab={frt:#x}"
+        ));
+    }
+    if frt > data.len() {
+        return Err(format!(
+            "LE fixup record table {frt:#x} past EOF (file size {:#x})",
+            data.len()
+        ));
+    }
+    let mut bounds: Vec<(usize, usize)> = Vec::with_capacity(numpages);
+    let mut prev = 0usize;
+    let mut first = true;
+    for i in 0..=numpages {
+        let e = at32(fpt + i * 4)? as usize;
+        if !first && e < prev {
+            return Err(format!(
+                "LE fixup page table not monotonic at page {i}: {e:#x} < {prev:#x}"
+            ));
+        }
+        first = false;
+        prev = e;
+        if i < numpages {
+            bounds.push((e, 0));
+        } else if frt.checked_add(e).map_or(true, |end| end > data.len()) {
+            return Err(format!(
+                "LE fixup record table end {e:#x} past EOF (file size {:#x})",
+                data.len()
+            ));
+        }
+        if i > 0 {
+            bounds[i - 1].1 = e;
+        }
+    }
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (pi, (start, end)) in bounds.iter().enumerate() {
+        let lp = pi + 1; // logical pages are 1-based
+        let (obase, _, opage, _) = objs
+            .iter()
+            .find(|(_, _, p, c)| lp >= *p && lp < p + c)
+            .ok_or(format!("LE fixup page {lp} belongs to no object"))?;
+        let lin_base = (*obase as usize)
+            .checked_add((lp - opage) * pagesize)
+            .ok_or(format!("LE fixup page {lp} linear base overflow"))?;
+        let mut p = frt
+            .checked_add(*start)
+            .ok_or("LE fixup record offset overflow")?;
+        let pend = frt
+            .checked_add(*end)
+            .ok_or("LE fixup record end overflow")?;
+        while p < pend {
+            let rec_off = p - frt;
+            let st = *data.get(p).ok_or(format!(
+                "LE fixup record {rec_off:#x} (page {lp}) truncated: missing srctype"
+            ))?;
+            let fl = *data.get(p + 1).ok_or(format!(
+                "LE fixup record {rec_off:#x} (page {lp}) truncated: missing tgtflags"
+            ))?;
+            p += 2;
+            let mut srcs: Vec<u16> = Vec::new();
+            if st & 0x20 != 0 {
+                let cnt = *data.get(p).ok_or(format!(
+                    "LE fixup record {rec_off:#x} (page {lp}) truncated: missing source count"
+                ))?;
+                p += 1;
+                for _ in 0..cnt {
+                    if p + 2 > pend || p + 2 > data.len() {
+                        return Err(format!(
+                            "LE fixup record {rec_off:#x} (page {lp}) source runs past page end"
+                        ));
+                    }
+                    srcs.push(u16::from_le_bytes([data[p], data[p + 1]]));
+                    p += 2;
+                }
+            } else {
+                if p + 2 > pend || p + 2 > data.len() {
+                    return Err(format!(
+                        "LE fixup record {rec_off:#x} (page {lp}) source runs past page end"
+                    ));
+                }
+                srcs.push(u16::from_le_bytes([data[p], data[p + 1]]));
+                p += 2;
+            }
+            let low4 = st & 0x0F;
+            let is_sel = (st == 0x02 || st == 0x22) && fl == 0x00;
+            let is_off = (low4 == 7 || low4 == 8)
+                && (st & 0xD0) == 0
+                && (fl == 0x00 || fl == 0x10);
+            if !is_sel && !is_off {
+                // Novelty, not corruption (see NOVEL_FIXUP_PREFIX): the
+                // tables may belong to a linker dialect with fixup kinds
+                // beyond the proven grammar (e.g. import fixups). The
+                // caller skips the tables loudly instead of failing.
+                return Err(format!(
+                    "{NOVEL_FIXUP_PREFIX}record {rec_off:#x} (page {lp}): srctype=0x{st:02X} tgtflags=0x{fl:02X}"
+                ));
+            }
+            if p + 1 > pend || p + 1 > data.len() {
+                return Err(format!(
+                    "LE fixup record {rec_off:#x} (page {lp}) truncated: missing target object"
+                ));
+            }
+            let obj = data[p] as usize;
+            p += 1;
+            if obj < 1 || obj > objs.len() {
+                return Err(format!(
+                    "LE fixup record {rec_off:#x} (page {lp}) has bad target object {obj}"
+                ));
+            }
+            let wide = fl & 0x10 != 0;
+            let toff: u32 = if is_sel {
+                0
+            } else if wide {
+                if p + 4 > pend || p + 4 > data.len() {
+                    return Err(format!(
+                        "LE fixup record {rec_off:#x} (page {lp}) truncated: missing wide target offset"
+                    ));
+                }
+                let v = u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
+                p += 4;
+                v
+            } else {
+                if p + 2 > pend || p + 2 > data.len() {
+                    return Err(format!(
+                        "LE fixup record {rec_off:#x} (page {lp}) truncated: missing narrow target offset"
+                    ));
+                }
+                let v = u16::from_le_bytes([data[p], data[p + 1]]) as u32;
+                p += 2;
+                v
+            };
+            let target = objs[obj - 1].0.wrapping_add(toff);
+            for s in srcs {
+                // Source offsets are page-relative, but a patched dword may
+                // straddle a page boundary: wlink files the record under the
+                // page holding the dword's final byte with the offset wrapped.
+                let loc = if (s as usize) < pagesize {
+                    lin_base.checked_add(s as usize)
+                } else if s >= 0xFFFD {
+                    lin_base
+                        .checked_add(s as usize)
+                        .and_then(|l| l.checked_sub(0x1_0000))
+                } else {
+                    None
+                };
+                let loc = loc.ok_or(format!(
+                    "LE fixup record {rec_off:#x} (page {lp}) bad source offset {s:#x} (pagesize {pagesize:#x})"
+                ))?;
+                let pre = pre_of(loc as u64).ok_or(format!(
+                    "LE fixup record {rec_off:#x} (page {lp}) location {loc:#x} outside image"
+                ))?;
+                if is_sel {
+                    continue; // deferred: no flat-model value (see field docs)
+                }
+                if low4 == 7 {
+                    out.push((pre as u64, target as u64));
+                }
+                // 08 self-relative: validated, not stored (a relative
+                // offset is not an address).
+            }
+        }
+        if p != pend {
+            return Err(format!(
+                "LE fixup page {lp} consumed to {:#x}, expected end {:#x}",
+                p - frt,
+                pend - frt
+            ));
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal hand-built LE: MZ + LE header, one executable object
+    /// (base 0x10000, one 0x1000 page), page map, fixup tables, one data
+    /// page. The page holds `mov eax,[0x10400]; ret` plus three patched
+    /// dwords; the record table holds one narrow 07, one narrow 08, and
+    /// one source-list 07 (wide). Returns the raw file bytes.
+    fn build_fixup_le() -> Vec<u8> {
+        let le_off = 0x40usize;
+        let pagesize = 0x1000usize;
+        let mut data = vec![0u8; 0x1400];
+        data[0..2].copy_from_slice(b"MZ");
+        data[0x3c..0x40].copy_from_slice(&(le_off as u32).to_le_bytes());
+        data[le_off..le_off + 2].copy_from_slice(b"LE");
+        data[le_off + 8..le_off + 10].copy_from_slice(&2u16.to_le_bytes()); // cpu = 386
+        data[le_off + 0x14..le_off + 0x18].copy_from_slice(&1u32.to_le_bytes()); // numpages
+        data[le_off + 0x28..le_off + 0x2C]
+            .copy_from_slice(&(pagesize as u32).to_le_bytes()); // pagesize
+        data[le_off + 0x2C..le_off + 0x30]
+            .copy_from_slice(&(pagesize as u32).to_le_bytes()); // lastpagesize
+        data[le_off + 0x40..le_off + 0x44].copy_from_slice(&0x1C0u32.to_le_bytes()); // objtab_rel
+        data[le_off + 0x44..le_off + 0x48].copy_from_slice(&1u32.to_le_bytes()); // objcnt
+        data[le_off + 0x48..le_off + 0x4C].copy_from_slice(&0x1D8u32.to_le_bytes()); // pagemap_rel
+        data[le_off + 0x4C..le_off + 0x50].copy_from_slice(&0u32.to_le_bytes()); // itermap
+        data[le_off + 0x68..le_off + 0x6C].copy_from_slice(&0x2C0u32.to_le_bytes()); // fpt_rel
+        data[le_off + 0x6C..le_off + 0x70].copy_from_slice(&0x2C8u32.to_le_bytes()); // frt_rel
+        data[le_off + 0x80..le_off + 0x84].copy_from_slice(&0x400u32.to_le_bytes()); // datapage_abs
+        // Object table: vsize, base, flags(exec), page_idx, page_cnt, 12 reserved.
+        let o = 0x200usize;
+        data[o..o + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[o + 4..o + 8].copy_from_slice(&0x10000u32.to_le_bytes());
+        data[o + 8..o + 12].copy_from_slice(&0x4u32.to_le_bytes());
+        data[o + 12..o + 16].copy_from_slice(&1u32.to_le_bytes());
+        data[o + 16..o + 20].copy_from_slice(&1u32.to_le_bytes());
+        // Page map: physical page 1, flags 0.
+        data[0x218..0x21C].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+        // Fixup page table: page 1 owns [0..26).
+        data[0x300..0x304].copy_from_slice(&0u32.to_le_bytes());
+        data[0x304..0x308].copy_from_slice(&26u32.to_le_bytes());
+        // Record 1 (7 bytes @0x308): 07 narrow absolute, src 0x10, obj 1,
+        // toff 0x500 → loc 0x10010 (pre 0x10400), post 0x10500.
+        data[0x308..0x30F].copy_from_slice(&[0x07, 0x00, 0x10, 0x00, 0x01, 0x00, 0x05]);
+        // Record 2 (7 bytes @0x30F): 08 narrow self-relative, src 0x21
+        // (CALL rel32 at 0x20), obj 1, toff 0x100 → validated only, no pair.
+        data[0x30F..0x316].copy_from_slice(&[0x08, 0x00, 0x21, 0x00, 0x01, 0x00, 0x01]);
+        // Record 3 (12 bytes @0x316): 07 wide absolute, source-list
+        // [0x30, 0x34], obj 1, toff 0x600 → locs 0x10030/0x10034
+        // (pres 0x10410/0x10420), post 0x10600.
+        data[0x316..0x322].copy_from_slice(&[
+            0x27, 0x10, 0x02, 0x30, 0x00, 0x34, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00,
+        ]);
+        // Data page: `mov eax,[0x10400]; ret`, patched dwords, CALL stub.
+        let pg = 0x400usize;
+        data[pg..pg + 6].copy_from_slice(&[0xA1, 0x00, 0x04, 0x01, 0x00, 0xC3]);
+        data[pg + 0x10..pg + 0x14].copy_from_slice(&0x10400u32.to_le_bytes());
+        data[pg + 0x20..pg + 0x25].copy_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]);
+        data[pg + 0x30..pg + 0x34].copy_from_slice(&0x10410u32.to_le_bytes());
+        data[pg + 0x34..pg + 0x38].copy_from_slice(&0x10420u32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn le_fixup_07_pairs_absorbed() {
+        let pe = Pe::parse(build_fixup_le()).expect("parse synthetic LE");
+        assert_eq!(pe.fixup_count(), 3, "one narrow 07 + two listed 07 dwords");
+        let got = pe.fixup_post_images(&[0x10400].into_iter().collect());
+        assert_eq!(got, [0x10500].into_iter().collect());
+        let got = pe.fixup_post_images(&[0x10410, 0x10420].into_iter().collect());
+        assert_eq!(got, [0x10600].into_iter().collect());
+        // Unknown pres map to nothing; 08 records contribute no pairs.
+        let got = pe.fixup_post_images(&[0x99999].into_iter().collect());
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn le_fixup_post_global_passes_spec() {
+        use crate::{analyze, Spec};
+        let pe = Pe::parse(build_fixup_le()).expect("parse synthetic LE");
+        let cg = analyze(&pe, 0x10000).expect("analyze synthetic fn");
+        assert!(cg.globals.contains(&0x10400), "{cg:?}");
+        // Pre-fixup value: always accepted.
+        Spec::new(0x10000).globals(&[0x10400]).check(&pe).expect("pre global");
+        // Post-fixup image of the referenced pre value: accepted (the fix).
+        Spec::new(0x10000).globals(&[0x10500]).check(&pe).expect("post global");
+        // An address referenced nowhere, pre or post: still rejected.
+        assert!(Spec::new(0x10000).globals(&[0x10999]).check(&pe).is_err());
+    }
+
+    #[test]
+    fn le_fixup_unknown_record_skips_loudly() {
+        use super::FixupStatus;
+        let mut data = build_fixup_le();
+        data[0x308] = 0x09; // bogus srctype on record 1
+        // Novelty skips the tables (image stays pre-fixup) — it must NOT
+        // fail the parse, and the reason must be recorded, not silent.
+        let pe = Pe::parse(data).expect("novel fixup kind must skip, not fail");
+        assert_eq!(pe.fixup_count(), 0);
+        match pe.fixup_status() {
+            FixupStatus::Skipped { reason } => {
+                assert!(reason.contains("srctype=0x09"), "{reason}")
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn le_fixup_tables_must_be_adjacent() {
+        let mut data = build_fixup_le();
+        data[0x40 + 0x68..0x40 + 0x6C].copy_from_slice(&0x2C4u32.to_le_bytes());
+        match Pe::parse(data) {
+            Ok(_) => panic!("moved page table must fail"),
+            Err(err) => assert!(err.contains("not adjacent"), "{err}"),
+        }
+    }
 }

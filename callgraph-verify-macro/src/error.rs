@@ -71,6 +71,10 @@ pub enum Code {
     VTableSlot,
     /// A vtable slot was declared past `slots = N`. E020.
     VTableSlotOob,
+    /// The binary tests one branch class (equality vs relational) that the
+    /// body never tests — a wrong-class predicate the call/CFG checks can't
+    /// see. E021.
+    Polarity,
 }
 
 impl Code {
@@ -96,6 +100,7 @@ impl Code {
             Code::CfgFingerprint => "E018",
             Code::VTableSlot => "E019",
             Code::VTableSlotOob => "E020",
+            Code::Polarity => "E021",
         }
     }
 
@@ -121,6 +126,7 @@ impl Code {
             Code::CfgFingerprint => "CFG-FINGERPRINT",
             Code::VTableSlot => "VTABLE-SLOT",
             Code::VTableSlotOob => "VTABLE-SLOT-OOB",
+            Code::Polarity => "POLARITY",
         }
     }
 
@@ -290,6 +296,7 @@ mod tests {
             ("E018", "CFG-FINGERPRINT", CfgFingerprint),
             ("E019", "VTABLE-SLOT", VTableSlot),
             ("E020", "VTABLE-SLOT-OOB", VTableSlotOob),
+            ("E021", "POLARITY", Polarity),
         ];
         for (number, label, code) in cases {
             assert_eq!(code.number(), *number, "number drift for {:?}", code);

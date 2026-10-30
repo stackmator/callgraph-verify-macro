@@ -64,6 +64,7 @@ C_SYMBOLS = [
     "g_tail_tag",
     "tail_target",
     "tail_caller",
+    "recurse_sum",
 ]
 
 CPP_SYMBOLS = [

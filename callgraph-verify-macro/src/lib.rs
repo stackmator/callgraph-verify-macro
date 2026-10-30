@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Expr, ExprArray, Ident, Lit, LitInt, Token};
 
-use callgraph_verify::{analyze, cfg_fingerprint, diff_body_calls, reg_params, tail_referenced, ArgKind, Pe, Spec};
+use callgraph_verify::{analyze, cfg_fingerprint, diff_body_calls, reg_params, tail_referenced, ArgKind, FixupStatus, Pe, Spec};
 
 mod body;
 mod corpus;
@@ -546,6 +546,16 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         return quote! { #err #item2 }.into();
     };
 
+    // LE fixup tables that held a record kind outside the proven grammar are
+    // skipped loudly (image stays pre-fixup): the post-fixup accept-set is
+    // empty, so bodies baking runtime values E015-fail with the reason named
+    // here. Deduped per message — prints once per build, not per origin.
+    if let FixupStatus::Skipped { reason } = pe.fixup_status() {
+        note(&format!(
+            "LE-FIXUP-SKIPPED: {reason} — address checks run on pre-fixup bytes only"
+        ));
+    }
+
     // Per-diagnostic collector. Each entry is an independently-emitted
     // `compile_error!` so rustc renders them as separate gutter diagnostics
     // — agents navigate by span, and the previous single-block string made
@@ -839,6 +849,32 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                             )),
                     );
                 }
+                // UNPORTED-CALL inventory (MISSING-unknown gap, informational
+                // only — never fatal): real binary edges with no `#[origin]`
+                // in the corpus. Bodies may omit these with a `TODO`, but the
+                // omission was previously silent-green; listing it keeps the
+                // coverage hole visible.
+                if !d.unported.is_empty() {
+                    const SHOW: usize = 8;
+                    let mut listed: String = d
+                        .unported
+                        .iter()
+                        .take(SHOW)
+                        .map(|a| format!("{a:#010x}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if d.unported.len() > SHOW {
+                        listed.push_str(&format!(" (+{} more)", d.unported.len() - SHOW));
+                    }
+                    note(&format!(
+                        "UNPORTED-CALLS: binary at {:#010x} also calls {} with no \
+                         #[origin] in the corpus ({} edge(s)) — omitted with TODO is \
+                         allowed, but consider porting them",
+                        args.addr,
+                        listed,
+                        d.unported.len()
+                    ));
+                }
             }
             Err(e) => errors.push(
                 error::RichError::new(
@@ -894,6 +930,16 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             // demands duplication (no MISSING) yet forbids the addresses
             // (E015) — an unsatisfiable pair. Only ever ADDS acceptance.
             referenced.extend(tail_referenced(&pe, &cg));
+            // LE fixup awareness: DOS4GW applies the fixup tables at load,
+            // so a body may bake the RUNTIME (post-fixup) value of a data
+            // address the binary references pre-fixup (the harvesters read
+            // file bytes). Accept post images of referenced globals and
+            // baked immediates — widening only, never a new demand.
+            {
+                let mut data_refs = cg.globals.clone();
+                data_refs.extend(&cg.imm_addrs);
+                referenced.extend(pe.fixup_post_images(&data_refs));
+            }
             let mut reported: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
             // Collect hex-literal spans so each HALLUCINATED-ADDR error can
             // be attached to the literal that bakes the invented address.
@@ -982,16 +1028,22 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ),
                 );
             }
-            // High conditional count + a wholly straight-line body suggests gross under-
-            // implementation (delegating bodies have calls but the binary inlined the branches,
-            // so this still fires on faithful delegation — kept high to limit that).
-            if fp.conditionals >= 12 && r.ifs + r.matches + r.loops == 0 {
+            // High conditional count + a near-straight-line body suggests gross
+            // under-implementation (delegating bodies have calls but the binary
+            // inlined the branches, so this still fires on faithful
+            // delegation — kept high to limit that). Branchiness counts
+            // `if`/`match`/loops plus `&&`/`||` (each short-circuits through
+            // its own JCC, so a fused `a && b && ...` condition earns its
+            // keep); a single bare `if` wrapper no longer defeats the gate.
+            let branchiness =
+                r.ifs + r.matches + r.loops + facts.conds.lazy as usize;
+            if fp.conditionals >= 12 && branchiness <= 1 {
                 errors.push(
                     error::RichError::new(
                         error::Code::Cfg,
                         format!(
-                            "binary branches heavily ({} conditionals) but the body is \
-                             straight-line (no if/match/loop)",
+                            "binary branches heavily ({} conditionals) but the body has \
+                             branchiness {branchiness} (≤1 if/match/loop/&&/||)",
                             fp.conditionals
                         ),
                     )
@@ -1001,6 +1053,59 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                          branch structure (cmp/test/jcc) and port the predicates",
                     ),
                 );
+            }
+            // POLARITY (E021): the binary tests one branch class that the
+            // body never tests — a wrong-class predicate the call/CFG checks
+            // can't see (`==` ported as `>` passes the gate while
+            // mis-modeling the binary). Thresholds mirror E016's
+            // conservative style: only gross divergence fires (a fused or
+            // optimized-away predicate never trips this). Body counts come
+            // from `CondCounts` (see body.rs): overcounting there only ever
+            // suppresses this check, never causes a false fire.
+            // Documented limit: taken-arm inversions WITHIN a class
+            // (`==` vs `!=`) are not detectable statically — that stays a
+            // hand-audit (compare each ported jcc against `--asm`).
+            match analyze(&pe, args.addr) {
+                Ok(cg) => {
+                    if cg.equality_branches >= 3 && facts.conds.eq == 0 {
+                        errors.push(
+                            error::RichError::new(
+                                error::Code::Polarity,
+                                format!(
+                                    "binary tests equality {} time(s) (JE/JNE) but the body \
+                                     has no ==/!=/match-literal/matches!/flag test — wrong-class predicate?",
+                                    cg.equality_branches
+                                ),
+                            )
+                            .with_span(fn_like.attr_target_span())
+                            .with_fix(
+                                "port the binary's equality predicates (cmp/test + je/jne) \
+                                 as ==/!=/match arms instead of relational or call conditions",
+                            ),
+                        );
+                    }
+                    let bin_rel = cg.signed_branches + cg.unsigned_branches;
+                    if bin_rel >= 2 && facts.conds.rel == 0 {
+                        errors.push(
+                            error::RichError::new(
+                                error::Code::Polarity,
+                                format!(
+                                    "binary tests relationally {} time(s) (signed {}/unsigned {}) \
+                                     but the body has no </<=/>/>=/range-arm/for test — wrong-class predicate?",
+                                    bin_rel, cg.signed_branches, cg.unsigned_branches
+                                ),
+                            )
+                            .with_span(fn_like.attr_target_span())
+                            .with_fix(
+                                "port the binary's relational predicates (cmp + jl/jg/jb/ja family) \
+                                 as relational tests instead of equality or call conditions",
+                            ),
+                        );
+                    }
+                }
+                // An analyze failure here was already reported as E017 by the
+                // operand-fact check above — don't double-report.
+                Err(_) => {}
             }
             // Fake-loop guard: a body that uses `loop { break; }` as a
             // structural placeholder satisfies the keyword counter without

@@ -11,8 +11,10 @@
 #   `perf`, macro tests). The `test-bin`-backed `integration` suite needs
 #   the MSVC linker, so it only runs on Windows.
 #
-# DOS scope: LE fixups are not applied yet (see `pe.rs`), so the LE tests
-# pin call-graph/CFG facts only — never absolute globals/vtables/IAT.
+# DOS scope: LE fixup tables are absorbed for post-fixup address facts
+# (see `pe.rs`), but jump-table entry reads stay pre-fixup bytes, so most
+# LE tests pin call-graph/CFG facts — absolute globals/vtables/IAT only
+# via the post-image accept-set (`dos_fixup_post_images_accepted`).
 #
 # `CALLGRAPH_REQUIRE_FIXTURES=1` turns a missing fixture into a hard test
 # failure: a broken build step must never silently green the suite by
