@@ -485,18 +485,31 @@ fn c_field_offsets() {
 
 #[test]
 fn c_recurse_sum_calls_itself() {
-    // Self-recursion ground truth for the MISSING self-edge check: the
-    // binary must contain a DIRECT call to its own entry on both optimized
-    // and unoptimized MSVC output (not a tail-JMP — the add after the call
-    // keeps it a real CALL).
+    // Self-recursion ground truth for the MISSING self-edge check.
+    // MSVC keeps the non-tail self-call as a DIRECT call on both /O2 and
+    // /Od (the add after the call blocks sibling-call lowering). MinGW may
+    // lower the same shape to a self loop or a tail-jump stub instead, so
+    // there the self edge is pinned in EITHER form (direct or tail) — the
+    // macro's direct-only MISSING check is pinned MSVC-only by the real
+    // harness e2e, which is where the gate behavior lives.
     for fx in [c_fixture(), c_od_fixture()].into_iter().flatten() {
         let me = addr(&fx, "recurse_sum");
         let cg = analyze(&fx.pe, me).expect("analyze recurse_sum");
-        assert!(
-            cg.call_targets().contains(&me),
-            "[{}] recurse_sum must directly call itself: {:?}",
-            fx.label, cg.direct_calls
-        );
+        if fx.toolchain == "msvc" {
+            assert!(
+                cg.call_targets().contains(&me),
+                "[{}] recurse_sum must directly call itself: {:?}",
+                fx.label, cg.direct_calls
+            );
+        } else {
+            let mut edges = cg.call_targets();
+            edges.extend(&cg.tail_calls);
+            assert!(
+                edges.contains(&me),
+                "[{}] recurse_sum must reference itself (call or tail): {:?}",
+                fx.label, cg
+            );
+        }
     }
 }
 
