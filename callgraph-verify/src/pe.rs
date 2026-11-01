@@ -398,6 +398,24 @@ impl Pe {
                 }
             }
         }
+        // Widen with the post-fixup images of those pre-fixup values: an LE
+        // 07 record rewrites these dwords at load, so the RUNTIME address the
+        // port bakes (e.g. post 0x74ABA for a stored link-time 0x64ABA slot
+        // seed) is genuinely referenced even though the file bytes hold the
+        // link-time value. Without this, ORIGIN-UNREFERENCED rejects every
+        // slot-seeded callback (`mov dword [slot],pre; call [slot]`), while
+        // HALLUCINATED-ADDR already accepts the post value via the same
+        // `fixup_post_images` map -- an asymmetry the gate must not have.
+        // Widening the accept-set can never false-positive a real entry
+        // (same over-approximation invariant as the scans above).
+        if !self.fixup_posts.is_empty() {
+            let pres: BTreeSet<u64> = out.iter().map(|&v| v as u64).collect();
+            for post in self.fixup_post_images(&pres) {
+                if (lo..hi).contains(&post) {
+                    out.insert(post as u32);
+                }
+            }
+        }
         out
     }
 }
@@ -951,6 +969,30 @@ mod tests {
         Spec::new(0x10000).globals(&[0x10500]).check(&pe).expect("post global");
         // An address referenced nowhere, pre or post: still rejected.
         assert!(Spec::new(0x10000).globals(&[0x10999]).check(&pe).is_err());
+    }
+
+    #[test]
+    fn le_referenced_addrs_include_fixup_post_images() {
+        let pe = Pe::parse(build_fixup_le()).expect("parse synthetic LE");
+        let refs = pe.referenced_addrs();
+        // Link-time values physically present in the image (instruction
+        // operand + stored data dwords).
+        assert!(refs.contains(&0x10400), "pre operand ref missing: {refs:x?}");
+        assert!(refs.contains(&0x10410), "pre stored dword ref missing");
+        assert!(refs.contains(&0x10420), "pre stored dword ref missing");
+        // Runtime images of those values (what a ported body bakes) must also
+        // count as referenced, or ORIGIN-UNREFERENCED rejects every real
+        // slot-seeded callback whose slot holds a link-time pointer.
+        assert!(refs.contains(&0x10500), "post image of 0x10400 missing");
+        assert!(
+            refs.contains(&0x10600),
+            "post image of 0x10410/0x10420 missing"
+        );
+        // Nothing invented: an address referenced neither pre nor post stays out.
+        assert!(
+            !refs.contains(&0x10999),
+            "garbage address must stay unreferenced"
+        );
     }
 
     #[test]

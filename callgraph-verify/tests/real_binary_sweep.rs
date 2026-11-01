@@ -105,3 +105,53 @@ fn real_binary_sweeps_agree_and_diff_clean() {
         unclean.len()
     );
 }
+
+#[test]
+fn real_le_fixup_post_images_are_referenced() {
+    let exe = match std::env::var("CALLGRAPH_REAL_EXE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => {
+            eprintln!(
+                "skipping: set CALLGRAPH_REAL_EXE=<path-to-DOS4GW-LE> to pin fixup post images"
+            );
+            return;
+        }
+    };
+    let pe = Pe::load(&exe).unwrap_or_else(|e| panic!("load {exe}: {e}"));
+    if pe.fixup_count() == 0 {
+        eprintln!("{exe}: no 07 fixup pairs; nothing to pin");
+        return;
+    }
+    // Real-binary counterpart of the synthetic pe.rs test: every link-time
+    // value the byte scan saw as referenced must also contribute its runtime
+    // (post-fixup) image to the ORIGIN-UNREFERENCED accept set. This is the
+    // `mov dword [slot],pre; call [slot]` callback pattern that motivated the
+    // widening (e.g. FALL.EXE seeds slot 0x25AE4 with link-time 0x64ABA, so
+    // post 0x74ABA must count as referenced).
+    let refs = pe.referenced_addrs();
+    let mut checked = 0u32;
+    let mut sample: Vec<(u64, u64)> = Vec::new();
+    for &(pre, post) in pe.fixup_pairs() {
+        if (pre as u32) == (post as u32) || !refs.contains(&(pre as u32)) {
+            continue;
+        }
+        assert!(
+            refs.contains(&(post as u32)),
+            "post-fixup image {post:#x} of referenced link-time {pre:#x} \
+             missing from referenced_addrs on {exe}"
+        );
+        if sample.len() < 8 {
+            sample.push((pre, post));
+        }
+        checked += 1;
+        if checked >= 512 {
+            break;
+        }
+    }
+    eprintln!("{exe}: verified {checked} pre->post references; sample {sample:x?}");
+    assert!(
+        checked > 0,
+        "{exe}: no in-image 07 pre value appeared in referenced_addrs"
+    );
+}
+

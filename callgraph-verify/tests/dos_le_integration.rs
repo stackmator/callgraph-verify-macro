@@ -443,3 +443,46 @@ fn dos_call_targets_are_referenced() {
         missing.len()
     );
 }
+
+#[test]
+fn dos_referenced_addrs_include_fixup_post_images() {
+    let Some(_) = load_dos() else {
+        return;
+    };
+    let (_, pe) = load_dos().unwrap();
+    if pe.fixup_count() == 0 {
+        eprintln!("DOS fixture has no 07 pairs; post-image widening not exercised");
+        return;
+    }
+    // Real-LE counterpart of the synthetic pe.rs unit test: whichever link-time
+    // values the byte scan saw as referenced (stored fn pointers, jump-table
+    // slots, vtable dwords), the runtime value an LE 07 record rewrites them
+    // to must ALSO be in the ORIGIN-UNREFERENCED accept set. Without the
+    // widening, E006 rejects a ported origin at the post VA even though the
+    // slot seeds it at load.
+    let refs = pe.referenced_addrs();
+    let mut checked = 0u32;
+    for &(pre, post) in pe.fixup_pairs() {
+        if (pre as u32) == (post as u32) || !refs.contains(&(pre as u32)) {
+            continue;
+        }
+        assert!(
+            refs.contains(&(post as u32)),
+            "post-fixup image {post:#x} of referenced link-time {pre:#x} is missing \
+             from referenced_addrs"
+        );
+        checked += 1;
+        if checked >= 32 {
+            break;
+        }
+    }
+    if checked == 0 {
+        eprintln!(
+            "DOS fixture: no in-image 07 pre value appears in referenced_addrs; \
+             the synthetic pe.rs test carries the proof"
+        );
+    } else {
+        eprintln!("verified {checked} pre->post references on the real DOS LE fixture");
+    }
+}
+
