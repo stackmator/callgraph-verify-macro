@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-01
+
+### Fixed
+
+- ORIGIN-UNREFERENCED (`E006`) now counts LE fixup post images as referenced.
+  `referenced_addrs` indexed only the link-time dwords physically present in
+  the image, so a slot-seeded callback stored as `mov dword [slot],64ABAh`
+  (runtime `0x74ABA`) failed the gate even though HALLUCINATED-ADDR already
+  accepted the same post value through `fixup_post_images`. The accept set is
+  widened with the post images of the collected pre values (over-approximation
+  only, so a genuine entry is never rejected). Pinned by the synthetic-LE unit
+  test `le_referenced_addrs_include_fixup_post_images`, the real Watcom LE
+  fixture test `dos_referenced_addrs_include_fixup_post_images`, and the
+  env-gated real-binary sweep `real_le_fixup_post_images_are_referenced`
+  (512 pre/post pairs pinned on `FALL.EXE`).
+
 ## [0.1.6] - 2026-10-31
 
 ### Added
@@ -269,7 +285,8 @@ Initial crates.io release.
 - `vtable_table!` declaration support with indirectly-called slot
   verification.
 
-[Unreleased]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.3...v0.1.4

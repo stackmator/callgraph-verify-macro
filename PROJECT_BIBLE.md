@@ -46,7 +46,7 @@ Everything is derived from disassembly. No Ghidra export, no decompiler, no
 | Host | `x86_64` (proc-macros always build for the host) |
 | Rust | edition 2021, MSRV 1.70 |
 | License | MIT |
-| Current version | 0.1.6 (workspace) |
+| Current version | 0.1.7 (workspace) |
 | Crate 1 | `callgraph-verify` — parser, disassembler, analysis, CLI |
 | Crate 2 | `callgraph-verify-macro` — `#[origin]` and `vtable_table!` proc-macros |
 
