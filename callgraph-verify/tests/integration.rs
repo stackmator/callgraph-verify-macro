@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
     use callgraph_verify::{
-        analyze, cfg_fingerprint, diff_body_calls, has_direct_branch_target, reg_params,
-        tail_referenced, ArgKind, Pe, Spec,
+        analyze, cfg_fingerprint, diff_body_calls, diff_body_calls_ext,
+        has_direct_branch_target, reg_params, tail_referenced, ArgKind, Pe, Spec,
     };
     use std::process::Command;
 
@@ -364,6 +364,45 @@ mod tests {
                     diff.hallucinated.iter().any(|(n, _)| n == "invented_fn"),
                     "hallucinated: {:?}",
                     diff.hallucinated
+                );
+                return;
+            }
+        }
+    }
+
+    /// A declared stack-slot/register indirect-call target is accepted: a body
+    /// that spells it as a direct call is faithful, and it never becomes a
+    /// MISSING requirement.
+    #[test]
+    fn test_diff_body_calls_indirect_target_accepted() {
+        let pe = load_test_pe();
+        let addrs = find_function_addresses(&pe);
+        for addr in &addrs {
+            let cg = analyze(&pe, *addr).expect("analyze");
+            if cg.indirect_calls > 0 {
+                let target = 0xFEEDFACEu64; // not a direct callee
+                let corpus: std::collections::BTreeSet<u64> = [target].into_iter().collect();
+                let rust_idents = vec![("callback".to_string(), vec![target])];
+                let targets: std::collections::BTreeSet<u64> = [target].into_iter().collect();
+                let diff = diff_body_calls_ext(
+                    &pe,
+                    &[*addr],
+                    &corpus,
+                    &rust_idents,
+                    &std::collections::BTreeSet::new(),
+                    &std::collections::BTreeSet::new(),
+                    &targets,
+                )
+                .expect("diff_body_calls_ext");
+                assert!(
+                    diff.hallucinated.is_empty(),
+                    "declared indirect target must be accepted, got {:?}",
+                    diff.hallucinated
+                );
+                // Acceptance-only: it must not be demanded as a MISSING.
+                assert!(
+                    !diff.missing.contains(&target),
+                    "indirect target must not be a MISSING requirement"
                 );
                 return;
             }

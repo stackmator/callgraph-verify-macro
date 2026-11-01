@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `#[origin(addr, indirect_targets = [0xNN, ...])]`: declared targets the
+  function reaches only through a register/memory (stack-slot) indirect
+  call. Acceptance-only: a body that spells one as a direct call is
+  faithful, it never becomes a `MISSING` requirement, and it is validated
+  (executable-section VA + the function really has an indirect call).
+  New API: `Spec::indirect_targets` and `diff_body_calls_ext` (the old
+  `diff_body_calls` is a no-target wrapper). Pinned by
+  `test_diff_body_calls_indirect_target_accepted` plus the real-codegen
+  `c_indirect_target_accepted_on_real_output` (MSVC and MinGW, `/O2` and
+  `/Od`).
 - Branch-polarity ground truth in `CallGraph`: `signed_branches` /
   `unsigned_branches` / `equality_branches` count every conditional branch
   by condition class (`JL/JLE/JG/JGE` vs `JB/JBE/JA/JAE` vs `JE/JNE`),
@@ -24,30 +34,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   informational `UNPORTED-CALLS` note listing them instead of staying
   silent-green. Pinned by `c_diff_body_calls_reports_unported` on the real
   C fixture (partial corpus: `leaf_const` edge is `unported`, not `missing`).
-- ARG-SHAPE `let`-bound const propagation in `body.rs`: `let k = 0x10;`
-  records `k -> Imm(16)` so a later `f(k)` checks the value instead of
-  skipping as `Other`. Sound under-approximation — rebinding to anything
-  non-concrete, `=`/compound assignment, `ref` bindings, and shadowing
-  binders (`for`/`while`-`let`/`if`-`let`/closures/match arms/block scope/
-  `let`-`else`) all evict. Pinned by 11 `body.rs` unit tests plus
-  `tests/real_arg_shape.rs`: fixtures generated from the live MSVC Od
-  manifest (`branch_caller` stages `PUSH 1` before `CALL leaf_add`) prove
-  `let k = 1` stays clean while `let k = 0x99` fires E014
-  (`arg #1 is Imm(153), but the binary's call passes Imm(1)`).
-- E021 POLARITY (new fatal code): the binary tests one branch class the
-  body never tests — a wrong-class predicate the call/CFG checks can't see
-  (`==` ported as `>` passes the gate while mis-modeling the binary).
-  Binary side from the `CallGraph::{signed,unsigned,equality}_branches`
-  harvest; Rust side from the new `CondCounts` harvest (`==`/`!=`, match
-  literal arms, `matches!`, bare flag tests, `if`/`while` `let` ⇒ eq;
-  relational binops, match range arms, `for` loops ⇒ rel). Fires only on
-  gross divergence (equality ≥3 with body eq == 0; signed+unsigned ≥ 2 with
-  body rel == 0). Taken-arm inversions WITHIN a class (`==` vs `!=`) stay a
-  hand-audit (documented). Pinned by `tests/real_polarity.rs` on real MSVC
-  Od output (decision_chain eq=14, nested_sum signed=2) plus 8 `body.rs`
-  counting tests. New-code note for downstream trees: E021 can fire where
-  E016 stayed silent (branch classes with <12 total conditionals); re-bless
-  or port the predicate.
+- E021 POLARITY (advisory NOTE, code reserved): the binary tests one branch
+  class the body never tests — a wrong-class predicate the call/CFG checks
+  can't see (`==` ported as `>` passes the gate while mis-modeling the
+  binary). Binary side from the `CallGraph::{signed,unsigned,equality}_
+  branches` harvest; Rust side from the new `CondCounts` harvest (`==`/
+  `!=`, match literal arms, `matches!`, bare flag tests, `if`/`while` `let`
+  ⇒ eq; relational binops, match range arms, `for` loops ⇒ rel). Reports
+  only gross divergence (equality ≥3 with body eq == 0; signed+unsigned ≥2
+  with body rel == 0). NOTE-only by design, never fatal: downstream trees
+  abstract predicates their HLE provably fixes, and there is no waiver
+  mechanism for sound abstractions. Taken-arm inversions WITHIN a class
+  (`==` vs `!=`) stay a hand-audit (documented). Pinned by 8 `body.rs`
+  counting tests plus the binary-side integration pins (decision_chain
+  eq=14, nested_sum signed=2 on real MSVC output).
+- ARG-SHAPE const-prop deliberately NOT shipped: resolving `let`-bound
+  args to concrete kinds exposed a latent positional-model mismatch
+  (Rust arg #0 vs the callee's EDX slot) against downstream trees whose
+  universal `let x = <lit>` idiom previously read as `Other` (hundreds of
+  false fires on a green tree). `classify_expr` keeps its literal-only
+  contract; the finding is recorded here so the model fix (register-aware
+  alignment) can land first.
 - E016 third-prong tightening: `conditionals >= 12` now fires at
   branchiness ≤ 1 (was == 0), where branchiness counts `if`/`match`/loops
   plus `&&`/`||` (each short-circuits through its own JCC, so a fused
@@ -73,7 +80,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failing the parse; corruption stays fatal. Pinned by 4 synthetic-LE
   `pe.rs` unit tests (narrow/list 07, 08 validation, unknown-kind skip,
   table-adjacency proof) and `dos_fixup_post_images_accepted` (real Watcom
-  LE on CI; skips without the fixture).
+  LE on CI; skips without the fixture). `Pe::fixup_pairs` exposes the
+  absorbed pairs for diagnostics and real-file round-trip tests.
+
+### Fixed
+
+- CI `c_recurse_sum_calls_itself` no longer assumes MinGW keeps a self-call:
+  GCC 13 `/O2` rewrites the non-tail recursion into an iterative loop. MSVC
+  still must show the direct self-CALL; MinGW now accepts a real self edge
+  (its `/O0` build) OR the loop back-edge the compiler emitted instead
+  (`cfg_fingerprint().loops >= 1`), so the test checks both real shapes
+  instead of skipping the toolchain.
+- `dos_fixup_post_images_accepted` no longer feeds an immediate constant to
+  `Spec::globals` (a false HALLUCINATED on the real `cmp eax,10000h`) and no
+  longer asserts that Watcom's DS-relative fixture must expose an in-image
+  pre value (it never does: the pre images are object-relative offsets, not
+  VAs). It now round-trips every real 07 pair through `Pe::fixup_pairs` +
+  `fixup_post_images` and checks globals/imm refs through their own Spec
+  buckets; Spec acceptance stays pinned by the synthetic
+  `le_fixup_post_global_passes_spec`.
 
 ## [0.1.5] - 2026-10-25
 

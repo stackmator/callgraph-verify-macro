@@ -33,6 +33,10 @@ pub struct Spec {
     globals: Vec<u64>,
     vtables: Vec<u64>, // in-image immediates (vtable VAs, fn ptrs, string addrs)
     vcall_slots: Vec<u64>,
+    /// Addresses this function reaches only by taking a register/memory
+    /// (stack-slot) indirect call. A faithful body spells them as direct
+    /// calls; acceptance-only (never a MISSING requirement).
+    indirect_targets: Vec<u64>,
     iat: Vec<u64>,
 }
 
@@ -248,6 +252,11 @@ impl Spec {
         self.vcall_slots = t.to_vec();
         self
     }
+    /// Declared stack-slot/register indirect-call targets (acceptance-only).
+    pub fn indirect_targets(mut self, t: &[u64]) -> Spec {
+        self.indirect_targets = t.to_vec();
+        self
+    }
     pub fn iat(mut self, t: &[u64]) -> Spec {
         self.iat = t.to_vec();
         self
@@ -286,6 +295,20 @@ impl Spec {
         present_check_fixup("global", &self.globals, &cg.globals, &post, &mut v);
         present_check_fixup("vtable/imm addr", &self.vtables, &cg.imm_addrs, &post, &mut v);
         present_check("vcall slot", &self.vcall_slots, &cg.vcall_slots, &mut v);
+        for t in &self.indirect_targets {
+            if !pe.is_executable_section_va(*t) {
+                v.push(format!(
+                    "indirect target {t:#010x} is not in an executable section"
+                ));
+            }
+        }
+        if !self.indirect_targets.is_empty() && cg.indirect_calls == 0 {
+            v.push(
+                "indirect_targets declared, but the binary makes no register/memory \
+                 indirect call at this address"
+                    .to_string(),
+            );
+        }
         present_check("IAT import", &self.iat, &cg.iat_calls, &mut v);
 
         if v.is_empty() {
@@ -426,6 +449,32 @@ pub fn diff_body_calls(
     vtable_methods: &BTreeSet<u64>,
     miss_satisfied: &BTreeSet<u64>,
 ) -> Result<CorpusDiff, String> {
+    diff_body_calls_ext(
+        pe,
+        own_addrs,
+        corpus,
+        rust_idents,
+        vtable_methods,
+        miss_satisfied,
+        &BTreeSet::new(),
+    )
+}
+
+/// Like [`diff_body_calls`], plus `indirect_targets`: addresses the binary
+/// reaches through a register/memory indirect call at `own_addrs` (a stack-slot
+/// callback, a registered handler, an IAT thunk, ...). They widen the
+/// ACCEPTANCE set only: a body that spells one as a direct call is faithful,
+/// and they never become a MISSING requirement (the binary issues no direct
+/// CALL to them).
+pub fn diff_body_calls_ext(
+    pe: &Pe,
+    own_addrs: &[u64],
+    corpus: &BTreeSet<u64>,
+    rust_idents: &[(String, Vec<u64>)],
+    vtable_methods: &BTreeSet<u64>,
+    miss_satisfied: &BTreeSet<u64>,
+    indirect_targets: &BTreeSet<u64>,
+) -> Result<CorpusDiff, String> {
     let primary = *own_addrs.first().ok_or("no origin address")?;
     let mut bin_calls = BTreeSet::new();
     // Direct CALL targets only (no tail jumps): feeds the self-recursion
@@ -482,6 +531,9 @@ pub fn diff_body_calls(
     // unactionable "add the call" fix; the suggested call was already spelled).
     let mut bin_calls_wide = bin_calls.clone();
     bin_calls_wide.extend(wide_extras);
+    // Declared indirect-call targets: a direct body call to one is faithful
+    // (the binary reaches it through `call [reg+slot]`, not a direct CALL).
+    bin_calls_wide.extend(indirect_targets.iter().copied());
     for t in tail_targets {
         if let Ok(tcg) = analyze(pe, t) {
             bin_calls_wide.extend(tcg.call_targets());

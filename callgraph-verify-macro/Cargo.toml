@@ -37,6 +37,6 @@ proc-macro2 = "1"
 # is a regression: the test runner will silently keep working, but the
 # wording can drift undetected. see tests/error_codes.rs.
 trybuild = "1.0"
-# Only used by tests/real_arg_shape.rs to read the Od address manifest
+# Only used by tests/real_structure.rs to read the Od address manifest
 # written by test-fixtures/build_fixtures.py (never linked into the macro).
 serde_json = "1"

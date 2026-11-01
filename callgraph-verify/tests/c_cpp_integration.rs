@@ -20,8 +20,8 @@
 //! hard failure so a broken build step can never silently green the suite.
 
 use callgraph_verify::{
-    analyze, cfg_fingerprint, diff_body_calls, diff_calls, has_direct_branch_target, reg_params,
-    resolve_thunk, tail_referenced, ArgKind, Pe, Spec,
+    analyze, cfg_fingerprint, diff_body_calls, diff_body_calls_ext, diff_calls,
+    has_direct_branch_target, reg_params, resolve_thunk, tail_referenced, ArgKind, Pe, Spec,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -310,6 +310,76 @@ fn c_use_apply_reaches_apply_twice_indirectly() {
     );
 }
 
+#[test]
+fn c_indirect_target_accepted_on_real_output() {
+    // Real-codegen pin for `indirect_targets`: a port of `apply_twice` that
+    // specializes its callback to the concrete `inc_fn` (the only fn the
+    // fixture ever passes) spells a DIRECT call the binary never issues —
+    // without the declaration that is HALLUCINATED, with it the call is
+    // accepted and never demanded as MISSING. Both compiler shapes are
+    // checked (/O2 and /Od), since the indirect-call count differs.
+    for fx in [c_fixture(), c_od_fixture()].into_iter().flatten() {
+        let caller = addr(&fx, "apply_twice");
+        let target = addr(&fx, "inc_fn");
+        let cg = analyze(&fx.pe, caller).expect("analyze apply_twice");
+        assert!(
+            cg.indirect_calls >= 1,
+            "[{}] premise: apply_twice must contain an indirect call: {cg:?}",
+            fx.label
+        );
+        let corpus: BTreeSet<u64> = [caller, target].into_iter().collect();
+        let idents = vec![("inc_fn".to_string(), vec![target])];
+        let none = BTreeSet::new();
+
+        // Baseline (no declaration): the direct spelling is flagged.
+        let d = diff_body_calls(
+            &fx.pe,
+            &[caller],
+            &corpus,
+            &idents,
+            &none,
+            &none,
+        )
+        .expect("diff_body_calls");
+        assert!(
+            d.hallucinated
+                .iter()
+                .any(|(n, addrs)| n == "inc_fn" && addrs.contains(&target)),
+            "[{}] baseline must flag the direct callback call: {:?}",
+            fx.label, d.hallucinated
+        );
+
+        // Declared: accepted, and not converted into a MISSING requirement.
+        let declared: BTreeSet<u64> = [target].into_iter().collect();
+        let d = diff_body_calls_ext(
+            &fx.pe,
+            &[caller],
+            &corpus,
+            &idents,
+            &none,
+            &none,
+            &declared,
+        )
+        .expect("diff_body_calls_ext");
+        assert!(
+            d.hallucinated.is_empty(),
+            "[{}] declared indirect target must be accepted: {:?}",
+            fx.label,
+            d.hallucinated
+        );
+        assert!(
+            !d.missing.contains(&target),
+            "[{}] an indirect target is acceptance-only, never MISSING: {:?}",
+            fx.label,
+            d.missing
+        );
+        Spec::new(caller)
+            .indirect_targets(&[target])
+            .check(&fx.pe)
+            .unwrap_or_else(|e| panic!("[{}] Spec indirect target: {e}", fx.label));
+    }
+}
+
 // --- Spec gates on real compiler output -------------------------------------
 
 #[test]
@@ -485,29 +555,38 @@ fn c_field_offsets() {
 
 #[test]
 fn c_recurse_sum_calls_itself() {
-    // Self-recursion ground truth for the MISSING self-edge check (MSVC
-    // only): MSVC keeps the non-tail self-call as a DIRECT call on both
-    // /O2 and /Od (the add after the call blocks sibling-call lowering).
-    // MinGW is excluded by design — its manifest VA resolves to a 26-byte
-    // fragment with no self-reference at all (direct_calls AND tail_calls
-    // empty: likely a clone/partition whose real body lives elsewhere, so
-    // there is no self edge to pin there). The macro's direct-only MISSING
-    // check is pinned MSVC-only by the real harness e2e, which is where
-    // the gate behavior lives.
+    // Self-recursion ground truth for the MISSING self-edge check. MSVC
+    // keeps the non-tail self-call as a DIRECT call on both /O2 and /Od (the
+    // add after the call blocks sibling-call lowering). MinGW /O0 also keeps
+    // the direct CALL, but GCC 13 /O2 rewrites this exact body into an
+    // iterative loop (`add edx,eax; sub eax,1; jne`) with no self edge at
+    // all. Pin the shape that actually exists per toolchain: a self edge
+    // where the compiler emitted one, otherwise the back-edge of the loop it
+    // lowered the recursion into. MSVC must always keep the direct CALL — the
+    // macro's direct-only MISSING check is pinned from that output.
     for fx in [c_fixture(), c_od_fixture()].into_iter().flatten() {
-        if fx.toolchain != "msvc" {
-            eprintln!(
-                "skipping recurse_sum self-edge on {} (manifest VA is not the recursive body there)",
-                fx.toolchain
+        let me = addr(&fx, "recurse_sum");
+        let cg = analyze(&fx.pe, me).expect("analyze recurse_sum");
+        if fx.toolchain == "msvc" {
+            assert!(
+                cg.call_targets().contains(&me),
+                "[{}] recurse_sum must directly call itself: {:?}",
+                fx.label,
+                cg.direct_calls
             );
             continue;
         }
-        let me = addr(&fx, "recurse_sum");
-        let cg = analyze(&fx.pe, me).expect("analyze recurse_sum");
+        let mut edges = cg.call_targets();
+        edges.extend(&cg.tail_calls);
+        if edges.contains(&me) {
+            continue;
+        }
+        let fp = cfg_fingerprint(&fx.pe, me).expect("cfg recurse_sum");
         assert!(
-            cg.call_targets().contains(&me),
-            "[{}] recurse_sum must directly call itself: {:?}",
-            fx.label, cg.direct_calls
+            fp.loops >= 1,
+            "[{}] recurse_sum must self-call or lower to a loop: {:?} {fp:?}",
+            fx.label,
+            cg
         );
     }
 }
@@ -1231,7 +1310,7 @@ fn c_o2_vs_od_inlining_differential() {
         {
             continue;
         }
-        let (Ok(cg_o2), Ok(cg_od)) =
+        let (Ok(_cg_o2), Ok(_cg_od)) =
             (analyze(&fx.pe, o2_va), analyze(&od.pe, od_va))
         else {
             continue;

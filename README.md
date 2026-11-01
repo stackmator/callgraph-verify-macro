@@ -17,7 +17,7 @@ Compile-time anti-hallucination call-graph verification for binary reverse-engin
 
 - **Target binary**: 32-bit x86 PE or DOS4GW LE (x86_64 / ARM / ARM64 planned)
 - **Host**: x86_64 (proc-macros always build for host; iced-x86 never enters the i686 target build)
-- **Dependencies**: Pure Rust — `iced-x86` for decoding, `goblin` for PE parsing, `syn`/`quote` for macro expansion
+- **Dependencies**: Pure Rust — `iced-x86` for decoding, a hand-rolled PE32/LE parser (no `goblin`), `syn`/`quote` for macro expansion
 
 ## Quick Start
 

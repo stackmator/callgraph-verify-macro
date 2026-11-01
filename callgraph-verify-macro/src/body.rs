@@ -8,7 +8,7 @@
 //! by [`DENY`]; resolution further requires the name to be `#[origin]`-tagged.
 
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{BinOp, Block, Expr, ExprCall, ExprLit, ExprMethodCall, ImplItemFn, ItemFn, Lit, Pat};
@@ -114,67 +114,9 @@ pub struct CondCounts {
 
 struct FnBodyVisitor {
     facts: FnBodyFacts,
-    /// In-scope single-assignment bindings with confidently-classified values:
-    /// `let k = 0x10;` records `k -> Imm(16)` so a later `f(k)` classifies
-    /// concrete instead of `Other`. A sound under-approximation, never a
-    /// guess: any rebinding to a non-concrete value, any `x = ...` /
-    /// compound assignment, and any shadowing binder (`for` patterns,
-    /// `while`/`if` `let` conditions, closure params, match arms, block
-    /// scoping, `let`-`else` divergence, `ref` bindings) evicts the name.
-    /// Unknown still means `Other`, which the ARG-SHAPE diff skips.
-    lets: HashMap<String, RustArg>,
-}
-
-/// Every identifier a pattern binds (shadowing the outer scope): plain
-/// idents, `x: T` ascriptions, and anything nested in tuple/struct/slice/
-/// reference/`|` patterns. Non-binding patterns contribute nothing.
-fn pat_bound_idents(pat: &Pat) -> Vec<String> {
-    match pat {
-        Pat::Ident(pi) => vec![pi.ident.to_string()],
-        Pat::Type(pt) => pat_bound_idents(&pt.pat),
-        Pat::Tuple(p) => p.elems.iter().flat_map(pat_bound_idents).collect(),
-        Pat::TupleStruct(p) => p.elems.iter().flat_map(pat_bound_idents).collect(),
-        Pat::Struct(p) => p.fields.iter().flat_map(|f| pat_bound_idents(&f.pat)).collect(),
-        Pat::Slice(p) => p.elems.iter().flat_map(pat_bound_idents).collect(),
-        Pat::Reference(p) => pat_bound_idents(&p.pat),
-        Pat::Paren(p) => pat_bound_idents(&p.pat),
-        Pat::Or(p) => p
-            .cases
-            .iter()
-            .flat_map(pat_bound_idents)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect(),
-        _ => Vec::new(),
-    }
 }
 
 impl FnBodyVisitor {
-    /// Classify a call argument: single-ident paths resolve through the
-    /// in-scope let-bindings first, everything else falls back to
-    /// [`classify_expr`].
-    fn classify_arg(&self, e: &Expr) -> RustArg {
-        if let Expr::Path(p) = e {
-            if p.path.segments.len() == 1 {
-                if let Some(a) = self.lets.get(&p.path.segments[0].ident.to_string()) {
-                    return a.clone();
-                }
-            }
-        }
-        classify_expr(e)
-    }
-
-    /// `x = ...` / `x op= ...` kills the binding — the stored literal no
-    /// longer holds. Only plain ident targets; `*p = v` / `s.f = v` leave
-    /// the address/value binding itself intact.
-    fn evict_assign_target(&mut self, left: &Expr) {
-        if let Expr::Path(p) = left {
-            if p.path.segments.len() == 1 {
-                self.lets.remove(&p.path.segments[0].ident.to_string());
-            }
-        }
-    }
-
     /// Condition-class counting for E021 (see `CondCounts`): comparison
     /// binops imply their class's JCC; `&&`/`||` imply a (usually
     /// equality-class) short-circuit JCC each, counted as `lazy` for the
@@ -228,7 +170,7 @@ impl<'ast> Visit<'ast> for FnBodyVisitor {
                     // Turbofish (`foo::<u32>(..)`) lives in the path segment's
                     // generic arguments; the callee name is still the segment
                     // ident, so explicit generics resolve like plain calls.
-                    args: e.args.iter().map(|a| self.classify_arg(a)).collect(),
+                    args: e.args.iter().map(classify_expr).collect(),
                     span: e.span(),
                 });
                 self.facts.names.plain.insert(name);
@@ -242,157 +184,37 @@ impl<'ast> Visit<'ast> for FnBodyVisitor {
         self.facts.exprs.push(CallExpr {
             name: name.clone(),
             is_method: true,
-            args: m.args.iter().map(|a| self.classify_arg(a)).collect(),
+            args: m.args.iter().map(classify_expr).collect(),
             span: m.span(),
         });
         self.facts.names.method.insert(name);
         visit::visit_expr_method_call(self, m);
     }
 
-    fn visit_block(&mut self, b: &'ast Block) {
-        // Block scoping: bindings made inside die at the closing brace.
-        let saved = self.lets.clone();
-        visit::visit_block(self, b);
-        self.lets = saved;
-    }
-
-    fn visit_local(&mut self, l: &'ast syn::Local) {
-        // The initializer's own calls see the pre-binding map (the name
-        // isn't bound until after its own init evaluates).
-        visit::visit_local(self, l);
-        // Simple shape only: `let name = <concrete>;` with no `else`
-        // diverger and no `ref` (a reference is not the value). Anything
-        // else evicts whatever the pattern binds (destructuring, `let`-`else`
-        // flow-through, `ref` shadows are all unknown).
-        let simple_name = match &l.pat {
-            Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
-                Some(pi.ident.to_string())
-            }
-            Pat::Type(pt) => match &*pt.pat {
-                Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
-                    Some(pi.ident.to_string())
-                }
-                _ => None,
-            },
-            _ => None,
-        };
-        match (simple_name, l.init.as_ref()) {
-            (Some(name), Some(init)) if init.diverge.is_none() => {
-                match self.classify_arg(&init.expr) {
-                    concrete @ (RustArg::Imm(_) | RustArg::Field(_) | RustArg::Global(_)) => {
-                        self.lets.insert(name, concrete);
-                    }
-                    _ => {
-                        self.lets.remove(&name);
-                    }
-                }
-            }
-            _ => {
-                for bound in pat_bound_idents(&l.pat) {
-                    self.lets.remove(&bound);
-                }
-            }
-        }
-    }
-
-    fn visit_expr_assign(&mut self, e: &'ast syn::ExprAssign) {
-        visit::visit_expr_assign(self, e);
-        self.evict_assign_target(&e.left);
-    }
-
     fn visit_expr_binary(&mut self, e: &'ast syn::ExprBinary) {
         self.count_binop(&e.op);
         visit::visit_expr_binary(self, e);
-        // Compound assignment (`+=`, `&=`, `<<=`, ...) mutates like `=`.
-        // (Assign-op `BinOp`s carry their token payload, hence `(..)`.)
-        if matches!(
-            e.op,
-            BinOp::AddAssign(..)
-                | BinOp::SubAssign(..)
-                | BinOp::MulAssign(..)
-                | BinOp::DivAssign(..)
-                | BinOp::RemAssign(..)
-                | BinOp::BitXorAssign(..)
-                | BinOp::BitAndAssign(..)
-                | BinOp::BitOrAssign(..)
-                | BinOp::ShlAssign(..)
-                | BinOp::ShrAssign(..)
-        ) {
-            self.evict_assign_target(&e.left);
-        }
     }
 
     fn visit_expr_for_loop(&mut self, e: &'ast syn::ExprForLoop) {
         // A range loop is a relational exit test.
         self.facts.conds.rel += 1;
-        // The loop pattern shadows the outer scope for the whole loop.
-        let saved = self.lets.clone();
-        for bound in pat_bound_idents(&e.pat) {
-            self.lets.remove(&bound);
-        }
         visit::visit_expr_for_loop(self, e);
-        self.lets = saved;
     }
 
     fn visit_expr_while(&mut self, e: &'ast syn::ExprWhile) {
         self.facts.conds.eq += cond_eq_value(&e.cond);
-        // `while let PAT = ...` binds PAT for the body.
-        let saved = self.lets.clone();
-        if let Expr::Let(el) = &*e.cond {
-            for bound in pat_bound_idents(&el.pat) {
-                self.lets.remove(&bound);
-            }
-        }
         visit::visit_expr_while(self, e);
-        self.lets = saved;
     }
 
     fn visit_expr_if(&mut self, e: &'ast syn::ExprIf) {
         self.facts.conds.eq += cond_eq_value(&e.cond);
-        // The condition evaluates in the outer scope; `if let PAT = ...`
-        // binds PAT for the then-branch only (`else` sees the outer scope).
-        self.visit_expr(&e.cond);
-        for attr in &e.attrs {
-            self.visit_attribute(attr);
-        }
-        if let Expr::Let(el) = &*e.cond {
-            let saved = self.lets.clone();
-            for bound in pat_bound_idents(&el.pat) {
-                self.lets.remove(&bound);
-            }
-            self.visit_block(&e.then_branch);
-            self.lets = saved;
-        } else {
-            self.visit_block(&e.then_branch);
-        }
-        if let Some((_tok, els)) = &e.else_branch {
-            self.visit_expr(els);
-        }
+        visit::visit_expr_if(self, e);
     }
 
     fn visit_arm(&mut self, a: &'ast syn::Arm) {
         self.count_arm_pat(&a.pat);
-        // The arm pattern (and its guard) shadow the outer scope; bindings
-        // made in the arm body die with it.
-        let saved = self.lets.clone();
-        for bound in pat_bound_idents(&a.pat) {
-            self.lets.remove(&bound);
-        }
         visit::visit_arm(self, a);
-        self.lets = saved;
-    }
-
-    fn visit_expr_closure(&mut self, e: &'ast syn::ExprClosure) {
-        // Closure params shadow the outer scope; everything bound inside
-        // dies with the closure.
-        let saved = self.lets.clone();
-        for input in &e.inputs {
-            for bound in pat_bound_idents(input) {
-                self.lets.remove(&bound);
-            }
-        }
-        visit::visit_expr_closure(self, e);
-        self.lets = saved;
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
@@ -425,7 +247,6 @@ pub fn collect_block_facts(block: &Block) -> FnBodyFacts {
             macros: Vec::new(),
             conds: CondCounts::default(),
         },
-        lets: HashMap::new(),
     };
     v.visit_block(block);
     v.facts
@@ -946,22 +767,14 @@ mod tests {
         );
     }
 
-    // --- let-bound const propagation (ARG-SHAPE `Other` gap) -----------------
-    // `collect_block_facts` (the exact path `verify_impl` takes) resolves
-    // single-ident args through in-scope `let` bindings.
-
-    fn args_of(src: &str) -> Vec<RustArg> {
-        let facts = facts_of(src);
-        assert_eq!(facts.exprs.len(), 1, "{:?}", facts.exprs);
-        facts.exprs[0].args.clone()
-    }
+    // --- condition-class counting (E021 POLARITY ground truth) --------------
+    // `collect_block_facts` (the exact path `verify_impl` takes) counts
+    // branch classes per function body.
 
     fn conds_of(src: &str) -> (u32, u32, u32) {
         let f = facts_of(src);
         (f.conds.eq, f.conds.rel, f.conds.lazy)
     }
-
-    // --- condition-class counting (E021 POLARITY ground truth) --------------
 
     #[test]
     fn eq_binops_count_as_eq() {
@@ -1015,97 +828,19 @@ mod tests {
         assert_eq!(conds_of("fn f(q: u32) -> bool { matches!(q, 1 | 2) }"), (1, 0, 0));
     }
 
-    #[test]
-    fn let_literal_propagates_to_call_arg() {
-        assert_eq!(
-            args_of("fn f() { let k = 0x10; real_call(k); }"),
-            vec![RustArg::Imm(0x10)]
-        );
-    }
-
-    #[test]
-    fn let_chain_propagates() {
-        assert_eq!(
-            args_of("fn f() { let a = 8; let b = a; real_call(b); }"),
-            vec![RustArg::Imm(8)]
-        );
-    }
-
-    #[test]
-    fn let_type_ascription_propagates() {
-        assert_eq!(
-            args_of("fn f() { let k: u32 = 0x20; real_call(k); }"),
-            vec![RustArg::Imm(0x20)]
-        );
-    }
-
-    #[test]
-    fn reassign_to_nonconcrete_kills_binding() {
-        // `let k = g();` rebinds k to an unknown value.
-        let facts = facts_of("fn f() { let k = 1; let k = g(); real_call(k); }");
-        assert_eq!(facts.exprs.len(), 2, "{:?}", facts.exprs);
-        assert_eq!(facts.exprs[1].args, vec![RustArg::Other]);
-    }
-
-    #[test]
-    fn plain_assign_kills_binding() {
-        assert_eq!(
-            args_of("fn f() { let k = 1; k = 2; real_call(k); }"),
-            vec![RustArg::Other]
-        );
-    }
-
-    #[test]
-    fn compound_assign_kills_binding() {
-        assert_eq!(
-            args_of("fn f() { let k = 1; k += 2; real_call(k); }"),
-            vec![RustArg::Other]
-        );
-    }
-
-    #[test]
-    fn block_scope_kills_binding() {
-        // `k` bound inside a block is gone after the closing brace.
-        let facts = facts_of("fn f() { { let k = 3; real_call(k); } real_call(k); }");
-        assert_eq!(facts.exprs.len(), 2, "{:?}", facts.exprs);
-        assert_eq!(facts.exprs[0].args, vec![RustArg::Imm(3)]);
-        assert_eq!(facts.exprs[1].args, vec![RustArg::Other]);
-    }
-
-    #[test]
-    fn for_pattern_shadows_outer_binding() {
-        assert_eq!(
-            args_of("fn f() { let x = 1; for x in 0..n { real_call(x); } }"),
-            vec![RustArg::Other]
-        );
-    }
-
-    #[test]
-    fn ref_binding_is_not_the_value() {
-        // `let ref k = 5` binds a reference — propagating Imm(5) would be a
-        // false ARG-SHAPE Imm against whatever the binary stages.
-        assert_eq!(
-            args_of("fn f() { let ref k = 5; real_call(k); }"),
-            vec![RustArg::Other]
-        );
-    }
-
+    /// Unbound paths stay `Other` (skipped by the ARG-SHAPE diff): without
+    /// const-propagation there is no cross-statement value tracking, by
+    /// design — downstream trees rely on `let`-bound args reading as
+    /// `Other` (their register conventions don't match the positional
+    /// model, so concrete propagation would false-fire).
     #[test]
     fn unbound_path_stays_other() {
-        assert_eq!(
-            args_of("fn f(q: u32) { real_call(q); }"),
-            vec![RustArg::Other]
-        );
-    }
-
-    #[test]
-    fn init_call_sees_prebinding_map() {
-        // The initializer's own calls classify against the map BEFORE the
-        // new binding lands: `g` here must not see `k`.
-        let facts = facts_of("fn f() { let k = g(1); real_call(k); }");
-        assert_eq!(facts.exprs.len(), 2, "{:?}", facts.exprs);
-        assert_eq!(facts.exprs[0].args, vec![RustArg::Imm(1)]);
-        assert_eq!(facts.exprs[1].args, vec![RustArg::Other]);
+        let facts = facts_of("fn f(q: u32) { real_call(q); }");
+        assert_eq!(facts.exprs.len(), 1, "{:?}", facts.exprs);
+        assert_eq!(facts.exprs[0].args, vec![RustArg::Other]);
+        let facts = facts_of("fn f() { let k = 1; real_call(k); }");
+        assert_eq!(facts.exprs.len(), 1, "{:?}", facts.exprs);
+        assert_eq!(facts.exprs[0].args, vec![RustArg::Other]);
     }
 
     // --- classify_expr (ARG-SHAPE argument classification) ------------------

@@ -209,6 +209,13 @@ impl Pe {
         self.fixup_posts.len()
     }
 
+    /// The absorbed `(pre, post)` content pairs for every 07 absolute fixup
+    /// (empty for PE). Diagnostic/test use; the gates go through
+    /// [`Pe::fixup_post_images`].
+    pub fn fixup_pairs(&self) -> &[(u64, u64)] {
+        &self.fixup_posts
+    }
+
     /// What happened with the LE fixup tables (see `FixupStatus`).
     pub fn fixup_status(&self) -> &FixupStatus {
         &self.fixup_status

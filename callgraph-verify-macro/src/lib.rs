@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Expr, ExprArray, Ident, Lit, LitInt, Token};
 
-use callgraph_verify::{analyze, cfg_fingerprint, diff_body_calls, reg_params, tail_referenced, ArgKind, FixupStatus, Pe, Spec};
+use callgraph_verify::{analyze, cfg_fingerprint, diff_body_calls_ext, reg_params, tail_referenced, ArgKind, FixupStatus, Pe, Spec};
 
 mod body;
 mod corpus;
@@ -49,6 +49,9 @@ struct Args {
     globals: Vec<u64>,
     vtables: Vec<u64>,
     vcall_slots: Vec<u64>,
+    /// Addresses this fn reaches only through a register/memory indirect call
+    /// (stack-slot callback). A faithful body spells them as direct calls.
+    indirect_targets: Vec<u64>,
     iat: Vec<u64>,
     /// Waiver for the ORIGIN-UNREFERENCED check: this origin address is real but
     /// the binary never CALLs/JMPs to it nor stores it as a pointer (e.g. the
@@ -97,6 +100,7 @@ impl Parse for Args {
             globals: Vec::new(),
             vtables: Vec::new(),
             vcall_slots: Vec::new(),
+            indirect_targets: Vec::new(),
             iat: Vec::new(),
             unreferenced: false,
         };
@@ -119,7 +123,7 @@ impl Parse for Args {
                         let msg = format!(
                             "[CG-VERIFY-E002 UNKNOWN-ATTR-FLAG] unknown flag `{other}` in \
                              #[origin(...)] — only `unreferenced` is supported as a bare flag. \
-                             Maybe you meant one of: fields, globals, vtables, vcall_slots, iat"
+                             Maybe you meant one of: fields, globals, vtables, vcall_slots, indirect_targets, iat"
                         );
                         return Err(syn::Error::new(key.span(), msg));
                     }
@@ -132,13 +136,14 @@ impl Parse for Args {
                 "globals" => a.globals = vals,
                 "vtables" => a.vtables = vals,
                 "vcall_slots" => a.vcall_slots = vals,
+                "indirect_targets" => a.indirect_targets = vals,
                 "iat" => a.iat = vals,
                 other => {
                     let msg = format!(
                         "[CG-VERIFY-E001 UNKNOWN-ATTR-KEY] unknown key `{other}` in \
                          #[origin(...)] — supported keys: fields, globals, vtables, \
-                         vcall_slots, iat (each takes `= [0xNN, ...]`). Bare flag: \
-                         unreferenced"
+                         vcall_slots, indirect_targets, iat (each takes \
+                         `= [0xNN, ...]`). Bare flag: unreferenced"
                     );
                     return Err(syn::Error::new(key.span(), msg));
                 }
@@ -611,6 +616,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         .globals(&args.globals)
         .vtables(&args.vtables)
         .vcall_slots(&args.vcall_slots)
+        .indirect_targets(&args.indirect_targets)
         .iat(&args.iat);
     if let Err(msg) = spec.check(&pe) {
         errors.push(
@@ -748,13 +754,16 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             let (vt_va, slot) = vtm.get(&args.addr).copied().unwrap_or((0, 0));
             note(&vtable_only_dispatch_msg(args.addr, vt_va, slot));
         }
-        match diff_body_calls(
+        let indirect_targets: std::collections::BTreeSet<u64> =
+            args.indirect_targets.iter().copied().collect();
+        match diff_body_calls_ext(
             &pe,
             &[args.addr],
             &map.corpus,
             &rust_idents,
             &vtable_methods,
             &miss_satisfied,
+            &indirect_targets,
         ) {
             Ok(d) => {
                 // VTABLE-DISPATCH: a direct call to a known vtable method — must be a `vcall`.
@@ -938,6 +947,17 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             {
                 let mut data_refs = cg.globals.clone();
                 data_refs.extend(&cg.imm_addrs);
+                // Tail targets execute as part of this body, so their data
+                // refs may be baked too (same fold as `referenced.extend`
+                // above); widen their fixup images as well.
+                data_refs.extend(tail_referenced(&pe, &cg));
+                // D65: a body may bake the RUNTIME image of ANY link-time
+                // address the binary references, including sub-image
+                // (DS-relative) offsets and SIB/relocated refs the
+                // per-function harvester misses. The byte-scan reference
+                // set is the same source E006 uses, so this is a widening
+                // of a verified fact, never a new demand.
+                data_refs.extend(referenced_addrs_cached(&exe, &pe).iter().map(|&a| a as u64));
                 referenced.extend(pe.fixup_post_images(&data_refs));
             }
             let mut reported: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
@@ -1054,53 +1074,39 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ),
                 );
             }
-            // POLARITY (E021): the binary tests one branch class that the
-            // body never tests — a wrong-class predicate the call/CFG checks
-            // can't see (`==` ported as `>` passes the gate while
-            // mis-modeling the binary). Thresholds mirror E016's
-            // conservative style: only gross divergence fires (a fused or
-            // optimized-away predicate never trips this). Body counts come
-            // from `CondCounts` (see body.rs): overcounting there only ever
-            // suppresses this check, never causes a false fire.
+            // POLARITY (advisory NOTE, code E021 reserved): the binary tests
+            // one branch class that the body never tests — a wrong-class
+            // predicate the call/CFG checks can't see (`==` ported as `>`
+            // passes the gate while mis-modeling the binary). Thresholds
+            // mirror E016's conservative style: only gross divergence is
+            // reported. Body counts come from `CondCounts` (see body.rs).
+            // Advisory only (NOTE, never fatal): downstream trees abstract
+            // predicates their HLE provably fixes (e.g. a straight-line
+            // init sequence whose binary guards on TODO-dataflow values),
+            // and there is no waiver mechanism for sound abstractions — so
+            // this stays a visible review hint, not a gate. Flip to fatal
+            // (E021 errors) only after downstream triage.
             // Documented limit: taken-arm inversions WITHIN a class
             // (`==` vs `!=`) are not detectable statically — that stays a
             // hand-audit (compare each ported jcc against `--asm`).
             match analyze(&pe, args.addr) {
                 Ok(cg) => {
                     if cg.equality_branches >= 3 && facts.conds.eq == 0 {
-                        errors.push(
-                            error::RichError::new(
-                                error::Code::Polarity,
-                                format!(
-                                    "binary tests equality {} time(s) (JE/JNE) but the body \
-                                     has no ==/!=/match-literal/matches!/flag test — wrong-class predicate?",
-                                    cg.equality_branches
-                                ),
-                            )
-                            .with_span(fn_like.attr_target_span())
-                            .with_fix(
-                                "port the binary's equality predicates (cmp/test + je/jne) \
-                                 as ==/!=/match arms instead of relational or call conditions",
-                            ),
-                        );
+                        note(&format!(
+                            "[CG-VERIFY-E021 POLARITY-NOTE] binary at {:#010x} tests equality {} time(s) \
+                             (JE/JNE) but the body has no ==/!=/match-literal/matches!/flag test — \
+                             wrong-class predicate? (advisory; port the predicates to silence)",
+                            args.addr, cg.equality_branches
+                        ));
                     }
                     let bin_rel = cg.signed_branches + cg.unsigned_branches;
                     if bin_rel >= 2 && facts.conds.rel == 0 {
-                        errors.push(
-                            error::RichError::new(
-                                error::Code::Polarity,
-                                format!(
-                                    "binary tests relationally {} time(s) (signed {}/unsigned {}) \
-                                     but the body has no </<=/>/>=/range-arm/for test — wrong-class predicate?",
-                                    bin_rel, cg.signed_branches, cg.unsigned_branches
-                                ),
-                            )
-                            .with_span(fn_like.attr_target_span())
-                            .with_fix(
-                                "port the binary's relational predicates (cmp + jl/jg/jb/ja family) \
-                                 as relational tests instead of equality or call conditions",
-                            ),
-                        );
+                        note(&format!(
+                            "[CG-VERIFY-E021 POLARITY-NOTE] binary at {:#010x} tests relationally {} time(s) \
+                             (signed {}/unsigned {}) but the body has no </<=/>/>=/range-arm/for test — \
+                             wrong-class predicate? (advisory; port the predicates to silence)",
+                            args.addr, bin_rel, cg.signed_branches, cg.unsigned_branches
+                        ));
                     }
                 }
                 // An analyze failure here was already reported as E017 by the
