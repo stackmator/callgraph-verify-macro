@@ -35,12 +35,28 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up MSVC x86 environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x86
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $install = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $install) {
+            throw 'Visual Studio with the x86 C++ toolset was not found'
+          }
+          $devcmd = Join-Path $install 'Common7\Tools\VsDevCmd.bat'
+          cmd /c "`"$devcmd`" -arch=x86 -no_logo && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+              $name = $matches[1]
+              $value = $matches[2]
+              if ($name -ieq 'PATH') {
+                Add-Content -Path $env:GITHUB_PATH -Value $value
+              } else {
+                Add-Content -Path $env:GITHUB_ENV -Value "$name=$value"
+              }
+            }
+          }
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -60,10 +76,10 @@ jobs:
 
   integration-ubuntu:
     name: ubuntu (MinGW + Watcom fixtures + host suites)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install MinGW-w64 32-bit toolchain
         run: |
