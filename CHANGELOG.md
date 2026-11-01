@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-10-31
+
 ### Added
 
 - `#[origin(addr, indirect_targets = [0xNN, ...])]`: declared targets the
@@ -267,7 +269,8 @@ Initial crates.io release.
 - `vtable_table!` declaration support with indirectly-called slot
   verification.
 
-[Unreleased]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.2...v0.1.3

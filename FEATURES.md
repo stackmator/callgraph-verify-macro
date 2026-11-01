@@ -1,9 +1,8 @@
 # Feature handoff: `indirect_targets` (stack-slot / register indirect callbacks)
 
-Status: **implemented and tested in the working tree, not committed**. It sits
-on top of unrelated pre-existing uncommitted changes (`src/body.rs`,
-deleted `tests/real_arg_shape.rs` / `tests/real_polarity.rs`, etc.) that this
-feature does not touch.
+Status: **shipped in 0.1.6**. The feature landed together with the E021
+advisory note, the ARG-SHAPE const-prop withdrawal, and the related CI
+fixture fixes.
 
 ## Why
 
