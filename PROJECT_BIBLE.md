@@ -286,7 +286,10 @@ Used by `E006` and to widen LE fixup acceptance. Over-approximates by design:
 - `JMP short rel8` (`0xEB`) targets,
 - `CALL/JMP rel32` and `Jcc rel32` targets in `.text`,
 - every little-endian `u32` at **every byte offset** of every section that lands
-  inside the image (vtables, jump tables, baked pointers, data refs).
+  inside the image (vtables, jump tables, baked pointers, data refs),
+- on LE, the **post-fixup image** of every collected pre value (`07` records),
+  so a slot-seeded callback stored as a link-time dword (`mov [slot],pre;
+  call [slot]`) passes `E006` at the runtime VA a port bakes. Widening only.
 
 A real function entry is reachable somehow; an address referenced nowhere is
 almost certainly a misattributed origin. `unreferenced` is the loud waiver.
