@@ -369,8 +369,9 @@ fn arg_shape_check(
     call_exprs: &[body::CallExpr],
     errors: &mut Vec<error::RichError>,
 ) {
-    // CRT allocator/free targets: their decompiled arg lists are unreliable (the project notes
-    // 0/2-arg `FormHeap_Allocate`/`Free` calls are decompiler artifacts), so skip them.
+    // CRT allocator/free targets: their decompiled arg lists are unreliable (the
+    // observed 0/2-arg allocator/free calls are decompiler artifacts), so skip
+    // them.
     const SKIP_TARGETS: &[u64] = &[0x0040_1f00, 0x0040_1f20];
 
     let Ok(cg) = analyze(pe, addr) else { return };
@@ -1181,7 +1182,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
 //   vtable_table! {
 //       name = renderer_vt, va = 0x00A88EA4, slots = 98,
 //       default = crate::vtable::vtable_unimplemented;
-//       1  = ni_dx9_renderer_get_rtti;
+//       1  = renderer_get_rtti;
 //       21 = renderer_caps_flags;
 //       ...
 //   }

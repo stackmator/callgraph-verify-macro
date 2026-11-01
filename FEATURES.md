@@ -91,7 +91,7 @@ cargo test -p callgraph-verify --test integration \
     test_diff_body_calls_indirect_target_accepted
 ```
 
-## Downstream use (dagger-engine-rs)
+## Downstream use (a real port)
 
 Demonstrated end-to-end: with
 
@@ -117,6 +117,6 @@ immediate is the mid-instruction `0x99529` rather than the runtime `0xA9529`.
 - The pre-fixup -> post-fixup relocation of pointer immediates is still a gate
   blind spot; the `unreferenced` waiver is the current escape (documented in
   the macro).
-- The remaining dagger formatter work is unrelated to this gate feature: the
+- The remaining formatter work is unrelated to this gate feature: the
   StackSlot frame, the 9 callback sites, and the va_list dataflow in `ad466`
   must still be ported before `[0x203A4]` is filled.

@@ -58,11 +58,11 @@ green the suite by skipping. Two deliberate exceptions, documented at
 their use sites: the MSVC-only `c_callgraph_dbg` twin (GNU ld cannot emit
 ILT thunks) and `CALLGRAPH_REAL_EXE` below.
 
-## Sweeping your own period binaries
+## Sweeping your own sample binaries
 
 `tests/real_binary_sweep.rs` runs the whole-image agreement + diff-clean
-sweeps over any 32-bit PE/LE pointed at by `CALLGRAPH_REAL_EXE` — e.g. an
-Oblivion-era exe built with MSVC 2005/2008, the crate's actual domain,
+sweeps over any 32-bit PE/LE pointed at by `CALLGRAPH_REAL_EXE` — e.g. a
+2000s-era exe built with MSVC 2005/2008, the crate's actual domain,
 which can never be committed (size + licensing). Local-only by design:
 it skips when the variable is unset, even under REQUIRE.
 

@@ -71,7 +71,7 @@ fn decode_all(pe: &Pe, entry: u64) -> (BTreeMap<u64, Instruction>, BTreeSet<u64>
                     // handled by `build_cfg`'s `leaders.contains(&addrs[idx])`
                     // check at line 203) or — the bug case — a tail-call
                     // into another function. Real-world instance: thunk
-                    // `0x579210: jmp 0x5821f0` in noivilbo.exe, where
+                    // `0x579210: jmp 0x5821f0` in a real PE, where
                     // 0x5821f0 is 36KB past the entry and the OLD
                     // `(lo..hi).contains(&t)` check followed it and
                     // counted the callee's loops, switches, and

@@ -87,7 +87,7 @@ fn pe_with_text(fill: &[u8], code: &[u8], text_len: usize) -> Pe {
 /// 3-byte canonical NOP — no branch opcodes, keeps the instruction count
 /// (and thus the one-time decode cost) at |text|/3.
 const NOP_FILL: &[u8] = &[0x0F, 0x1F, 0x00];
-/// 4 MB of `.text` — same order of magnitude as noivilbo.exe's 6.4 MB.
+/// 4 MB of `.text` — same order of magnitude as a real 6.4 MB PE.
 const TEXT_LEN: usize = 4 * 1024 * 1024;
 
 /// REGRESSION GUARD: repeat `has_direct_branch_target` lookups must be

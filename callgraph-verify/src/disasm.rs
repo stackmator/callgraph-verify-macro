@@ -23,7 +23,7 @@ use crate::pe::Pe;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Upper bound on how far past the entry we follow control flow. Oblivion's
+/// Upper bound on how far past the entry we follow control flow. Real-world
 /// largest functions are a few KB; 64 KB stops a mis-decoded `JMP` from walking
 /// the whole section.
 const MAX_FN_SPAN: u64 = 0x10000;
@@ -140,7 +140,7 @@ fn scan_operands(pe: &Pe, instr: &Instruction, cg: &mut CallGraph) {
                 {
                     // Indexed `[base + index*scale + disp]` (or `[reg+disp]`)
                     // off a large in-image displacement — a table base, not a
-                    // struct field (e.g. FALL.EXE `[eax*4+0x18F01]`). Record it
+                    // struct field (e.g. `[eax*4+0x18F01]` in a real LE binary). Record it
                     // as a global so bodies may bake the true address without
                     // tripping HALLUCINATED-ADDR. Small offsets miss
                     // `section_of` and fall through to the field branch below;
@@ -545,11 +545,11 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
                     //   the fallthrough past a non-returning jump is dead
                     //   code -- decoding it attributes neighboring
                     //   functions' calls here (verified: 9KB/20-call blowup
-                    //   on noivilbo 0x006ff480, whose IAT tail-jmps sit
+                    //   on a real PE at 0x006ff480, whose IAT tail-jmps sit
                     //   after cmp/jcc).
                     // * Unindexed `[reg+TABLE]` WITH a base register: Watcom
                     //   switch lowering (`shl reg,2` then `jmp [reg+TABLE]`,
-                    //   e.g. FALL.EXE 0x602c0). The table entries are
+                    //   e.g. an LE binary at 0x602c0). The table entries are
                     //   pre-fixup bytes on LE, so the read below yields
                     //   nothing; instead continue decoding at the fallthrough
                     //   address -- the case bodies tile the bytes right after
@@ -662,7 +662,7 @@ pub fn tail_referenced(pe: &Pe, cg: &CallGraph) -> BTreeSet<u64> {
 ///
 /// `allow_unindexed` covers Watcom-style lowering where the scale lives in a
 /// separate `shl` and the dispatch is a plain `[reg+TABLE]` with no SIB index
-/// (e.g. FALL.EXE `0x602c0`: `jmp dword ptr cs:[eax+0x502D8]`). Only set it
+/// (e.g. an LE binary at `0x602c0`: `jmp dword ptr cs:[eax+0x502D8]`). Only set it
 /// when the block already looks like a switch (see `is_switch_dispatch`):
 /// without that evidence a vtable tail-jump would read arbitrary words as
 /// "cases". On LE binaries the table entries are pre-fixup bytes, so the

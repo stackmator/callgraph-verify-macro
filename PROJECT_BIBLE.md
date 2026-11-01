@@ -84,7 +84,7 @@ those differences need human review or tests.
 | `callgraph-verify/tests/dos_le_integration.rs` | Real Open Watcom DOS4GW LE fixture tests |
 | `callgraph-verify/tests/jump_tables.rs` | Synthetic PE jump-table shapes |
 | `callgraph-verify/tests/perf.rs` | Cache/scan performance regression guards |
-| `callgraph-verify/tests/real_binary_sweep.rs` | Local-only sweep over `CALLGRAPH_REAL_EXE` (e.g. `noivilbo.exe`) |
+| `callgraph-verify/tests/real_binary_sweep.rs` | Local-only sweep over a `CALLGRAPH_REAL_EXE` binary (e.g. a sample PE) |
 | `callgraph-verify-macro/tests/ui/*` | `trybuild` compile-error snapshots (E001–E021) |
 | `callgraph-verify-macro/tests/real_structure.rs` | Live-fixture E016/E013 pins, MSVC-only |
 | `callgraph-verify-macro/tests/error_codes.rs` | Error-code stability contract |
@@ -403,7 +403,7 @@ vtable_table! {
     va = 0x00A88EA4,          // engine vtable VA
     slots = 98,               // slot count (decimal)
     default = crate::vtable::vtable_unimplemented;
-    1  = ni_dx9_renderer_get_rtti;   // slot = function
+    1  = renderer_get_rtti;   // slot = function
     21 = renderer_caps_flags;
 }
 ```
@@ -484,8 +484,15 @@ cargo test -p callgraph-verify-macro
 Real binary sweep:
 
 ```bash
-CALLGRAPH_REAL_EXE=/path/to/period.exe \
+CALLGRAPH_REAL_EXE=/path/to/sample.exe \
   cargo test -p callgraph-verify --test real_binary_sweep -- --nocapture
+```
+
+Local real-PE CFG pins (skipped when no binary is supplied):
+
+```bash
+CALLGRAPH_REAL_PE=/path/to/sample.exe \
+  cargo test -p callgraph-verify --test integration cfg_pin_real_pe -- --nocapture
 ```
 
 ### CI jobs
@@ -701,7 +708,7 @@ Windows with the exact CI command shapes:
 - Ubuntu equivalent: MinGW-w64 GCC 13.2 fixtures (`c_cpp_integration`) and
   Open Watcom `owcc -bdos4g` (`dos_le_integration`) — **pass**.
 - Host suites: `perf`, macro unit tests, trybuild UI — **pass**.
-- Local real binary: `noivilbo.exe` sweep — 47,896 entries / 10,988 direct
+- Local real binary: whole-image sweep — 47,896 entries / 10,988 direct
   calls, no disagreements — **pass**.
 
 Re-run the commands in section 8 after any change; do not treat this snapshot

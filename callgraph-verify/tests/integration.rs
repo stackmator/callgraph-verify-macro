@@ -6,6 +6,32 @@ mod tests {
     };
     use std::process::Command;
 
+    /// Local-only real-PE pins: `CALLGRAPH_REAL_PE`, else `real.exe` at the
+    /// workspace root. Skips when absent so a fresh clone stays green.
+    fn real_pe_path() -> Option<std::path::PathBuf> {
+        let path = std::env::var("CALLGRAPH_REAL_PE")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+                manifest_dir
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("real.exe"))
+            })?;
+        if path.exists() {
+            Some(path)
+        } else {
+            eprintln!(
+                "skipping: {} not found (set CALLGRAPH_REAL_PE or place a \
+                 sample PE at the workspace root)",
+                path.display()
+            );
+            None
+        }
+    }
+
     /// Build the test-bin binary if needed.
     fn ensure_test_binary_built() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -802,7 +828,8 @@ mod tests {
     }
 
     /// SIB-indexed `[base + index*scale + disp32]` with an IN-SECTION
-    /// displacement is a table-base load (e.g. FALL.EXE `[eax*4+0x18F01]`),
+    /// displacement is a table-base load (e.g. `[eax*4+0x18F01]` in a real LE
+    /// binary),
     /// not a struct field. `analyze` must record the displacement in
     /// `cg.globals` — otherwise HALLUCINATED-ADDR fires on the true table
     /// address — and must NOT record it in `field_offsets` (BUG #4 stays).
@@ -913,7 +940,7 @@ mod tests {
     /// `FlowControl::Interrupt` like `ret`: listings truncated at the
     /// first `int` and any CALL reachable only via post-`int`
     /// fallthrough was silently dropped from the call set (real
-    /// instance: FALL.EXE `0xb73d8` → `0xa3805` absent), blinding the
+    /// instance: an LE binary at `0xb73d8` → `0xa3805` absent), blinding the
     /// gate's MISSING check for those callees.
     #[test]
     fn test_int_does_not_terminate_decode() {
@@ -957,7 +984,7 @@ mod tests {
 
     /// Regression: `referenced_addrs` must index `JMP short rel8` (0xEB)
     /// targets. The scan only recognized CALL/JMP rel32 and Jcc rel32, so a
-    /// function reached solely via short jump (real instance: FALL.EXE
+    /// function reached solely via short jump (real instance: an LE binary at
     /// `0x9dbe2`, reached only by `EB F0` from `0x9dbeb`) was invisible to
     /// ORIGIN-UNREFERENCED and needed a waiver. Over-approximation stays:
     /// a stray 0xEB only ever widens the accept set.
@@ -1453,16 +1480,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Real-binary CFG pin: the function at 0x00959d60 in the workspace's
-    // `noivilbo.exe` has FOUR back-edges (loop heads) per the reference
-    // skeleton's basic blocks (0x959d8b, 0x959de0, 0x959df1, 0x959e64).
+    // Real-binary CFG pin: the function at 0x00959d60 in a local sample PE
+    // has FOUR back-edges (loop heads) per the reference skeleton's basic
+    // blocks (0x959d8b, 0x959de0, 0x959df1, 0x959e64).
     // The skeleton view:
-    //   cargo run --bin callgraph_verify --release -- noivilbo.exe 0x959d60 --skeleton
+    //   cargo run --bin callgraph_verify --release -- real.exe 0x959d60 --skeleton
     // shows each loop head marked with `// loop head`. The macro's
     // CFG-fingerprint diff at `callgraph-verify-macro/src/lib.rs:690` keys
     // off `fp.loops >= 2 && r.loops == 0` — meaning a port whose literal
     // body has no `while`/`loop`/`for` (e.g. one that extracted the loop
-    // bodies into `pick_traverse`/`update_world_bound` helpers) will be
+    // bodies into helper functions) will be
     // rejected as a compile error.
     //
     // This test pins the byte-truth side of that contract: the entry's
@@ -1477,25 +1504,11 @@ mod tests {
     // port omissions.
     // -----------------------------------------------------------------
     #[test]
-    fn cfg_pin_noivilbo_0x959d60_has_four_back_edges() {
-        // `noivilbo.exe` lives at the workspace root (two levels up from this
-        // crate's manifest). Skip gracefully if it's not present so this test
-        // doesn't break a fresh clone where the fixture binary hasn't been
-        // added yet.
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let pe_path = manifest_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("noivilbo.exe"))
-            .expect("workspace root resolves");
-        if !pe_path.exists() {
-            eprintln!(
-                "skipping: {} not found (fixture binary lives at workspace root)",
-                pe_path.display()
-            );
+    fn cfg_pin_real_pe_0x959d60_has_four_back_edges() {
+        let Some(pe_path) = real_pe_path() else {
             return;
-        }
-        let pe = Pe::load(pe_path.to_str().unwrap()).expect("load noivilbo.exe");
+        };
+        let pe = Pe::load(pe_path.to_str().unwrap()).expect("load local sample PE");
         let fp = cfg_fingerprint(&pe, 0x00959d60).expect("cfg_fingerprint at 0x00959d60");
         assert_eq!(
             fp.loops, 4,
@@ -1515,15 +1528,15 @@ mod tests {
     // The OLD heuristic was `t <= ld && leaders.contains(&t)` — a back-edge
     // by address. That conflates "branch goes to an earlier block" with
     // "iteration", so a function whose only `je`/`jbe` exits were to a
-    // common epilog tail got false positives. Example from `noivilbo.exe`:
-    // ni_file_flush (0x00747d30) had `je0x7D40` and `jbe 0x7D40`, both
+    // common epilog tail got false positives. Example from a real PE:
+    // a file-flush helper (0x00747d30) had `je0x7D40` and `jbe 0x7D40`, both
     // appearing as back-edges by address but neither forming a loop.
     //
     // The fix: only count `B -> T` as a natural-loop back-edge when `T`
     // dominates `B` (every path from `entry` to `B` passes through `T`).
     // This is the textbook natural-loop definition and correctly handles:
     //   * real `while`/`for`/`do-while` (the loop head dominates the body)
-    //   * `ni_file_flush`-style early-exits to a common tail (the tail
+    //   * file-flush-style early-exits to a common tail (the tail
     //     does NOT dominate the `je`/`jbe` sites, because entry can fall
     //     through to those sites without going through the tail)
     // -----------------------------------------------------------------
@@ -1650,34 +1663,24 @@ mod tests {
         );
     }
 
-    /// Real-binary regression for the bug. `ni_file_flush` at 0x00747d30
-    /// in `noivilbo.exe` has two Jccs into a common tail (0x00747d40)
+    /// Real-binary regression for the bug. A file-flush helper at 0x00747d30
+    /// in a real PE has two Jccs into a common tail (0x00747d40)
     /// that does NOT dominate the Jcc source blocks (entry can fall
     /// through to them without going through the tail). With the OLD
     /// `t <= ld` heuristic, those counted as back-edges and `fp.loops`
     /// was ≥1. After the fix, `fp.loops` must be 0 — there's no actual
     /// iteration in this function.
     #[test]
-    fn cfg_pin_noivilbo_ni_file_flush_has_no_loops() {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let pe_path = manifest_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("noivilbo.exe"))
-            .expect("workspace root resolves");
-        if !pe_path.exists() {
-            eprintln!(
-                "skipping: {} not found (fixture binary lives at workspace root)",
-                pe_path.display()
-            );
+    fn cfg_pin_real_pe_file_flush_has_no_loops() {
+        let Some(pe_path) = real_pe_path() else {
             return;
-        }
-        let pe = Pe::load(pe_path.to_str().unwrap()).expect("load noivilbo.exe");
+        };
+        let pe = Pe::load(pe_path.to_str().unwrap()).expect("load local sample PE");
         let fp = cfg_fingerprint(&pe, 0x00747d30)
-            .expect("cfg_fingerprint at 0x00747d30 (ni_file_flush)");
+            .expect("cfg_fingerprint at 0x00747d30 (file-flush helper)");
         assert_eq!(
             fp.loops, 0,
-            "ni_file_flush (0x00747d30) has no real loops — its two Jccs into \
+            "file-flush helper (0x00747d30) has no real loops — its two Jccs into \
              0x00747d40 are early-exits to a common tail, not back-edges into a \
              loop head. The OLD `t <= ld && leaders.contains(&t)` heuristic \
              counted them as loops (fp.loops was 1+); the dominance-based \
@@ -1986,30 +1989,20 @@ mod tests {
     }
 
     /// Real-binary pin for a function with KNOWN non-zero loop count:
-    /// `select_texture_format` at 0x00773ba0 has 12 back-edges per
+    /// a twelve-loop helper at 0x00773ba0 has 12 back-edges per
     /// the probe above. Guards against the dominance fix dropping
     /// genuine loops (e.g. by computing dom on the wrong subgraph).
     #[test]
-    fn cfg_pin_noivilbo_select_texture_format_has_twelve_loops() {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let pe_path = manifest_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("noivilbo.exe"))
-            .expect("workspace root resolves");
-        if !pe_path.exists() {
-            eprintln!(
-                "skipping: {} not found (fixture binary lives at workspace root)",
-                pe_path.display()
-            );
+    fn cfg_pin_real_pe_twelve_loop_function() {
+        let Some(pe_path) = real_pe_path() else {
             return;
-        }
-        let pe = Pe::load(pe_path.to_str().unwrap()).expect("load noivilbo.exe");
+        };
+        let pe = Pe::load(pe_path.to_str().unwrap()).expect("load local sample PE");
         let fp = cfg_fingerprint(&pe, 0x00773ba0)
-            .expect("cfg_fingerprint at 0x00773ba0 (select_texture_format)");
+            .expect("cfg_fingerprint at 0x00773ba0 (twelve-loop function)");
         assert_eq!(
             fp.loops, 12,
-            "select_texture_format (0x00773ba0) has 12 real back-edges in its \
+            "twelve-loop function (0x00773ba0) has 12 real back-edges in its \
              CFG (multiple nested loops). The dominance-based check must \
              preserve them. Got fp = {:?}",
             fp
@@ -2021,7 +2014,7 @@ mod tests {
     /// to the same loop head — the case that an over-eager fix would
     /// silently regress by treating one as "not a real loop".
     ///
-    /// The function at 0x0071FF54 (a `ni_property_state_*` port) has:
+    /// The function at 0x0071FF54 (a state-helper port) has:
     ///   * an unconditional `jmp 0x0071FF54` self-loop at the entry
     ///   * a conditional `jb 0x00720062` back-edge from 0x0072018c to
     ///     0x00720062 (a `while (cmp dx, [ebp+0x50])` loop tail)
@@ -2032,26 +2025,16 @@ mod tests {
     /// forward self-loops) would silently drop the second one and
     /// make the porter's `r.loops >= 1` check fail spuriously.
     #[test]
-    fn cfg_pin_noivilbo_ni_property_state_has_two_loops() {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let pe_path = manifest_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("noivilbo.exe"))
-            .expect("workspace root resolves");
-        if !pe_path.exists() {
-            eprintln!(
-                "skipping: {} not found (fixture binary lives at workspace root)",
-                pe_path.display()
-            );
+    fn cfg_pin_real_pe_state_helper_has_two_loops() {
+        let Some(pe_path) = real_pe_path() else {
             return;
-        }
-        let pe = Pe::load(pe_path.to_str().unwrap()).expect("load noivilbo.exe");
+        };
+        let pe = Pe::load(pe_path.to_str().unwrap()).expect("load local sample PE");
         let fp = cfg_fingerprint(&pe, 0x0071FF54)
-            .expect("cfg_fingerprint at 0x0071FF54 (ni_property_state)");
+            .expect("cfg_fingerprint at 0x0071FF54 (state helper)");
         assert_eq!(
             fp.loops, 2,
-            "ni_property_state (0x0071FF54) has 2 real back-edges — a \
+            "state helper (0x0071FF54) has 2 real back-edges — a \
              conditional `jb` back-edge and an unconditional `jmp` self-loop. \
              The dominance-based check must count BOTH; a fix that drops \
              either kind would let the porter silently lose a loop. \

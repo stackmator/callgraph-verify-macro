@@ -343,7 +343,7 @@ mod tests {
         let c = scan_text(
             "\
 #[origin(0x004028d0)]
-/// inline: 0x0070b780 (typed entry over [ni_node_ctor])
+/// inline: 0x0070b780 (typed entry over [node_ctor])
 pub unsafe fn foo() {}
 ",
         );

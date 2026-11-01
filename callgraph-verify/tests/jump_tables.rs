@@ -2,7 +2,7 @@
 //!
 //! Watcom-style switches lower the index scaling into a separate `shl` and
 //! dispatch through a plain `[reg+TABLE]` with NO SIB index (e.g.
-//! FALL.EXE `0x602c0`: `shl eax,2` then `jmp dword ptr cs:[eax+0x502D8]`).
+//! a real LE binary at `0x602c0`: `shl eax,2` then `jmp dword ptr cs:[eax+0x502D8]`).
 //! `follow_jump_table` only followed SIB-indexed tables, so case bodies
 //! reachable only through the table were invisible to the gate: bodies
 //! calling them looked HALLUCINATED, and omitting them could never trip

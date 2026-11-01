@@ -1,4 +1,4 @@
-//! Local-only sweep over a user-provided real binary (e.g. an Oblivion-era
+//! Local-only sweep over a user-provided real binary (e.g. a 2000s-era
 //! exe built with MSVC 2005/2008 — the crate's actual domain, which cannot
 //! be committed to the repo for size and licensing reasons).
 //!
@@ -28,13 +28,13 @@ fn real_binary_sweeps_agree_and_diff_clean() {
     // dword): that is the crate's own definition of a plausible function
     // entry (the ORIGIN-UNREFERENCED gate). A blind extent-skip walk also
     // lands mid-gap on alignment padding, whose bytes decode to junk with
-    // junk rel32 targets (e.g. noivilbo.exe 0x497A59: a 3-byte NOP sled
+    // junk rel32 targets (e.g. a real PE at 0x497A59: a 3-byte NOP sled
     // followed by `JP`/`ADD` filler) — checking those would blame the
     // verifier for decoding non-code. The macro never analyzes such
     // addresses either: every `#[origin]` must pass the referenced gate.
     let refs = pe.referenced_addrs();
     // And only check targets INSIDE the image: a decoded `CALL` to kernel
-    // space (e.g. noivilbo.exe 0xBCAE8B `OUT DX,AL` + ... + `CALL
+    // space (e.g. a real PE at 0xBCAE8B `OUT DX,AL` + ... + `CALL
     // 0xDAC27BB9` — data decoded as code) is definitionally not a real
     // direct call, and the byte scan (like `referenced_addrs`) only indexes
     // in-image targets. Real missed-branch bugs always land in-image.
@@ -126,7 +126,7 @@ fn real_le_fixup_post_images_are_referenced() {
     // value the byte scan saw as referenced must also contribute its runtime
     // (post-fixup) image to the ORIGIN-UNREFERENCED accept set. This is the
     // `mov dword [slot],pre; call [slot]` callback pattern that motivated the
-    // widening (e.g. FALL.EXE seeds slot 0x25AE4 with link-time 0x64ABA, so
+    // widening (e.g. an LE binary seeds slot 0x25AE4 with link-time 0x64ABA, so
     // post 0x74ABA must count as referenced).
     let refs = pe.referenced_addrs();
     let mut checked = 0u32;

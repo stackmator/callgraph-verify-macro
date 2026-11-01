@@ -6,7 +6,7 @@
  *
  * This exercises `Pe::parse_le` + the disassembler over genuine Watcom
  * codegen (startup code, register-based fastcall-ish helpers, real loop
- * back-edges) instead of FALL.EXE, which cannot be checked into the repo.
+ * back-edges) instead of a real LE binary, which cannot be checked into the repo.
  *
  * Constraints (Watcom wcc386 + DOS/4GW target):
  *   - C89-style code (declarations at block tops). No CRT beyond stdio.

@@ -61,7 +61,7 @@ declarations — by design. Concretely:
 iteration logic into a single contiguous range (e.g. a 200-byte block with
 nested loops and no `CALL` between them), the faithful Rust port is one
 function with matching nested loops — even if it is 200+ lines. Extracting the
-loops into `pick_traverse` / `update_world_bound` helpers is a *structural*
+loops into separate helper functions is a *structural*
 divergence from the binary: the binary never calls them, and the verifier
 correctly refuses to accept the split.
 
@@ -112,7 +112,7 @@ vtable_table! {
     va = 0x00A88EA4,
     slots = 98,
     default = crate::vtable::vtable_unimplemented;
-    1  = ni_dx9_renderer_get_rtti;
+    1  = renderer_get_rtti;
     21 = renderer_caps_flags;
     // ... each slot verified against engine vtable at 0x00A88EA4
 }

@@ -644,7 +644,7 @@ pub fn diff_body_calls_ext(
 ///     fn set_name @ 0x006ff420 => exact [0x00401f00, 0x00401f20, 0x00984b6a];
 ///
 ///     // 2) block — any subset of clauses, each `;`-terminated
-///     fn ni_node_ctor @ 0x0070b780 {
+///     fn node_ctor @ 0x0070b780 {
 ///         calls: superset [0x004b2d30];
 ///         fields: [0xbc, 0xc0, 0xc4, 0xc8];   // struct offsets it must touch
 ///         vtables: [0x00a7e38c];              // NiNode vtable VA installed

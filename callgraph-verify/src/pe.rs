@@ -356,7 +356,7 @@ impl Pe {
                 for i in 0..blob.len().saturating_sub(4) {
                     // `JMP short rel8` (0xEB): the scan used to index rel32
                     // branches only, so a function reached solely via short
-                    // jump (e.g. FALL.EXE `0x9dbe2`, reached only by `EB F0`
+                    // jump (e.g. an LE entry at `0x9dbe2`, reached only by `EB F0`
                     // from `0x9dbeb`) was invisible to ORIGIN-UNREFERENCED.
                     // Over-approximate like the rest: a stray 0xEB only
                     // widens the set.
@@ -420,7 +420,7 @@ impl Pe {
     }
 }
 
-/// DOS4GW Linear Executable (LE) support — Daggerfall's FALL.EXE etc. are
+/// DOS4GW Linear Executable (LE) support — real DOS4GW binaries are
 /// MZ+LE, not PE. We synthesize a PE-like image so the existing
 /// disassembler works unchanged:
 ///
@@ -430,8 +430,8 @@ impl Pe {
 ///   `.text`-gated caches keep working; other objects become
 ///   `.textN` / `.dataN`.
 /// * Page map entries are 4 bytes in LE: 24-bit big-endian physical page
-///   number + 8-bit flags (0 = legal). All FALL.EXE pages are flag 0 and
-///   sequential; iterated/zero pages are rejected for now.
+///   number + 8-bit flags (0 = legal). Pages in the observed sample are flag
+///   0 and sequential; iterated/zero pages are rejected for now.
 /// * `datapage` header field is a file-absolute offset (proven by
 ///   datapage + pages*pagesize - (pagesize-lastpagesize) == file size).
 /// * Fixups are absorbed, not applied: direct CALL rel32 (the call graph)
@@ -639,8 +639,8 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
 const NOVEL_FIXUP_PREFIX: &str = "NOVEL-FIXUP-RECORD: ";
 
 /// Read-only LE fixup walk: `(pre, post)` content pairs for every internal
-/// 07 (absolute) record. The grammar mirrors the DOS4GW loader (dagger's
-/// `apply_fixups`, proven against FALL.EXE's record tables): page table at
+/// 07 (absolute) record. The grammar mirrors the DOS4GW loader's
+/// `apply_fixups` (proven against real LE record tables): page table at
 /// `le+0x68`, record table at `le+0x6C`, single-source or u8-counted source
 /// lists, narrow (u16) or wide (u32) target offsets, and the wlink
 /// page-straddler wrap (`0xFFFD/0xFFFE/0xFFFF` source offsets file under the

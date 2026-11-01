@@ -2,8 +2,8 @@
 //!
 //! `callgraph-verify/test-fixtures/dos/callgraph.c` is compiled by CI with
 //! Open Watcom (`owcc -bdos4g`) to a 32-bit DOS/4GW LE binary and parsed by
-//! `Pe::parse_le`. FALL.EXE — the motivating LE target — cannot be checked
-//! into the repo, so this fixture is the only real-LE coverage the suite has.
+//! `Pe::parse_le`. A real-world LE binary cannot be checked into the repo,
+//! so this fixture is the only real-LE coverage the suite has.
 //!
 //! No address manifest: parsing wlink maps is fragile, so these tests
 //! discover functions by SHAPE (callers, leaves, loops) instead of by name.

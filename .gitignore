@@ -1,6 +1,7 @@
 target/
 Cargo.lock
-noivilbo.exe
+# Local sample binaries (never committed).
+/*.exe
 # Synthetic PE + corpus written by tests/error_codes.rs at every test run;
 # checked-in fixtures live under callgraph-verify-macro/tests/ui/.
 callgraph-verify-macro/tests/testdata/

@@ -1033,8 +1033,7 @@ mod tests {
         assert_eq!(f.spans.len(), 1, "exactly 1 fake: {:?}", f);
     }
 
-    /// Regression: the exact shape from the `ni_source_texture_load_binary`
-    /// bug report. `let _x = while !cond { break; };` is invalid Rust AND
+    /// Regression: the exact shape from a real-world bug report. `let _x = while !cond { break; };` is invalid Rust AND
     /// a fake-loop placeholder — it adds nothing to `r.loops` because the
     /// loop never iterates. Without this, the rebuild body containing two
     /// such placeholders silently passed the CFG gate (binary has 2
@@ -1054,7 +1053,7 @@ mod tests {
         assert_eq!(f.spans.len(), 1, "expected 1 fake: {:?}", f);
         assert_eq!(f.spans[0].1, "body is just `break;` under `while`");
 
-        // Full ni_source_texture_load_binary shape: two fake whiles + a
+        // Full real-world shape: two fake whiles + a
         // real `for` in the middle. Net count = 1 (the real `for`).
         let ts = TokenStream::from_str(
             "pub fn outer() { \
