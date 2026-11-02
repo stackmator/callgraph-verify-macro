@@ -45,6 +45,12 @@ struct FnStats {
 /// bytes that happen to start a valid opcode.
 fn enumerate_functions(pe: &Pe, max: u32) -> Vec<(u64, u64, callgraph_verify::CallGraph)> {
     let mut out: Vec<(u64, u64, callgraph_verify::CallGraph)> = Vec::new();
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    let mut queue: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+
+    // Pass 1: linear sweep of executable sections (obj1). Seed the BFS with
+    // every direct-call / tail target so code reachable only by CALL into a
+    // non-executable object is still found.
     for sec in pe.sections() {
         if !sec.is_executable() {
             continue;
@@ -55,7 +61,12 @@ fn enumerate_functions(pe: &Pe, max: u32) -> Vec<(u64, u64, callgraph_verify::Ca
         while va < sec_end {
             if let Ok(cg) = analyze(pe, va) {
                 let extent = cg.max_end.saturating_sub(va).max(1);
-                out.push((va, extent, cg));
+                if seen.insert(va) {
+                    for &t in cg.call_targets().iter().chain(cg.tail_calls.iter()) {
+                        queue.push_back(t);
+                    }
+                    out.push((va, extent, cg));
+                }
                 va = va.saturating_add(extent);
             } else {
                 va += 1;
@@ -63,6 +74,36 @@ fn enumerate_functions(pe: &Pe, max: u32) -> Vec<(u64, u64, callgraph_verify::Ca
             if out.len() as u32 >= max {
                 break;
             }
+        }
+    }
+
+    // Pass 2: reachability into non-executable objects. FALLE.EXE's obj2
+    // (0xC0000+) is the main game code but is flagged read/write and mixes
+    // data with code, so it cannot be swept linearly. Follow direct-call /
+    // tail targets that land in a non-executable section and expand from
+    // those real entries.
+    while let Some(va) = queue.pop_front() {
+        if seen.contains(&va) {
+            continue;
+        }
+        let in_nonexec = pe
+            .section_of(va)
+            .map(|s| !s.is_executable())
+            .unwrap_or(false);
+        if !in_nonexec {
+            continue;
+        }
+        if let Ok(cg) = analyze(pe, va) {
+            let extent = cg.max_end.saturating_sub(va).max(1);
+            if seen.insert(va) {
+                for &t in cg.call_targets().iter().chain(cg.tail_calls.iter()) {
+                    queue.push_back(t);
+                }
+                out.push((va, extent, cg));
+            }
+        }
+        if out.len() as u32 >= max {
+            break;
         }
     }
     out

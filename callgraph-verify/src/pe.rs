@@ -386,7 +386,12 @@ impl Pe {
             let blob = &self.data[start..end];
             let sec_va = self.image_base + sec.virtual_address as u64;
             // rel8/rel32 branch targets — only meaningful in the code section.
-            if sec.name == ".text" {
+            // Scan `.text` plus every non-executable section: FALLE.EXE's
+            // main game code lives in a read/write object (obj2, 0xC0000+)
+            // that is mixed data+code, so its CALL/JMP targets must
+            // contribute to the accept-set or E006 falsely rejects every
+            // obj2 function. Over-approximation only widens acceptance.
+            if sec.name == ".text" || !sec.is_executable() {
                 for i in 0..blob.len().saturating_sub(4) {
                     // `JMP short rel8` (0xEB): the scan used to index rel32
                     // branches only, so a function reached solely via short
