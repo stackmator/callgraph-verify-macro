@@ -14,9 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Pe::fixup_post_image(pre) -> Option<u64>`: the runtime (post-fixup) image
   of a single link-time address, or `None` for PE and for pre values that are
   not LE 07 fixup sites. Single-value counterpart of `fixup_post_images`.
+- `Pe::fixup_rel32_target(loc) -> Option<u64>` / `fixup_rel32_pairs()`: LE 08
+  self-relative records as `(operand_va, target_va)`. The loader writes
+  `target-(operand+4)`, so the record target is the runtime destination of an
+  on-disk `rel32=0` placeholder (`call $+5`, e.g. DOS4GW `int 2Fh` stubs).
 
 ### Fixed
 
+- `call $+5` (`rel32=0`, target == `next_ip`) is no longer recorded as a call
+  to the next instruction. When an LE 08 self-relative fixup patches the
+  operand, the fixup's runtime target is recorded instead; otherwise the
+  site is treated as a GET-PC no-op. Two integration tests that used
+  `call $+5` as a synthetic call now use real rel32 targets.
 - Jump-table harvesting on DOS4GW LE binaries. A switch table's base
   (`jmp dword [idx*4+TABLE]`) and its 32-bit entries are stored as link-time
   values that the loader relocates, so reading them raw made every entry look

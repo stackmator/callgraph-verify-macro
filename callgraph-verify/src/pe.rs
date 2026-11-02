@@ -39,6 +39,12 @@ pub struct Pe {
     /// contribute no pairs (relative offsets are not addresses; selectors
     /// have no flat-model value).
     fixup_posts: Vec<(u64, u64)>,
+    /// LE 08 self-relative records as `(operand_va, target_va)`: the loader
+    /// writes `target - (operand_va + 4)` into the rel32 field, so the
+    /// record's target is the runtime branch/call destination. Resolves
+    /// on-disk `rel32=0` placeholders (DOS4GW/Watcom `call $+5`), which are
+    /// load-time call sites, not get-PC no-ops.
+    fixup_rel32: Vec<(u64, u64)>,
     /// What happened with the LE fixup tables (see `FixupStatus`).
     fixup_status: FixupStatus,
     /// Process-unique identity assigned at parse time. Whole-image derived
@@ -175,6 +181,7 @@ impl Pe {
         image_base,
         sections,
         fixup_posts: Vec::new(),
+        fixup_rel32: Vec::new(),
         fixup_status: FixupStatus::Absent,
         id: next_pe_id(),
     })
@@ -228,6 +235,19 @@ impl Pe {
     /// [`Pe::fixup_post_images`].
     pub fn fixup_pairs(&self) -> &[(u64, u64)] {
         &self.fixup_posts
+    }
+
+    /// The LE 08 self-relative records as `(operand_va, target_va)`.
+    pub fn fixup_rel32_pairs(&self) -> &[(u64, u64)] {
+        &self.fixup_rel32
+    }
+
+    /// Runtime target of a rel32 branch/call whose operand sits at `loc`, if
+    /// an LE 08 self-relative fixup patches it. `None` for PE and non-sites.
+    pub fn fixup_rel32_target(&self, loc: u64) -> Option<u64> {
+        self.fixup_rel32
+            .iter()
+            .find_map(|&(l, t)| (l == loc).then_some(t))
     }
 
     /// What happened with the LE fixup tables (see `FixupStatus`).
@@ -430,6 +450,14 @@ impl Pe {
                 }
             }
         }
+        // Self-relative fixup targets: the loader rewrites an on-disk
+        // rel32=0 placeholder to `target-(loc+4)`, so the record target is
+        // a real branch/call destination even though the file bytes hold 0.
+        for &(_, t) in &self.fixup_rel32 {
+            if (lo..hi).contains(&t) {
+                out.insert(t as u32);
+            }
+        }
         out
     }
 }
@@ -621,15 +649,15 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
             characteristics,
         });
     }
-    let (fixup_posts, fixup_status) = match collect_fixups(
+    let (fixup_posts, fixup_rel32, fixup_status) = match collect_fixups(
         &data, le_off, &objs, numpages, pagesize, &sections, &new_data,
     ) {
-        Ok(pairs) => {
+        Ok((pairs, rel32)) => {
             let n = pairs.len();
-            (pairs, FixupStatus::Applied { pairs: n })
+            (pairs, rel32, FixupStatus::Applied { pairs: n })
         }
         Err(e) if e.starts_with(NOVEL_FIXUP_PREFIX) => {
-            (Vec::new(), FixupStatus::Skipped { reason: e })
+            (Vec::new(), Vec::new(), FixupStatus::Skipped { reason: e })
         }
         Err(e) => return Err(e),
     };
@@ -638,6 +666,7 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
         image_base: 0,
         sections,
         fixup_posts,
+        fixup_rel32,
         fixup_status,
         id: next_pe_id(),
     })
@@ -673,7 +702,7 @@ fn collect_fixups(
     pagesize: usize,
     sections: &[Section],
     image: &[u8],
-) -> Result<Vec<(u64, u64)>, String> {
+) -> Result<(Vec<(u64, u64)>, Vec<(u64, u64)>), String> {
     let pre_of = |va: u64| -> Option<u32> {
         for s in sections {
             let lo = s.virtual_address as u64;
@@ -715,7 +744,7 @@ fn collect_fixups(
         .ok_or("LE fixup record-table offset overflow")?;
     if fpt == le_off && frt == le_off {
         // Zeroed table offsets: the linker emitted no fixup tables.
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let tab_len = (numpages + 1)
         .checked_mul(4)
@@ -758,6 +787,7 @@ fn collect_fixups(
         }
     }
     let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut out_rel32: Vec<(u64, u64)> = Vec::new();
     for (pi, (start, end)) in bounds.iter().enumerate() {
         let lp = pi + 1; // logical pages are 1-based
         let (obase, _, opage, _) = objs
@@ -879,9 +909,11 @@ fn collect_fixups(
                 }
                 if low4 == 7 {
                     out.push((pre as u64, target as u64));
+                } else if low4 == 8 {
+                    // Self-relative: the loader writes target-(loc+4), so the
+                    // record target is the runtime branch/call destination.
+                    out_rel32.push((loc as u64, target as u64));
                 }
-                // 08 self-relative: validated, not stored (a relative
-                // offset is not an address).
             }
         }
         if p != pend {
@@ -892,7 +924,7 @@ fn collect_fixups(
             ));
         }
     }
-    Ok(out)
+    Ok((out, out_rel32))
 }
 
 #[cfg(test)]

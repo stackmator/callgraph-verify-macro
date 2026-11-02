@@ -1138,9 +1138,9 @@ mod tests {
             0xB9, 0x05, 0x00, 0x00, 0x00, // 0: MOV ECX, 5
             0x85, 0xC0, // 5: TEST EAX, EAX
             0x75, 0x06, // 7: JNZ +6 → take_call at 15
-            0xE8, 0x00, 0x00, 0x00, 0x00, // 9: CALL <next_ip> (fallthrough path)
+            0xE8, 0xF2, 0xFF, 0xFF, 0xFF, // 9: CALL entry+0 (fallthrough path)
             0xC3, // 14: RET
-            0xE8, 0x00, 0x00, 0x00, 0x00, // 15: CALL <next_ip> (taken path)
+            0xE8, 0xF1, 0xFF, 0xFF, 0xFF, // 15: CALL entry+5 (taken path)
             0xC3, // 20: RET
         ];
         let pe = pe_with_code(&code);
@@ -1149,7 +1149,7 @@ mod tests {
 
         // We expect two CALL sites — fallthrough and taken. Find the taken one
         // by its target VA (offset 15 + length 5 = 20 → image_base + 0x1014).
-        let taken_target = entry + 0x14;
+        let taken_target = entry + 5;
         let taken = cg
             .call_sites
             .iter()
@@ -1174,7 +1174,7 @@ mod tests {
             0xB9, 0x05, 0x00, 0x00, 0x00, // 0: MOV ECX, 5
             0x85, 0xC0, // 5: TEST EAX, EAX
             0x75, 0x06, // 7: JNZ +6 → take_call at 15
-            0xE8, 0x00, 0x00, 0x00, 0x00, // 9: CALL <next_ip> (fallthrough path)
+            0xE8, 0xF2, 0xFF, 0xFF, 0xFF, // 9: CALL entry+0 (fallthrough path)
             0xC3, // 14: RET
             0xC3, // 15: take_call: RET (taken path returns immediately)
         ];
@@ -1182,7 +1182,7 @@ mod tests {
         let entry = pe.image_base + 0x1000;
         let cg = analyze(&pe, entry).expect("analyze");
 
-        let fallthrough_target = entry + 0x0E;
+        let fallthrough_target = entry;
         let ft = cg
             .call_sites
             .iter()

@@ -474,11 +474,28 @@ pub fn analyze_opt(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph,
             match instr.flow_control() {
                 FlowControl::Call => {
                     let t = instr.near_branch_target();
-                    if t != 0 {
-                        *cg.direct_calls.entry(t).or_insert(0) += 1;
-                        let prior = &block_buf[..block_buf.len() - 1]; // exclude the CALL itself
-                        let cs = recover_call_site(pe, prior, t);
-                        cg.call_sites.push(cs);
+                    // `call $+5` (rel32 == 0, target == next_ip) is either a
+                    // genuine get-PC/fall-through or a load-time relocation
+                    // site (LE 08 self-relative fixup) whose on-disk field is
+                    // a zero placeholder. Prefer the fixup's runtime target
+                    // (operand sits at ip+1 for `E8 rel32`).
+                    let fixed = if t == instr.next_ip() {
+                        pe.fixup_rel32_target(instr.ip() + 1)
+                    } else {
+                        None
+                    };
+                    let dest = match fixed {
+                        Some(target) => Some(target),
+                        None if t != 0 && t != instr.next_ip() => Some(t),
+                        None => None,
+                    };
+                    if let Some(target) = dest {
+                        if target != 0 {
+                            *cg.direct_calls.entry(target).or_insert(0) += 1;
+                            let prior = &block_buf[..block_buf.len() - 1]; // exclude the CALL itself
+                            let cs = recover_call_site(pe, prior, target);
+                            cg.call_sites.push(cs);
+                        }
                     }
                     block_buf.clear(); // args after a call start fresh
                 }
