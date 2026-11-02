@@ -100,7 +100,7 @@ fn decode_all(pe: &Pe, entry: u64) -> (BTreeMap<u64, Instruction>, BTreeSet<u64>
                     // (for index-less Watcom dispatches) is deliberately
                     // scoped to call harvesting so CFG fingerprints stay
                     // byte-stable (see is_switch_dispatch there).
-                    follow_jump_table(&instr, pe, lo, hi, false, &mut cases);
+                    follow_jump_table(&instr, pe, lo, hi, false, true, &mut cases);
                     for c in cases {
                         leaders.insert(c);
                         work.push(c);
@@ -206,7 +206,7 @@ fn build_cfg(pe: &Pe, entry: u64) -> (BTreeMap<u64, Instruction>, Vec<Block>) {
                         // dispatch as a forward fan-out (no back-edge
                         // through a switch). SIB-only read (see above).
                         let mut cases = Vec::new();
-                        follow_jump_table(&instr, pe, lo, hi, false, &mut cases);
+                        follow_jump_table(&instr, pe, lo, hi, false, true, &mut cases);
                         for c in cases {
                             if (lo..hi).contains(&c) {
                                 succ.push(c);
@@ -348,9 +348,12 @@ pub fn cfg_fingerprint(pe: &Pe, entry: u64) -> Result<CfgFingerprint, String> {
             FlowControl::Return | FlowControl::Interrupt => fp.returns += 1,
             FlowControl::IndirectBranch => {
                 let mut cases = Vec::new();
-                // SIB-only read (see above): keeps switch_cases
-                // byte-stable for LE tables with pre-fixup entries.
-                follow_jump_table(&instr, pe, lo, hi, false, &mut cases);
+                // SIB-only read (see above). On LE the table base and its
+                // entries are pre-fixup; follow_jump_table translates both
+                // through Pe::fixup_post_image, so LE tables resolve here
+                // too (0.1.8). A resolved switch then requires the body to
+                // model it (CFG gate: switch_cases>=3 needs a match/if-chain).
+                follow_jump_table(&instr, pe, lo, hi, false, true, &mut cases);
                 fp.switch_cases += cases.len();
             }
             _ => {}

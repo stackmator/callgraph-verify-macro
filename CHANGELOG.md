@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-01
+
+### Added
+
+- `Pe::fixup_post_image(pre) -> Option<u64>`: the runtime (post-fixup) image
+  of a single link-time address, or `None` for PE and for pre values that are
+  not LE 07 fixup sites. Single-value counterpart of `fixup_post_images`.
+
+### Fixed
+
+- Jump-table harvesting on DOS4GW LE binaries. A switch table's base
+  (`jmp dword [idx*4+TABLE]`) and its 32-bit entries are stored as link-time
+  values that the loader relocates, so reading them raw made every entry look
+  out of the function span: `switch_cases` collapsed to 0 and a ported body
+  that spelled a hidden arm's `CALL` was reported HALLUCINATED (`E012`) - the
+  arm was never harvested. Both the table base and each entry are now
+  translated through `Pe::fixup_post_image` before the range check and the
+  page-map read. PE (no fixup tables) is byte-for-byte unchanged. Pinned by
+  the real Watcom LE fixture test
+  `dos_switch_table_entries_translate_pre_fixup` and the env-gated real-LE
+  sweep `real_le_jump_table_entries_translate_to_post_images`; the PE path
+  stays covered by `c_switch_case_calls_recovered`.
+- Hidden-arm calls are now ACCEPTANCE-ONLY. The demand analysis reads
+  tables untranslated (`MISSING` unchanged from 0.1.7); the translated
+  analysis feeds the acceptance set, so a body may spell an arm's `CALL`
+  without tripping `E012` and is never required to (`E013` unchanged).
+  This unblocks porting hidden arms with no regression on existing ports.
+
 ## [0.1.7] - 2026-11-01
 
 ### Changed

@@ -18,7 +18,7 @@ pub mod disasm;
 pub mod pe;
 pub mod skel;
 
-pub use disasm::{analyze, reg_params, resolve_thunk, tail_referenced, ArgKind, CallGraph, CallSite};
+pub use disasm::{analyze, analyze_opt, reg_params, resolve_thunk, tail_referenced, ArgKind, CallGraph, CallSite};
 pub use pe::{FixupStatus, Pe};
 pub use skel::{cfg_fingerprint, CfgFingerprint};
 
@@ -486,26 +486,36 @@ pub fn diff_body_calls_ext(
     let mut footprint = BTreeSet::new();
     let mut indirect = 0u32;
     let mut tail_targets: BTreeSet<u64> = BTreeSet::new();
+    // 0.1.8: LE jump-table arms are harvested for ACCEPTANCE only. The demand
+    // analysis reads tables untranslated (`analyze_opt(.., false)`), so arms
+    // never become MISSING demands; the wide analysis translates them, so a
+    // body that spells an arm's CALL is faithful (fixes the old E012).
+    let mut wide_calls: BTreeSet<u64> = BTreeSet::new();
+    let mut wide_tail: BTreeSet<u64> = BTreeSet::new();
     for &a in own_addrs {
-        let cg = analyze(pe, a)?;
-        bin_direct.extend(cg.call_targets());
-        bin_calls.extend(cg.call_targets());
+        let cg_d = analyze_opt(pe, a, false)?;
+        let cg_w = analyze_opt(pe, a, true)?;
+        bin_direct.extend(cg_d.call_targets());
+        bin_calls.extend(cg_d.call_targets());
         // A tail-call `JMP 0xADDR` out of the body is a real call edge (e.g. a
-        // cache-wrapper that tail-calls the base getter), so count it as a call —
+        // cache-wrapper that tail-calls the base getter), so count it as a call -
         // a faithful port spells it as an ordinary call.
-        bin_calls.extend(&cg.tail_calls);
-        tail_targets.extend(&cg.tail_calls);
+        bin_calls.extend(&cg_d.tail_calls);
+        tail_targets.extend(&cg_d.tail_calls);
+        wide_calls.extend(cg_w.call_targets());
+        wide_tail.extend(&cg_w.tail_calls);
         // Code-pointer immediates widen acceptance only (folded into
         // `bin_calls_wide` below, never into the MISSING requirement); staged here
         // so the walk stays single-pass.
         wide_extras.extend(
-            cg.imm_addrs
+            cg_w
+                .imm_addrs
                 .iter()
                 .copied()
                 .filter(|&x| pe.is_executable_section_va(x)),
         );
-        footprint.extend(cg.footprint());
-        indirect += cg.indirect_calls;
+        footprint.extend(cg_w.footprint());
+        indirect += cg_w.indirect_calls;
     }
     // Wide acceptance set: `bin_calls` plus, per function, its executable-section
     // code-pointer immediates and one level of each tail-callee's direct calls.
@@ -530,6 +540,8 @@ pub fn diff_body_calls_ext(
     // duplicate the tail target's body (previously misdiagnosed as E013 with an
     // unactionable "add the call" fix; the suggested call was already spelled).
     let mut bin_calls_wide = bin_calls.clone();
+    bin_calls_wide.extend(wide_calls);
+    bin_calls_wide.extend(wide_tail);
     bin_calls_wide.extend(wide_extras);
     // Declared indirect-call targets: a direct body call to one is faithful
     // (the binary reaches it through `call [reg+slot]`, not a direct CALL).

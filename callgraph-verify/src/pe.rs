@@ -203,6 +203,20 @@ impl Pe {
         out
     }
 
+    /// Runtime (post-fixup) image of a single link-time address, if that
+    /// address is an LE 07 fixup site. `None` for PE, for LE binaries with
+    /// no absolute fixups, and for pre values that are not fixup sites.
+    ///
+    /// Used by the jump-table reader: an LE table's base *and* its entries
+    /// are stored pre-fixup, so a displacement/entry must be translated to
+    /// its runtime VA before it can be range-checked or read through the
+    /// page map. Widening only: PE (and LE non-fixup values) are unchanged.
+    pub fn fixup_post_image(&self, pre: u64) -> Option<u64> {
+        self.fixup_posts
+            .iter()
+            .find_map(|&(p, post)| (p == pre).then_some(post))
+    }
+
     /// How many 07 absolute fixup records were absorbed at load (0 for PE
     /// and for LE binaries without absolute fixups). Diagnostic/test use.
     pub fn fixup_count(&self) -> usize {
@@ -969,6 +983,16 @@ mod tests {
         Spec::new(0x10000).globals(&[0x10500]).check(&pe).expect("post global");
         // An address referenced nowhere, pre or post: still rejected.
         assert!(Spec::new(0x10000).globals(&[0x10999]).check(&pe).is_err());
+    }
+
+    #[test]
+    fn le_fixup_post_image_single_lookup() {
+        let pe = Pe::parse(build_fixup_le()).expect("parse synthetic LE");
+        assert_eq!(pe.fixup_post_image(0x10400), Some(0x10500));
+        assert_eq!(pe.fixup_post_image(0x10410), Some(0x10600));
+        assert_eq!(pe.fixup_post_image(0x10420), Some(0x10600));
+        // Not a fixup site: no mapping (callers fall back to the raw value).
+        assert_eq!(pe.fixup_post_image(0x99999), None);
     }
 
     #[test]

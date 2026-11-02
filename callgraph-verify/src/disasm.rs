@@ -389,6 +389,15 @@ pub fn reg_params(pe: &Pe, addr: u64) -> (bool, bool) {
 
 /// Walk the function at `entry` and return its facts, sourced purely from bytes.
 pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
+    analyze_opt(pe, entry, true)
+}
+
+/// [`analyze`] with control over LE jump-table translation. With
+/// `translate_le = false` a table's pre-fixup base/entries are read raw
+/// (the pre-0.1.8 behaviour: LE arms are invisible). The gate uses both:
+/// the `false` set drives `MISSING` (no new demands), the `true` set drives
+/// acceptance (spelling an arm is faithful).
+pub fn analyze_opt(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph, String> {
     if !pe.is_executable_va(entry) {
         return Err(format!(
             "{entry:#010x} is not inside any PE section of this image\n{}",
@@ -582,7 +591,7 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
                     }
                     let unindexed_switch =
                         !has_index && base_written && is_switch_dispatch(&block_buf);
-                    follow_jump_table(&instr, pe, lo, hi, unindexed_switch, &mut cases);
+                    follow_jump_table(&instr, pe, lo, hi, unindexed_switch, translate_le, &mut cases);
                     // GCC -O0 switch lowering keeps the scale in a separate
                     // `shl`, adds the table base as an immediate, loads the
                     // entry, then jumps through a register:
@@ -599,10 +608,19 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
                         && instr.op_kind(0) == OpKind::Register
                         && is_switch_dispatch(&block_buf)
                     {
-                        if let Some(table) =
+                        if let Some(mut table) =
                             register_table_base(&block_buf, pe, instr.op_register(0))
                         {
-                            read_table_entries(pe, table, lo, hi, &mut cases);
+                            // LE bases are pre-fixup too; translate only when
+                            // the raw base is not already a valid section VA.
+                            if translate_le && table != 0 && pe.section_of(table).is_none() {
+                                if let Some(post) = pe.fixup_post_image(table) {
+                                    if pe.section_of(post).is_some() {
+                                        table = post;
+                                    }
+                                }
+                            }
+                            read_table_entries(pe, table, lo, hi, translate_le, &mut cases);
                         }
                     }
                     for c in &cases {
@@ -674,20 +692,34 @@ pub(crate) fn follow_jump_table(
     lo: u64,
     hi: u64,
     allow_unindexed: bool,
+    translate_le: bool,
     work: &mut Vec<u64>,
 ) {
     for i in 0..instr.op_count() {
         if instr.op_kind(i) != OpKind::Memory {
             continue;
         }
-        let disp = instr.memory_displacement64();
+        let mut disp = instr.memory_displacement64();
+        // LE stores the table base pre-fixup (e.g. `jmp [ecx*4+0x549A9]`);
+        // translate it to the runtime VA before the section check and the
+        // page-map read. A LE absolute operand is always a link-time value, so
+        // a fixup-site displacement is translated whenever its post image is a
+        // valid section VA (a `0` terminator/offset is excluded). PE has no
+        // fixup tables, so `fixup_post_image` is None and this is a no-op.
+        if translate_le && disp != 0 {
+            if let Some(post) = pe.fixup_post_image(disp) {
+                if pe.section_of(post).is_some() {
+                    disp = post;
+                }
+            }
+        }
         if instr.memory_index() == Register::None && !allow_unindexed {
             return;
         }
         if pe.section_of(disp).is_none() {
             return;
         }
-        read_table_entries(pe, disp, lo, hi, work);
+        read_table_entries(pe, disp, lo, hi, translate_le, work);
         return;
     }
 }
@@ -695,7 +727,7 @@ pub(crate) fn follow_jump_table(
 /// Read a u32 VA jump table at `table_va`, pushing entries while they point
 /// back into the function `[lo, hi)` (the terminator shared by every table
 /// shape: switch cases always target the function's own bodies).
-fn read_table_entries(pe: &Pe, table_va: u64, lo: u64, hi: u64, work: &mut Vec<u64>) {
+fn read_table_entries(pe: &Pe, table_va: u64, lo: u64, hi: u64, translate_le: bool, work: &mut Vec<u64>) {
     let mut k = 0u64;
     while k < 1024 {
         let Some(b) = pe.read(table_va + k * 4, 4) else {
@@ -704,7 +736,22 @@ fn read_table_entries(pe: &Pe, table_va: u64, lo: u64, hi: u64, work: &mut Vec<u
         if b.len() < 4 {
             break;
         }
-        let target = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64;
+        let raw = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64;
+        if raw == 0 {
+            break; // zero terminator (and pre=0 fixup sites are not cases)
+        }
+        // LE table entries are pre-fixup case addresses; translate each to
+        // its runtime VA *only* when the raw value is out of the function
+        // span and the post image is inside it. In-span entries (PE, or
+        // already-post values) pass through unchanged.
+        let mut target = raw;
+        if translate_le && !(lo..hi).contains(&target) {
+            if let Some(post) = pe.fixup_post_image(raw) {
+                if (lo..hi).contains(&post) {
+                    target = post;
+                }
+            }
+        }
         if !(lo..hi).contains(&target) {
             break; // first entry outside the function ends the table
         }

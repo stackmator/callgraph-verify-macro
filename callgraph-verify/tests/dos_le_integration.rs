@@ -267,6 +267,57 @@ fn dos_switch_table_resolves() {
     );
 }
 
+/// 0.1.8 regression: an LE switch table stores its **base and entries** as
+/// link-time values that the loader relocates, so `follow_jump_table` must
+/// translate both through `Pe::fixup_post_image`. Before that fix every
+/// entry read back as an out-of-span pre value, `switch_cases` collapsed
+/// to 0, and a body calling an arm was mis-reported HALLUCINATED (the
+/// arm's CALL was never harvested).
+///
+/// Precise and lowering-tolerant: only asserts when the fixture actually
+/// dispatches through an indirect jump (a table, not a compare chain), and
+/// then requires the table to resolve. Before the fix this fails on the
+/// real Watcom LE; the C/C++ PE fixtures cover the unchanged PE path
+/// (`c_switch_case_calls_recovered`).
+#[test]
+fn dos_switch_table_entries_translate_pre_fixup() {
+    let Some((_, pe)) = load_dos() else {
+        return;
+    };
+    if matches!(pe.fixup_status(), FixupStatus::Absent) {
+        eprintln!("DOS fixture has no 07 fixup tables; nothing to pin");
+        return;
+    }
+    let addrs = sweep_functions(&pe, 512);
+    let mut indirect = 0usize;
+    let mut resolved = 0usize;
+    for a in &addrs {
+        if let Ok(cg) = analyze(&pe, *a) {
+            if cg.indirect_jumps == 0 {
+                continue;
+            }
+            indirect += 1;
+            if let Ok(fp) = cfg_fingerprint(&pe, *a) {
+                if fp.switch_cases >= 1 {
+                    resolved += 1;
+                }
+            }
+        }
+    }
+    if indirect == 0 {
+        eprintln!(
+            "DOS fixture emitted no jump table (compare-chain lowering); \
+             nothing to pin"
+        );
+        return;
+    }
+    assert!(
+        resolved > 0,
+        "{indirect} LE indirect-jump dispatch(es) but none resolved a switch \
+         table - pre-fixup table base/entries not translated"
+    );
+}
+
 #[test]
 fn dos_decision_chain_has_many_conditionals() {
     let Some(_) = load_dos() else {
