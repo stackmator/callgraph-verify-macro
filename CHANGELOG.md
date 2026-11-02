@@ -348,3 +348,13 @@ Initial crates.io release.
 [0.1.2]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/stackmator/callgraph-verify-macro/releases/tag/v0.1.0
+## How to resolve a `call $+5` (rel32=0) target
+
+FALL.EXE has many call sites encoded as `e8 00 00 00 00` whose true target is supplied by an LE `08` self-relative fixup. `--asm`/`--skeleton` print the on-disk next-ip, not the resolved target, so a port can mislabel such a site as a "no-op". Dump the resolved map with the `dump_rel32` example:
+
+```
+cargo run -q -p callgraph-verify --example dump_rel32 -- <FALL.EXE> > rel32.txt
+rg "^0x4f2bb " rel32.txt      # output: <operand_va> <target_va>
+```
+
+`fixup_rel32_pairs()` yields `(loc, target)` with `loc` = the operand address = call instruction address + 1. Check this map before wiring any "call-next" TODO; several such sites resolve to real obj2 functions.
