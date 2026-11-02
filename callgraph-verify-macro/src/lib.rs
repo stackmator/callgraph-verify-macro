@@ -1172,6 +1172,14 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         let sp = e.span.unwrap_or_else(proc_macro2::Span::call_site);
         combined.extend(syn::Error::new(sp, e.render()).to_compile_error());
     }
+    if std::env::var("CG_TRACE").is_ok() {
+        if let Ok(mut f) = syn::parse2::<syn::ItemFn>(item2.clone()) {
+            let va = args.addr;
+            let stmt: syn::Stmt = syn::parse_quote! { crate::trace_hit(#va as u32); };
+            f.block.stmts.insert(0, stmt);
+            return quote! { #combined #f }.into();
+        }
+    }
     quote! { #combined #item2 }.into()
 }
 
