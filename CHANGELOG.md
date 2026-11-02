@@ -19,8 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `target-(operand+4)`, so the record target is the runtime destination of an
   on-disk `rel32=0` placeholder (`call $+5`, e.g. DOS4GW `int 2Fh` stubs).
 
+### Added
+
+- `--list`/`--count`/`--summary` follow direct-call and tail-call targets
+  into non-executable code objects. Object type flags are unreliable (a
+  read/write object can hold the main code and mix it with data), so a
+  reachability pass now enumerates such code instead of a linear sweep.
+
 ### Fixed
 
+- E006's branch-target scan runs over every non-executable section too, so a
+  function referenced only from a read/write code object is no longer
+  falsely `ORIGIN-UNREFERENCED` (widening the accept-set only).
 - `call $+5` (`rel32=0`, target == `next_ip`) is no longer recorded as a call
   to the next instruction. When an LE 08 self-relative fixup patches the
   operand, the fixup's runtime target is recorded instead; otherwise the
