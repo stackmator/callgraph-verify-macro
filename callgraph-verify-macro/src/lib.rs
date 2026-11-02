@@ -1144,6 +1144,14 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     if errors.is_empty() {
+        if std::env::var("CG_TRACE").is_ok() {
+            if let Ok(mut f) = syn::parse2::<syn::ItemFn>(item2.clone()) {
+                let va = args.addr;
+                let stmt: syn::Stmt = syn::parse_quote! { crate::trace_hit(#va as u32); };
+                f.block.stmts.insert(0, stmt);
+                return quote! { #f }.into();
+            }
+        }
         return quote! { #item2 }.into();
     }
 
