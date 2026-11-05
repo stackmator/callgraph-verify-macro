@@ -182,8 +182,10 @@ binaries never share results.
   - `02` selector records are skipped.
   - A record kind outside the proven grammar skips the tables loudly
     (`FixupStatus::Skipped` + `LE-FIXUP-SKIPPED` note); corruption stays fatal.
-  - Call-graph and CFG ground truth stays pre-fixup. Only data-address
-    acceptance widens to post images.
+  - Instruction bytes and CFG structure stay pre-fixup. Recorded LE-08
+    zero-placeholder `CALL rel32` sites resolve to runtime call targets for
+    call-edge verification; `--asm` preserves raw bytes and annotates the
+    resolved destination. Data-address acceptance also widens to post images.
 
 ### 5.2 Function walk (`analyze`)
 
@@ -630,7 +632,7 @@ These are deliberate, documented limits, not hidden bugs.
 | Symptom | First checks |
 |---|---|
 | `E012 HALLUCINATED` | Is the call real? Check `--asm` at the origin. Is the callee inlined (footprint subset)? Is it reached only via `call [reg]` → declare `indirect_targets`. Is it a vtable method → dispatch via the table. |
-| `E013 MISSING` | `--asm` for a direct `CALL`/tail `JMP`. Spell the call, reproduce the callee's work inline, or port the callee with an `#[origin]`. Self-recursion must be spelled. |
+| `E013 MISSING` | Check the direct `CALL`/tail `JMP` in `--asm`, including any `LE08 runtime target` annotation on a zero-displacement call. Spell the call, reproduce the callee's work inline, or port the callee with an `#[origin]`. Self-recursion must be spelled. |
 | `E008 CORPUS-GAP` | `REBUILD_ROOT` wrong/empty, or a file failed to parse (the message names the skipped files). |
 | `E006 ORIGIN-UNREFERENCED` | Verify the VA; if real but externally reached, use `unreferenced`. |
 | `E005 ORIGIN-OUTSIDE-SECTION` | Wrong image base or transposed address; `--summary`/`--list` shows the real layout. |
@@ -653,8 +655,10 @@ cargo run --bin callgraph_verify -- target.exe --json --max 50
 cargo run --bin callgraph_verify -- target.exe 0x401000 --declared 0x401050 --exact
 ```
 
-Always port from `--asm`. The skeleton is a coarse structural hint, not ground
-truth.
+Always port from `--asm`. The raw zero-displacement `CALL rel32` remains
+visible as `call $+5`; when an LE-08 fixup supplies its runtime destination,
+the instruction line appends that address. Use the opcode and annotation
+together. The skeleton is a coarse structural hint, not ground truth.
 
 ---
 

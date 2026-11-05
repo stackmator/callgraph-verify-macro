@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `callgraph_verify --asm` annotates zero-displacement LE-08 `CALL rel32`
+  placeholders with their runtime destinations. The byte dump remains raw;
+  the annotation explains call-graph edges that are not visible in the
+  pre-fixup operand bytes.
+
 ## [0.1.8] - 2026-11-01
 
 ### Added
@@ -350,7 +357,7 @@ Initial crates.io release.
 [0.1.0]: https://github.com/stackmator/callgraph-verify-macro/releases/tag/v0.1.0
 ## How to resolve a `call $+5` (rel32=0) target
 
-FALL.EXE has many call sites encoded as `e8 00 00 00 00` whose true target is supplied by an LE `08` self-relative fixup. `--asm`/`--skeleton` print the on-disk next-ip, not the resolved target, so a port can mislabel such a site as a "no-op". Dump the resolved map with the `dump_rel32` example:
+FALL.EXE has many call sites encoded as `e8 00 00 00 00` whose true target is supplied by an LE `08` self-relative fixup. `--skeleton` still prints the on-disk next-ip only. `--asm` now adds the runtime destination beside such a call while preserving the raw bytes. Dump the full resolved map with the `dump_rel32` example:
 
 ```
 cargo run -q -p callgraph-verify --example dump_rel32 -- <FALL.EXE> > rel32.txt

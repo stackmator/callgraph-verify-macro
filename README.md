@@ -152,9 +152,10 @@ Output includes:
 cargo run --bin callgraph_verify -- C:/path/to/target.exe 0x0076a420 --asm
 ```
 
-Raw iced-x86 dump of the verified bytes at the address — this is the
-ground truth. Always port from `--asm`; `--skeleton` below is a coarse
-structural hint only.
+Raw iced-x86 dump of the verified bytes at the address. A raw zero-displacement
+`CALL rel32` stays visible as `call $+5`; if an LE-08 fixup supplies its runtime
+target, the instruction line appends that target. Use both the raw opcode and
+annotation when porting; `--skeleton` below is a coarse structural hint only.
 
 ### Generate reference skeleton (NASM-flavored)
 
@@ -181,7 +182,7 @@ totals (functions, code bytes, direct calls).
 | Flag | Purpose |
 |------|---------|
 | `--skeleton` | Emit NASM-style reference skeleton |
-| `--asm` | Raw disassembly dump of the verified bytes (ground truth) |
+| `--asm` | Raw-byte disassembly; annotates LE-08 runtime call targets |
 | `--list [--max N]` | Enumerate functions with extent/call counts |
 | `--count` | Print the function total |
 | `--summary` | Print binary totals (functions, code bytes, calls) |

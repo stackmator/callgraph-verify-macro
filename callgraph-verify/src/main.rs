@@ -493,7 +493,9 @@ fn print_set(label: &str, set: &BTreeSet<u64>, small: bool) {
 /// Same recursive-descent traversal as `analyze` (conditional + in-range
 /// unconditional branches), so the dump shows exactly the bytes the gate
 /// verifies — ground truth for writing faithful bodies (operand sizes,
-/// globals widths, branch structure).
+/// globals widths, branch structure). LE rel32 fixup sites retain their raw
+/// operands here; annotate their runtime destinations so a `call $+5` is not
+/// mistaken for a fall-through when the loader patches it into a real call.
 fn print_asm(pe: &Pe, entry: u64) {
     use iced_x86::{Decoder, DecoderOptions, FlowControl, Formatter, NasmFormatter};
     use std::collections::{BTreeMap, BTreeSet};
@@ -551,10 +553,19 @@ fn print_asm(pe: &Pe, entry: u64) {
     for (ip, ins) in &instrs {
         out.clear();
         fmt.format(ins, &mut out);
+        let fixup_note = if ins.flow_control() == FlowControl::Call
+            && ins.near_branch_target() == ins.next_ip()
+        {
+            pe.fixup_rel32_target(ins.ip() + 1)
+                .map(|target| format!(" ; LE08 runtime target {target:#010x}"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let len = ins.len();
         let bytes = pe.read(*ip, len).unwrap_or(&[]);
         let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        println!("{ip:#010x}: {:<24} {out}", hex.join(" "));
+        println!("{ip:#010x}: {:<24} {out}{fixup_note}", hex.join(" "));
     }
     println!("; {} instructions, extent ~{} bytes", instrs.len(), instrs.keys().last().map(|l| l + 1 - entry).unwrap_or(0));
 }
