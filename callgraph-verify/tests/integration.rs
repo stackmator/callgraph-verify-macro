@@ -982,6 +982,37 @@ mod tests {
         );
     }
 
+    /// A DOS `INT 21h` with AH=4Ch terminates the process. Do not decode
+    /// adjacent function bytes after this exact service setup.
+    #[test]
+    fn test_int21_4c_terminates_decode() {
+        // MOV AX, 0x4C00                 ; 66 B8 00 4C
+        // INT 21h                        ; CD 21
+        // CALL entry+0x20                ; E8 15 00 00 00 (unreachable)
+        // RET
+        // <padding to 0x20>
+        // RET (adjacent function/call target)
+        let mut code = vec![
+            0x66, 0xB8, 0x00, 0x4C, // MOV AX, 0x4C00
+            0xCD, 0x21, // INT 21h
+            0xE8, 0x15, 0x00, 0x00, 0x00, // CALL entry+0x20
+            0xC3, // RET
+        ];
+        while code.len() < 0x20 {
+            code.push(0x90);
+        }
+        code.push(0xC3);
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let cg = analyze(&pe, entry).expect("analyze");
+        assert!(
+            cg.direct_calls.is_empty(),
+            "DOS AH=4Ch must stop the scan before the adjacent CALL: {:?}",
+            cg.direct_calls
+        );
+        assert_eq!(cg.max_end, entry + 6);
+    }
+
     /// Regression: `referenced_addrs` must index `JMP short rel8` (0xEB)
     /// targets. The scan only recognized CALL/JMP rel32 and Jcc rel32, so a
     /// function reached solely via short jump (real instance: an LE binary at
