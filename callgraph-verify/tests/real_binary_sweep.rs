@@ -90,9 +90,7 @@ fn real_binary_sweeps_agree_and_diff_clean() {
             }
         }
     }
-    eprintln!(
-        "{exe}: swept {fns} entries ({checked_callers} referenced), {calls} direct calls"
-    );
+    eprintln!("{exe}: swept {fns} entries ({checked_callers} referenced), {calls} direct calls");
     assert!(fns > 0, "no analyzable functions in {exe}");
     assert!(
         disagreements.is_empty(),
@@ -237,4 +235,3 @@ fn real_le_jump_table_entries_translate_to_post_images() {
          - pre-fixup table translation regressed"
     );
 }
-

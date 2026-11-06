@@ -51,7 +51,9 @@ struct Asm {
 
 impl Asm {
     fn new() -> Self {
-        Self { buf: vec![0; 0x600] }
+        Self {
+            buf: vec![0; 0x600],
+        }
     }
     fn bytes_at(&mut self, off: usize, b: &[u8]) {
         self.buf[off..off + b.len()].copy_from_slice(b);
@@ -118,7 +120,7 @@ fn image_no_index_table() -> Vec<u8> {
     a.bytes_at(0x06, &[0x83, 0xF8, 0x02]);
     a.emit_ja(0x09, 0x401000 + 0x29); // -> DEFAULT
     a.bytes_at(0x0B, &[0xC1, 0xE0, 0x02]); // shl eax,2
-                                          // jmp dword [eax+0x401040]: no SIB index.
+                                           // jmp dword [eax+0x401040]: no SIB index.
     a.bytes_at(0x0E, &[0xFF, 0xA0, 0x40, 0x10, 0x40, 0x00]);
     // case bodies (contiguous, each ends with jmp OUT).
     let t0 = 0x100u32;
@@ -162,19 +164,16 @@ fn image_sib_table() -> Vec<u8> {
     a.bytes_at(B + 0x03, &[0x8B, 0x45, 0x08]);
     a.bytes_at(B + 0x06, &[0x83, 0xF8, 0x01]);
     a.emit_ja(B + 0x09, 0x401000 + (B + 0x1F) as u32); // -> DEFAULT
-    // jmp dword [eax*4+TABLE]: FF /4, mod=00 rm=100 (SIB follows),
-    // SIB scale=2 index=eax base=101 (disp32-only, no base). 7 bytes.
-    a.bytes_at(
-        B + 0x0B,
-        &[0xFF, 0x24, 0x85, 0x40, 0x14, 0x40, 0x00],
-    );
+                                                       // jmp dword [eax*4+TABLE]: FF /4, mod=00 rm=100 (SIB follows),
+                                                       // SIB scale=2 index=eax base=101 (disp32-only, no base). 7 bytes.
+    a.bytes_at(B + 0x0B, &[0xFF, 0x24, 0x85, 0x40, 0x14, 0x40, 0x00]);
     // caseB0.
     a.emit_call(B + 0x12, 0x401500); // -> t3
     a.emit_jmp8(B + 0x17, 0x401000 + (B + 0x24) as u32); // -> OUT
-    // caseB1.
+                                                         // caseB1.
     a.emit_call(B + 0x19, 0x401510); // -> t4
     a.emit_jmp8(B + 0x1E, 0x401000 + (B + 0x24) as u32); // -> OUT
-    // DEFAULT @B+0x1F: mov eax,-1 (falls into OUT).
+                                                         // DEFAULT @B+0x1F: mov eax,-1 (falls into OUT).
     a.bytes_at(B + 0x1F, &[0xB8, 0xFF, 0xFF, 0xFF, 0xFF]);
     // OUT @B+0x24.
     a.bytes_at(B + 0x24, &[0xC3]);
@@ -246,14 +245,14 @@ fn image_register_table() -> Vec<u8> {
     a.emit_ja(B + 0x0C, 0x401000 + (B + 0x35) as u32); // -> DEFAULT
     a.bytes_at(B + 0x0E, &[0x8B, 0x45, 0x08]); // mov eax,[ebp+8]
     a.bytes_at(B + 0x11, &[0xC1, 0xE0, 0x02]); // shl eax,2
-    // add eax,TABLE_va (05 imm32).
+                                               // add eax,TABLE_va (05 imm32).
     let table_va = 0x401000 + TABLE as u32;
     let mut add = vec![0x05u8];
     add.extend_from_slice(&table_va.to_le_bytes());
     a.bytes_at(B + 0x14, &add);
     a.bytes_at(B + 0x19, &[0x8B, 0x00]); // mov eax,[eax]
     a.bytes_at(B + 0x1B, &[0xFF, 0xE0]); // jmp eax
-    // case bodies (first tiles the fallthrough, like GCC -O0).
+                                         // case bodies (first tiles the fallthrough, like GCC -O0).
     let t0 = 0x3A0u32;
     let t1 = 0x3B0u32;
     let t2 = 0x3C0u32;

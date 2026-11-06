@@ -21,7 +21,11 @@
 
 use crate::pe::Pe;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, OnceLock};
+
+type AnalyzeCacheKey = (u64, u64, bool);
+type AnalyzeCache = Mutex<HashMap<AnalyzeCacheKey, Arc<Result<CallGraph, String>>>>;
 
 /// Upper bound on how far past the entry we follow control flow. Real-world
 /// largest functions are a few KB; 64 KB stops a mis-decoded `JMP` from walking
@@ -59,7 +63,7 @@ pub struct CallSite {
     pub stack: Vec<ArgKind>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CallGraph {
     pub entry: u64,
     /// Direct `CALL` targets → number of call sites hitting that target.
@@ -135,9 +139,7 @@ fn scan_operands(pe: &Pe, instr: &Instruction, cg: &mut CallGraph) {
                     if pe.section_of(disp).is_some() && instr.mnemonic() != Mnemonic::Lea {
                         cg.globals.insert(disp);
                     }
-                } else if pe.section_of(disp).is_some()
-                    && instr.mnemonic() != Mnemonic::Lea
-                {
+                } else if pe.section_of(disp).is_some() && instr.mnemonic() != Mnemonic::Lea {
                     // Indexed `[base + index*scale + disp]` (or `[reg+disp]`)
                     // off a large in-image displacement — a table base, not a
                     // struct field (e.g. `[eax*4+0x18F01]` in a real LE binary). Record it
@@ -398,6 +400,36 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
 /// the `false` set drives `MISSING` (no new demands), the `true` set drives
 /// acceptance (spelling an arm is faithful).
 pub fn analyze_opt(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph, String> {
+    // The macro asks for the same entry through several checks (call diff,
+    // operand facts, tail-call expansion, and inlining detection). Keep the
+    // decoded result per loaded image and mode so those consumers share the
+    // expensive recursive-descent walk. Pe IDs are assigned at parse time,
+    // so same-layout binaries with different bytes cannot alias.
+    static CACHE: OnceLock<AnalyzeCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (pe.id(), entry, translate_le);
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return (*cached).clone();
+    }
+
+    let result = analyze_uncached(pe, entry, translate_le);
+    let mut entries = cache.lock().unwrap_or_else(|e| e.into_inner());
+    // This is a process-local build cache, not a general purpose disassembly
+    // database. Bound it for long-lived library users that analyze many
+    // unrelated images/functions.
+    if entries.len() >= 8192 {
+        entries.clear();
+    }
+    entries.insert(key, Arc::new(result.clone()));
+    result
+}
+
+fn analyze_uncached(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph, String> {
     if !pe.is_executable_va(entry) {
         return Err(format!(
             "{entry:#010x} is not inside any PE section of this image\n{}",
@@ -608,7 +640,15 @@ pub fn analyze_opt(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph,
                     }
                     let unindexed_switch =
                         !has_index && base_written && is_switch_dispatch(&block_buf);
-                    follow_jump_table(&instr, pe, lo, hi, unindexed_switch, translate_le, &mut cases);
+                    follow_jump_table(
+                        &instr,
+                        pe,
+                        lo,
+                        hi,
+                        unindexed_switch,
+                        translate_le,
+                        &mut cases,
+                    );
                     // GCC -O0 switch lowering keeps the scale in a separate
                     // `shl`, adds the table base as an immediate, loads the
                     // entry, then jumps through a register:
@@ -760,7 +800,14 @@ pub(crate) fn follow_jump_table(
 /// Read a u32 VA jump table at `table_va`, pushing entries while they point
 /// back into the function `[lo, hi)` (the terminator shared by every table
 /// shape: switch cases always target the function's own bodies).
-fn read_table_entries(pe: &Pe, table_va: u64, lo: u64, hi: u64, translate_le: bool, work: &mut Vec<u64>) {
+fn read_table_entries(
+    pe: &Pe,
+    table_va: u64,
+    lo: u64,
+    hi: u64,
+    translate_le: bool,
+    work: &mut Vec<u64>,
+) {
     let mut k = 0u64;
     while k < 1024 {
         let Some(b) = pe.read(table_va + k * 4, 4) else {
@@ -845,20 +892,20 @@ fn register_table_base(block: &[Instruction], pe: &Pe, jump_reg: Register) -> Op
                     return Some(b.memory_displacement64());
                 }
             }
-            Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx => {
-                if b.op0_kind() == OpKind::Register && b.op0_register() == base {
-                    for i in 0..b.op_count() {
-                        if matches!(
-                            b.op_kind(i),
-                            OpKind::Immediate8
-                                | OpKind::Immediate8to16
-                                | OpKind::Immediate8to32
-                                | OpKind::Immediate16
-                                | OpKind::Immediate32
-                        ) && pe.section_of(b.immediate(i)).is_some()
-                        {
-                            return Some(b.immediate(i));
-                        }
+            Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx
+                if b.op0_kind() == OpKind::Register && b.op0_register() == base =>
+            {
+                for i in 0..b.op_count() {
+                    if matches!(
+                        b.op_kind(i),
+                        OpKind::Immediate8
+                            | OpKind::Immediate8to16
+                            | OpKind::Immediate8to32
+                            | OpKind::Immediate16
+                            | OpKind::Immediate32
+                    ) && pe.section_of(b.immediate(i)).is_some()
+                    {
+                        return Some(b.immediate(i));
                     }
                 }
             }

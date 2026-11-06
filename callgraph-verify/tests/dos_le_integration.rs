@@ -100,7 +100,8 @@ fn dos_le_parses_with_code_sections() {
     // LE images are identity-mapped: parse_le synthesizes image_base 0 with
     // object reloc bases as RVAs (a PE would carry 0x400000-style base).
     assert_eq!(
-        pe.image_base, 0,
+        pe.image_base,
+        0,
         "{}: expected LE identity base 0, got {:#x}",
         exe.display(),
         pe.image_base
@@ -420,9 +421,11 @@ fn dos_fixup_post_images_accepted() {
                 continue;
             }
             for post in pe.fixup_post_images(pres) {
-                declare(Spec::new(*a), &[post]).check(&pe).unwrap_or_else(|e| {
-                    panic!("post-fixup image {post:#x} of {a:#x} must be accepted: {e}")
-                });
+                declare(Spec::new(*a), &[post])
+                    .check(&pe)
+                    .unwrap_or_else(|e| {
+                        panic!("post-fixup image {post:#x} of {a:#x} must be accepted: {e}")
+                    });
                 validated += 1;
             }
             // Pre-fixup behavior is unchanged: the pre value passes, garbage fails.
@@ -536,4 +539,3 @@ fn dos_referenced_addrs_include_fixup_post_images() {
         eprintln!("verified {checked} pre->post references on the real DOS LE fixture");
     }
 }
-

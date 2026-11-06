@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- Cache per-image, per-address disassembly and CFG fingerprints so repeated
+  verifier checks reuse the same analysis results within a compiler process.
+
 ## [0.1.8] - 2026-11-05
 
 ### Added

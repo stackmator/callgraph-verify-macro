@@ -14,6 +14,7 @@ use iced_x86::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::sync::{Mutex, OnceLock};
 
 const MAX_SPAN: u64 = 0x10000;
 
@@ -303,6 +304,29 @@ fn dominators(entry: u64, blocks: &[Block]) -> BTreeMap<u64, BTreeSet<u64>> {
 /// across optimization (loops, jump-table switches) plus raw conditional/return counts; the caller
 /// should compare these tolerantly (optimized CFGs do not map 1:1 to source).
 pub fn cfg_fingerprint(pe: &Pe, entry: u64) -> Result<CfgFingerprint, String> {
+    type Key = (u64, u64);
+    static CACHE: OnceLock<Mutex<BTreeMap<Key, Result<CfgFingerprint, String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let key = (pe.id(), entry);
+    if let Some(result) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return result;
+    }
+
+    let result = cfg_fingerprint_uncached(pe, entry);
+    let mut entries = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if entries.len() >= 8192 {
+        entries.clear();
+    }
+    entries.insert(key, result.clone());
+    result
+}
+
+fn cfg_fingerprint_uncached(pe: &Pe, entry: u64) -> Result<CfgFingerprint, String> {
     if !pe.is_executable_va(entry) {
         return Err(format!(
             "{entry:#010x} is not inside any PE section\n{}",

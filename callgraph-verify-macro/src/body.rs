@@ -778,27 +778,48 @@ mod tests {
 
     #[test]
     fn eq_binops_count_as_eq() {
-        assert_eq!(conds_of("fn f(q: u32) -> u32 { if q == 1 { 1 } else { 2 } }"), (1, 0, 0));
-        assert_eq!(conds_of("fn f(q: u32) -> bool { q != 0 && q != 1 }"), (2, 0, 1));
+        assert_eq!(
+            conds_of("fn f(q: u32) -> u32 { if q == 1 { 1 } else { 2 } }"),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            conds_of("fn f(q: u32) -> bool { q != 0 && q != 1 }"),
+            (2, 0, 1)
+        );
     }
 
     #[test]
     fn rel_binops_count_as_rel() {
-        assert_eq!(conds_of("fn f(q: u32) -> u32 { if q > 100 { 1 } else { 2 } }"), (0, 1, 0));
-        assert_eq!(conds_of("fn f(q: u32) -> u32 { if q >= 1 && q <= 9 { 1 } else { 2 } }"), (0, 2, 1));
+        assert_eq!(
+            conds_of("fn f(q: u32) -> u32 { if q > 100 { 1 } else { 2 } }"),
+            (0, 1, 0)
+        );
+        assert_eq!(
+            conds_of("fn f(q: u32) -> u32 { if q >= 1 && q <= 9 { 1 } else { 2 } }"),
+            (0, 2, 1)
+        );
     }
 
     #[test]
     fn bare_flag_test_counts_as_eq() {
         // A bare `if x` lowers to test+je — same class as ==.
-        assert_eq!(conds_of("fn f(x: bool) -> u32 { if x { 1 } else { 2 } }"), (1, 0, 0));
-        assert_eq!(conds_of("fn f(x: bool) -> u32 { if !x { 1 } else { 2 } }"), (1, 0, 0));
+        assert_eq!(
+            conds_of("fn f(x: bool) -> u32 { if x { 1 } else { 2 } }"),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            conds_of("fn f(x: bool) -> u32 { if !x { 1 } else { 2 } }"),
+            (1, 0, 0)
+        );
     }
 
     #[test]
     fn call_condition_counts_nothing() {
         // `if ready(x)` is a different function's branch.
-        assert_eq!(conds_of("fn f(q: u32) -> u32 { if ready(q) { 1 } else { 2 } }"), (0, 0, 0));
+        assert_eq!(
+            conds_of("fn f(q: u32) -> u32 { if ready(q) { 1 } else { 2 } }"),
+            (0, 0, 0)
+        );
     }
 
     #[test]
@@ -815,17 +836,26 @@ mod tests {
 
     #[test]
     fn for_loop_counts_as_rel() {
-        assert_eq!(conds_of("fn f(n: u32) -> u32 { let mut s = 0; for i in 0..n { s += i; } s }"), (0, 1, 0));
+        assert_eq!(
+            conds_of("fn f(n: u32) -> u32 { let mut s = 0; for i in 0..n { s += i; } s }"),
+            (0, 1, 0)
+        );
     }
 
     #[test]
     fn if_let_counts_as_eq() {
-        assert_eq!(conds_of("fn f(q: Option<u32>) -> u32 { if let Some(v) = q { v } else { 0 } }"), (1, 0, 0));
+        assert_eq!(
+            conds_of("fn f(q: Option<u32>) -> u32 { if let Some(v) = q { v } else { 0 } }"),
+            (1, 0, 0)
+        );
     }
 
     #[test]
     fn matches_macro_counts_as_eq() {
-        assert_eq!(conds_of("fn f(q: u32) -> bool { matches!(q, 1 | 2) }"), (1, 0, 0));
+        assert_eq!(
+            conds_of("fn f(q: u32) -> bool { matches!(q, 1 | 2) }"),
+            (1, 0, 0)
+        );
     }
 
     /// Unbound paths stay `Other` (skipped by the ARG-SHAPE diff): without

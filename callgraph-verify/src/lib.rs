@@ -18,7 +18,9 @@ pub mod disasm;
 pub mod pe;
 pub mod skel;
 
-pub use disasm::{analyze, analyze_opt, reg_params, resolve_thunk, tail_referenced, ArgKind, CallGraph, CallSite};
+pub use disasm::{
+    analyze, analyze_opt, reg_params, resolve_thunk, tail_referenced, ArgKind, CallGraph, CallSite,
+};
 pub use pe::{FixupStatus, Pe};
 pub use skel::{cfg_fingerprint, CfgFingerprint};
 
@@ -288,12 +290,16 @@ impl Spec {
         // Data addresses accept their runtime (post-fixup) images too: DOS4GW
         // applies the LE fixup tables at load, so a declared post-fixup value
         // of a referenced pre-fixup address is faithful, not invented.
-        let post = pe.fixup_post_images(
-            &cg.globals.union(&cg.imm_addrs).copied().collect(),
-        );
+        let post = pe.fixup_post_images(&cg.globals.union(&cg.imm_addrs).copied().collect());
         present_check("field offset", &self.fields, &cg.field_offsets, &mut v);
         present_check_fixup("global", &self.globals, &cg.globals, &post, &mut v);
-        present_check_fixup("vtable/imm addr", &self.vtables, &cg.imm_addrs, &post, &mut v);
+        present_check_fixup(
+            "vtable/imm addr",
+            &self.vtables,
+            &cg.imm_addrs,
+            &post,
+            &mut v,
+        );
         present_check("vcall slot", &self.vcall_slots, &cg.vcall_slots, &mut v);
         for t in &self.indirect_targets {
             if !pe.is_executable_section_va(*t) {
@@ -508,8 +514,7 @@ pub fn diff_body_calls_ext(
         // `bin_calls_wide` below, never into the MISSING requirement); staged here
         // so the walk stays single-pass.
         wide_extras.extend(
-            cg_w
-                .imm_addrs
+            cg_w.imm_addrs
                 .iter()
                 .copied()
                 .filter(|&x| pe.is_executable_section_va(x)),
@@ -616,11 +621,7 @@ pub fn diff_body_calls_ext(
     // is a MISSING. Only DIRECT calls count — a self tail-JMP is a loop,
     // covered by the CFG gate (a `loop {}` port is faithful there).
     for o in &own {
-        if bin_direct.contains(o)
-            && !rust_idents
-                .iter()
-                .any(|(_, addrs)| addrs.contains(o))
-        {
+        if bin_direct.contains(o) && !rust_idents.iter().any(|(_, addrs)| addrs.contains(o)) {
             missing.push(*o);
         }
     }

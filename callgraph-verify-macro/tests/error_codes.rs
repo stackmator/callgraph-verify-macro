@@ -91,8 +91,7 @@ fn build_synthetic_pe() -> Vec<u8> {
     data[rdata_sec_off + 16..rdata_sec_off + 20].copy_from_slice(&rdata_raw.to_le_bytes());
     // .rdata raw data starts at file offset text_raw * 2 (right after .text's
     // 0x200-byte block).
-    data[rdata_sec_off + 20..rdata_sec_off + 24]
-        .copy_from_slice(&(text_raw * 2).to_le_bytes());
+    data[rdata_sec_off + 20..rdata_sec_off + 24].copy_from_slice(&(text_raw * 2).to_le_bytes());
 
     // .text layout (file offset = text_raw = 0x200):
     //   [0]:   6A 20              PUSH 0x20        ; staged arg kind = Imm(0x20)
@@ -115,8 +114,7 @@ fn build_synthetic_pe() -> Vec<u8> {
     let text_file_off = text_raw as usize;
     data[text_file_off] = 0x6A; // PUSH imm8
     data[text_file_off + 1] = 0x20; // 0x20
-    data[text_file_off + 2..text_file_off + 7]
-        .copy_from_slice(&[0xE8, 0xF9, 0x0F, 0x00, 0x00]);
+    data[text_file_off + 2..text_file_off + 7].copy_from_slice(&[0xE8, 0xF9, 0x0F, 0x00, 0x00]);
     // JE -2 (rel8 = 0xFE): 0x401007 → 0x401005 (back-edge #1)
     data[text_file_off + 7] = 0x74;
     data[text_file_off + 8] = 0xFE;
@@ -125,8 +123,7 @@ fn build_synthetic_pe() -> Vec<u8> {
     // 0x401005 because that address is reached as the JE target)
     data[text_file_off + 9] = 0xEB;
     data[text_file_off + 0xA] = 0xFE;
-    data[text_file_off + 0xB..text_file_off + 0xF]
-        .copy_from_slice(&0x00401000u32.to_le_bytes());
+    data[text_file_off + 0xB..text_file_off + 0xF].copy_from_slice(&0x00401000u32.to_le_bytes());
 
     // Vtable slot 0 → 0x00403000 (little-endian). .rdata raw data starts at
     // file offset text_raw * 2.
@@ -143,8 +140,7 @@ fn build_synthetic_pe() -> Vec<u8> {
     data[rdata2_sec_off + 12..rdata2_sec_off + 16].copy_from_slice(&rdata2_va.to_le_bytes());
     data[rdata2_sec_off + 16..rdata2_sec_off + 20].copy_from_slice(&rdata_raw.to_le_bytes());
     // .rdata.dup raw data starts at file offset text_raw * 3.
-    data[rdata2_sec_off + 20..rdata2_sec_off + 24]
-        .copy_from_slice(&(text_raw * 3).to_le_bytes());
+    data[rdata2_sec_off + 20..rdata2_sec_off + 24].copy_from_slice(&(text_raw * 3).to_le_bytes());
     let rdata2_file_off = (text_raw * 3) as usize;
     data[rdata2_file_off..rdata2_file_off + 4].copy_from_slice(&0x00402000u32.to_le_bytes());
 

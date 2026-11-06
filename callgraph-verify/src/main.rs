@@ -20,8 +20,9 @@ use std::collections::BTreeSet;
 
 fn parse_addr(s: &str) -> Result<u64, String> {
     let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    u64::from_str_radix(s, 16)
-        .map_err(|e| format!("bad address {s:?}: {e} — expected hex like \"0x401000\" or \"401000\""))
+    u64::from_str_radix(s, 16).map_err(|e| {
+        format!("bad address {s:?}: {e} — expected hex like \"0x401000\" or \"401000\"")
+    })
 }
 
 #[derive(Default)]
@@ -306,15 +307,11 @@ fn main() {
                 let more = cg
                     .decode_errors
                     .saturating_sub(cg.decode_error_samples.len() as u32);
-                println!(
-                    "  decode stops (padding/data/end):   {}",
-                    cg.decode_errors
-                );
+                println!("  decode stops (padding/data/end):   {}", cg.decode_errors);
                 if !cg.decode_error_samples.is_empty() {
                     println!("    first {}:", cg.decode_error_samples.len());
                     for (ip, bytes) in &cg.decode_error_samples {
-                        let hex: Vec<String> =
-                            bytes.iter().map(|b| format!("{b:02x}")).collect();
+                        let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
                         println!("      {ip:#010x}: {}", hex.join(" "));
                     }
                     if more > 0 {
@@ -352,7 +349,9 @@ fn parse_max(base: usize, args: &[String], max: &mut u32) {
                 i += 1;
                 if let Some(v) = args.get(i) {
                     *max = v.parse().unwrap_or_else(|_| {
-                        fatal(&format!("argv[{pos}] = --max: {v:?} is not a u32 (need 0..=4294967295)"))
+                        fatal(&format!(
+                            "argv[{pos}] = --max: {v:?} is not a u32 (need 0..=4294967295)"
+                        ))
                     });
                 } else {
                     fatal(&format!("argv[{pos}] = --max: missing value"));
@@ -539,9 +538,7 @@ fn print_asm(pe: &Pe, entry: u64) {
                     }
                     break;
                 }
-                FlowControl::IndirectBranch | FlowControl::Return => {
-                    break
-                }
+                FlowControl::IndirectBranch | FlowControl::Return => break,
                 // `int n` returns normally (DOS/DPMI API call) — keep
                 // decoding the fallthrough (see disasm.rs note).
                 _ => {}
@@ -567,7 +564,11 @@ fn print_asm(pe: &Pe, entry: u64) {
         let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
         println!("{ip:#010x}: {:<24} {out}{fixup_note}", hex.join(" "));
     }
-    println!("; {} instructions, extent ~{} bytes", instrs.len(), instrs.keys().last().map(|l| l + 1 - entry).unwrap_or(0));
+    println!(
+        "; {} instructions, extent ~{} bytes",
+        instrs.len(),
+        instrs.keys().last().map(|l| l + 1 - entry).unwrap_or(0)
+    );
 }
 
 fn fatal(msg: &str) -> ! {

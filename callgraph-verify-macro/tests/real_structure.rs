@@ -24,8 +24,7 @@ fn fixtures_dir() -> PathBuf {
 
 fn parse_manifest(json: &Path) -> (BTreeMap<String, u64>, String) {
     let text = std::fs::read_to_string(json).expect("read od addrs manifest");
-    let v: serde_json::Value =
-        serde_json::from_str(&text).expect("parse od addrs manifest");
+    let v: serde_json::Value = serde_json::from_str(&text).expect("parse od addrs manifest");
     let toolchain = v
         .get("toolchain")
         .and_then(|t| t.as_str())
@@ -37,9 +36,9 @@ fn parse_manifest(json: &Path) -> (BTreeMap<String, u64>, String) {
         .unwrap_or_else(|| panic!("manifest {} has no symbols map", json.display()));
     let mut addrs = BTreeMap::new();
     for (k, val) in raw {
-        let s = val.as_str().unwrap_or_else(|| {
-            panic!("bad VA {val:?} for {k} in {}", json.display())
-        });
+        let s = val
+            .as_str()
+            .unwrap_or_else(|| panic!("bad VA {val:?} for {k} in {}", json.display()));
         let n = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
             u64::from_str_radix(h, 16)
         } else {
@@ -52,7 +51,9 @@ fn parse_manifest(json: &Path) -> (BTreeMap<String, u64>, String) {
 }
 
 fn va(addrs: &BTreeMap<String, u64>, name: &str) -> u64 {
-    *addrs.get(name).unwrap_or_else(|| panic!("od manifest has no {name}"))
+    *addrs
+        .get(name)
+        .unwrap_or_else(|| panic!("od manifest has no {name}"))
 }
 
 /// Generate the corpus + fixtures + expected `.stderr`s from the live Od
@@ -92,7 +93,10 @@ fn setup(manifest_dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let dc = va(&addrs, "decision_chain");
     let rs = va(&addrs, "recurse_sum");
 
-    let dir = manifest_dir.join("tests").join("testdata").join("real_structure");
+    let dir = manifest_dir
+        .join("tests")
+        .join("testdata")
+        .join("real_structure");
     let corpus_dir = dir.join("corpus");
     std::fs::create_dir_all(&corpus_dir).expect("create real_structure corpus");
     std::fs::write(

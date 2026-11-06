@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
     use callgraph_verify::{
-        analyze, cfg_fingerprint, diff_body_calls, diff_body_calls_ext,
-        has_direct_branch_target, reg_params, tail_referenced, ArgKind, Pe, Spec,
+        analyze, cfg_fingerprint, diff_body_calls, diff_body_calls_ext, has_direct_branch_target,
+        reg_params, tail_referenced, ArgKind, Pe, Spec,
     };
     use std::process::Command;
 
@@ -2061,8 +2061,8 @@ mod tests {
             return;
         };
         let pe = Pe::load(pe_path.to_str().unwrap()).expect("load local sample PE");
-        let fp = cfg_fingerprint(&pe, 0x0071FF54)
-            .expect("cfg_fingerprint at 0x0071FF54 (state helper)");
+        let fp =
+            cfg_fingerprint(&pe, 0x0071FF54).expect("cfg_fingerprint at 0x0071FF54 (state helper)");
         assert_eq!(
             fp.loops, 2,
             "state helper (0x0071FF54) has 2 real back-edges — a \
@@ -2203,7 +2203,8 @@ mod tests {
     /// behaviour so a future "strict-less-than" → "strict-less-or-equal"
     /// drift doesn't change the count.
     #[test]
-    fn cfg_fingerprint_self_loop_jmp_thunk_is_one_loop() {        // 0x1000: EB FE   JMP 0x1000 (self-loop)
+    fn cfg_fingerprint_self_loop_jmp_thunk_is_one_loop() {
+        // 0x1000: EB FE   JMP 0x1000 (self-loop)
         let code = [0xEB, 0xFE, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90];
         let pe = pe_with_code(&code);
         let entry = pe.image_base + 0x1000;

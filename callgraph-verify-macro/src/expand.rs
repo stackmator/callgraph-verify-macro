@@ -93,10 +93,7 @@ pub fn parse_macro_rules(mac: &syn::ItemMacro, _defined_in: &str) -> Option<(Str
     if arms.is_empty() {
         return None;
     }
-    Some((
-        name,
-        MacroDef { arms },
-    ))
+    Some((name, MacroDef { arms }))
 }
 
 fn path_is_macro_rules(path: &syn::Path) -> bool {
@@ -286,10 +283,7 @@ pub fn expand_and_collect(
 }
 /// Expand all unambiguous local `macro_rules!` invocations in `ts`,
 /// running to a fixpoint (bounded by [`MAX_EXPAND_PASSES`]).
-pub fn expand_block_tokens(
-    ts: TokenStream,
-    defs: &HashMap<String, Vec<MacroDef>>,
-) -> TokenStream {
+pub fn expand_block_tokens(ts: TokenStream, defs: &HashMap<String, Vec<MacroDef>>) -> TokenStream {
     let mut cur = ts;
     for _ in 0..MAX_EXPAND_PASSES {
         let (next, changed) = expand_once(cur.clone(), defs);
@@ -304,10 +298,7 @@ pub fn expand_block_tokens(
 /// One expansion pass. Returns the rewritten stream plus whether anything
 /// changed. Invocation shape is the token triple
 /// `Ident(name) ! Group(args)`; `macro_rules!` itself is never expanded.
-fn expand_once(
-    ts: TokenStream,
-    defs: &HashMap<String, Vec<MacroDef>>,
-) -> (TokenStream, bool) {
+fn expand_once(ts: TokenStream, defs: &HashMap<String, Vec<MacroDef>>) -> (TokenStream, bool) {
     let toks: Vec<TokenTree> = ts.into_iter().collect();
     let mut out: Vec<TokenTree> = Vec::with_capacity(toks.len());
     let mut changed = false;
@@ -447,7 +438,10 @@ mod tests {
         let item: syn::Item = syn::parse_str(src).expect("parse macro_rules item");
         let m = match item {
             syn::Item::Macro(m) => m,
-            other => panic!("expected Item::Macro, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Item::Macro, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         };
         parse_macro_rules(&m, "test.rs").expect("def must parse")
     }
@@ -482,9 +476,8 @@ mod tests {
 
     #[test]
     fn optional_trailing_comma_idiom_accepted() {
-        let (_, def) = def_of(
-            "macro_rules! rd { ($p:expr, $off:expr $(,)?) => {{ rd32($p, $off) }}; }",
-        );
+        let (_, def) =
+            def_of("macro_rules! rd { ($p:expr, $off:expr $(,)?) => {{ rd32($p, $off) }}; }");
         assert_eq!(def.arms.len(), 1);
         assert_eq!(def.arms[0].params, vec!["p".to_string(), "off".to_string()]);
     }
@@ -493,7 +486,11 @@ mod tests {
     fn repetition_in_body_bails() {
         // The arm needs a repetition, so no usable arm survives.
         let parsed = try_def_of("macro_rules! fwd { ($($a:ident),*) => { g($($a),*) }; }");
-        assert!(parsed.is_none(), "repetition arm must not parse: {:?}", parsed.map(|p| p.0));
+        assert!(
+            parsed.is_none(),
+            "repetition arm must not parse: {:?}",
+            parsed.map(|p| p.0)
+        );
     }
 
     #[test]
@@ -519,7 +516,8 @@ mod tests {
 
     #[test]
     fn trailing_comma_invocation_works() {
-        let defs = defs_of("macro_rules! rd { ($p:expr, $off:expr $(,)?) => {{ rd32($p, $off) }}; }");
+        let defs =
+            defs_of("macro_rules! rd { ($p:expr, $off:expr $(,)?) => {{ rd32($p, $off) }}; }");
         let got = expand("{ rd!(buf, 0x10,); }", &defs);
         assert!(got.contains("rd32"), "got: {got}");
     }
@@ -561,7 +559,10 @@ mod tests {
         defs.insert("outer".to_string(), vec![outer]);
         let got = expand("{ outer!(v); }", &defs);
         assert!(got.contains("target"), "got: {got}");
-        assert!(!got.contains("outer") && !got.contains("inner"), "got: {got}");
+        assert!(
+            !got.contains("outer") && !got.contains("inner"),
+            "got: {got}"
+        );
     }
 
     #[test]
@@ -590,9 +591,7 @@ mod tests {
 
     #[test]
     fn dollar_crate_passes_through() {
-        let defs = defs_of(
-            "macro_rules! wrap { ($e:expr) => { $crate::m::f($e) }; }",
-        );
+        let defs = defs_of("macro_rules! wrap { ($e:expr) => { $crate::m::f($e) }; }");
         let got = expand("{ wrap!(v); }", &defs);
         // (`$crate` renders with a space in Display; what matters is the
         // path survives with the argument substituted.)
@@ -621,7 +620,10 @@ mod tests {
         // itself is sub-optimal but legal macro_rules.
         let block: syn::Block = syn::parse_str("{ pair!(x, y); }").unwrap();
         let (facts, ts, fell_back) = expand_and_collect(&block, Some(&defs));
-        assert!(fell_back, "comma-transcriber expansion must not parse as a block");
+        assert!(
+            fell_back,
+            "comma-transcriber expansion must not parse as a block"
+        );
         // Fallback facts == unexpanded facts: the invocation stays opaque,
         // and neither spliced call leaks into the edge set.
         assert!(
@@ -645,17 +647,16 @@ mod tests {
     fn block_body_substitution_shapes_calls() {
         // End-to-end shape: the expanded block parses and the inner call is
         // visible to the syn visitor used for edge collection.
-        let defs = defs_of(
-            "macro_rules! rel { ($o:expr) => { g($o); free($o); }; }",
-        );
-        let expanded = expand_block_tokens(
-            TokenStream::from_str("{ rel!(p); }").unwrap(),
-            &defs,
-        );
+        let defs = defs_of("macro_rules! rel { ($o:expr) => { g($o); free($o); }; }");
+        let expanded = expand_block_tokens(TokenStream::from_str("{ rel!(p); }").unwrap(), &defs);
         let block: syn::Block = syn::parse2(expanded).expect("expanded must parse as block");
         let facts = crate::body::collect_block_facts(&block);
         assert!(facts.names.plain.contains("g"), "{:?}", facts.names.plain);
-        assert!(facts.names.plain.contains("free"), "{:?}", facts.names.plain);
+        assert!(
+            facts.names.plain.contains("free"),
+            "{:?}",
+            facts.names.plain
+        );
         assert!(facts.macros.is_empty(), "{:?}", facts.macros);
     }
 }

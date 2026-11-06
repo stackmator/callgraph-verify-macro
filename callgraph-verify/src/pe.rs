@@ -6,6 +6,9 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+type FixupPair = (u64, u64);
+type FixupTables = (Vec<FixupPair>, Vec<FixupPair>);
+
 /// LE fixup-table outcome for one loaded image.
 #[derive(Debug, Clone)]
 pub enum FixupStatus {
@@ -176,16 +179,16 @@ impl Pe {
                 characteristics: u32(&data, s + 36),
             });
         }
-    Ok(Pe {
-        data,
-        image_base,
-        sections,
-        fixup_posts: Vec::new(),
-        fixup_rel32: Vec::new(),
-        fixup_status: FixupStatus::Absent,
-        id: next_pe_id(),
-    })
-}
+        Ok(Pe {
+            data,
+            image_base,
+            sections,
+            fixup_posts: Vec::new(),
+            fixup_rel32: Vec::new(),
+            fixup_status: FixupStatus::Absent,
+            id: next_pe_id(),
+        })
+    }
 
     /// Process-unique id assigned at parse time (see the field docs).
     pub fn id(&self) -> u64 {
@@ -335,7 +338,9 @@ impl Pe {
             ));
             let d = if va < start {
                 start - va
-            } else { va.saturating_sub(end) };
+            } else {
+                va.saturating_sub(end)
+            };
             if best.map(|(_, bd)| d < bd).unwrap_or(true) {
                 best = Some((sec, d));
             }
@@ -499,7 +504,12 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
         if o + 4 > sz {
             return Err(format!("LE header read past EOF at {o:#x}"));
         }
-        Ok(u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]))
+        Ok(u32::from_le_bytes([
+            data[o],
+            data[o + 1],
+            data[o + 2],
+            data[o + 3],
+        ]))
     };
     let at16 = |o: usize| -> Result<u16, String> {
         if o + 2 > sz {
@@ -536,7 +546,9 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
         ));
     }
     let objtab = le_off.checked_add(objtab_rel).ok_or("LE objtab overflow")?;
-    let pagemap = le_off.checked_add(pagemap_rel).ok_or("LE pagemap overflow")?;
+    let pagemap = le_off
+        .checked_add(pagemap_rel)
+        .ok_or("LE pagemap overflow")?;
     if objtab + objcnt * 24 > sz {
         return Err(format!(
             "LE object table runs past EOF: objtab={objtab:#x} + {objcnt}*24, file size {sz:#x}"
@@ -585,16 +597,12 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
     for oi in 0..objcnt {
         let o = objtab + oi * 24;
         let vsize = u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as usize;
-        let base =
-            u32::from_le_bytes([data[o + 4], data[o + 5], data[o + 6], data[o + 7]]) as u32;
-        let flags =
-            u32::from_le_bytes([data[o + 8], data[o + 9], data[o + 10], data[o + 11]]);
+        let base = u32::from_le_bytes([data[o + 4], data[o + 5], data[o + 6], data[o + 7]]);
+        let flags = u32::from_le_bytes([data[o + 8], data[o + 9], data[o + 10], data[o + 11]]);
         let page_idx =
-            u32::from_le_bytes([data[o + 12], data[o + 13], data[o + 14], data[o + 15]])
-                as usize;
+            u32::from_le_bytes([data[o + 12], data[o + 13], data[o + 14], data[o + 15]]) as usize;
         let page_cnt =
-            u32::from_le_bytes([data[o + 16], data[o + 17], data[o + 18], data[o + 19]])
-                as usize;
+            u32::from_le_bytes([data[o + 16], data[o + 17], data[o + 18], data[o + 19]]) as usize;
         if page_idx == 0 || page_idx - 1 + page_cnt > numpages {
             return Err(format!(
                 "LE object {oi} page range [{page_idx}..{}) out of 1..={numpages}",
@@ -640,10 +648,7 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
                 format!(".data{data_seen}")
             };
             data_seen += 1;
-            (
-                n,
-                section_flags::READ | section_flags::WRITE,
-            )
+            (n, section_flags::READ | section_flags::WRITE)
         };
         sections.push(Section {
             name,
@@ -707,7 +712,7 @@ fn collect_fixups(
     pagesize: usize,
     sections: &[Section],
     image: &[u8],
-) -> Result<(Vec<(u64, u64)>, Vec<(u64, u64)>), String> {
+) -> Result<FixupTables, String> {
     let pre_of = |va: u64| -> Option<u32> {
         for s in sections {
             let lo = s.virtual_address as u64;
@@ -733,7 +738,12 @@ fn collect_fixups(
         if o + 4 > data.len() {
             return Err(format!("LE fixup header read past EOF at {o:#x}"));
         }
-        Ok(u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]))
+        Ok(u32::from_le_bytes([
+            data[o],
+            data[o + 1],
+            data[o + 2],
+            data[o + 3],
+        ]))
     };
     let fpt_field = le_off
         .checked_add(0x68)
@@ -843,9 +853,7 @@ fn collect_fixups(
             }
             let low4 = st & 0x0F;
             let is_sel = (st == 0x02 || st == 0x22) && fl == 0x00;
-            let is_off = (low4 == 7 || low4 == 8)
-                && (st & 0xD0) == 0
-                && (fl == 0x00 || fl == 0x10);
+            let is_off = (low4 == 7 || low4 == 8) && (st & 0xD0) == 0 && (fl == 0x00 || fl == 0x10);
             if !is_sel && !is_off {
                 // Novelty, not corruption (see NOVEL_FIXUP_PREFIX): the
                 // tables may belong to a linker dialect with fixup kinds
@@ -950,10 +958,8 @@ mod tests {
         data[le_off..le_off + 2].copy_from_slice(b"LE");
         data[le_off + 8..le_off + 10].copy_from_slice(&2u16.to_le_bytes()); // cpu = 386
         data[le_off + 0x14..le_off + 0x18].copy_from_slice(&1u32.to_le_bytes()); // numpages
-        data[le_off + 0x28..le_off + 0x2C]
-            .copy_from_slice(&(pagesize as u32).to_le_bytes()); // pagesize
-        data[le_off + 0x2C..le_off + 0x30]
-            .copy_from_slice(&(pagesize as u32).to_le_bytes()); // lastpagesize
+        data[le_off + 0x28..le_off + 0x2C].copy_from_slice(&(pagesize as u32).to_le_bytes()); // pagesize
+        data[le_off + 0x2C..le_off + 0x30].copy_from_slice(&(pagesize as u32).to_le_bytes()); // lastpagesize
         data[le_off + 0x40..le_off + 0x44].copy_from_slice(&0x1C0u32.to_le_bytes()); // objtab_rel
         data[le_off + 0x44..le_off + 0x48].copy_from_slice(&1u32.to_le_bytes()); // objcnt
         data[le_off + 0x48..le_off + 0x4C].copy_from_slice(&0x1D8u32.to_le_bytes()); // pagemap_rel
@@ -961,7 +967,7 @@ mod tests {
         data[le_off + 0x68..le_off + 0x6C].copy_from_slice(&0x2C0u32.to_le_bytes()); // fpt_rel
         data[le_off + 0x6C..le_off + 0x70].copy_from_slice(&0x2C8u32.to_le_bytes()); // frt_rel
         data[le_off + 0x80..le_off + 0x84].copy_from_slice(&0x400u32.to_le_bytes()); // datapage_abs
-        // Object table: vsize, base, flags(exec), page_idx, page_cnt, 12 reserved.
+                                                                                     // Object table: vsize, base, flags(exec), page_idx, page_cnt, 12 reserved.
         let o = 0x200usize;
         data[o..o + 4].copy_from_slice(&0x1000u32.to_le_bytes());
         data[o + 4..o + 8].copy_from_slice(&0x10000u32.to_le_bytes());
@@ -1015,9 +1021,15 @@ mod tests {
         let cg = analyze(&pe, 0x10000).expect("analyze synthetic fn");
         assert!(cg.globals.contains(&0x10400), "{cg:?}");
         // Pre-fixup value: always accepted.
-        Spec::new(0x10000).globals(&[0x10400]).check(&pe).expect("pre global");
+        Spec::new(0x10000)
+            .globals(&[0x10400])
+            .check(&pe)
+            .expect("pre global");
         // Post-fixup image of the referenced pre value: accepted (the fix).
-        Spec::new(0x10000).globals(&[0x10500]).check(&pe).expect("post global");
+        Spec::new(0x10000)
+            .globals(&[0x10500])
+            .check(&pe)
+            .expect("post global");
         // An address referenced nowhere, pre or post: still rejected.
         assert!(Spec::new(0x10000).globals(&[0x10999]).check(&pe).is_err());
     }
@@ -1038,7 +1050,10 @@ mod tests {
         let refs = pe.referenced_addrs();
         // Link-time values physically present in the image (instruction
         // operand + stored data dwords).
-        assert!(refs.contains(&0x10400), "pre operand ref missing: {refs:x?}");
+        assert!(
+            refs.contains(&0x10400),
+            "pre operand ref missing: {refs:x?}"
+        );
         assert!(refs.contains(&0x10410), "pre stored dword ref missing");
         assert!(refs.contains(&0x10420), "pre stored dword ref missing");
         // Runtime images of those values (what a ported body bakes) must also
@@ -1061,8 +1076,8 @@ mod tests {
         use super::FixupStatus;
         let mut data = build_fixup_le();
         data[0x308] = 0x09; // bogus srctype on record 1
-        // Novelty skips the tables (image stays pre-fixup) — it must NOT
-        // fail the parse, and the reason must be recorded, not silent.
+                            // Novelty skips the tables (image stays pre-fixup) — it must NOT
+                            // fail the parse, and the reason must be recorded, not silent.
         let pe = Pe::parse(data).expect("novel fixup kind must skip, not fail");
         assert_eq!(pe.fixup_count(), 0);
         match pe.fixup_status() {

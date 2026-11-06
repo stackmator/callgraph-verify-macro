@@ -36,7 +36,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Expr, ExprArray, Ident, Lit, LitInt, Token};
 
-use callgraph_verify::{analyze, cfg_fingerprint, diff_body_calls_ext, reg_params, tail_referenced, ArgKind, FixupStatus, Pe, Spec};
+use callgraph_verify::{
+    analyze, cfg_fingerprint, diff_body_calls_ext, reg_params, tail_referenced, ArgKind,
+    FixupStatus, Pe, Spec,
+};
 
 mod body;
 mod corpus;
@@ -237,10 +240,7 @@ fn parse_errors_note(parse_errors: &[String]) -> Option<String> {
         .map(|s| format!("\n  - {s}"))
         .collect();
     if parse_errors.len() > SHOW {
-        listed.push_str(&format!(
-            "\n  - ... and {} more",
-            parse_errors.len() - SHOW
-        ));
+        listed.push_str(&format!("\n  - ... and {} more", parse_errors.len() - SHOW));
     }
     Some(format!(
         ". Scanner skipped {} unreadable/unparseable file(s):{listed}. Fix these \
@@ -586,8 +586,11 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ),
                 )
                 .with_span(fn_like.attr_target_span())
-                .with_fix("verify the address against the binary (e.g. open the PE in a \
-                     disassembler), or move the rebuild away from this addr".to_string()),
+                .with_fix(
+                    "verify the address against the binary (e.g. open the PE in a \
+                     disassembler), or move the rebuild away from this addr"
+                        .to_string(),
+                ),
             );
         } else if !referenced_addrs_cached(&exe, &pe).contains(&(args.addr as u32)) {
             errors.push(
@@ -621,9 +624,8 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iat(&args.iat);
     if let Err(msg) = spec.check(&pe) {
         errors.push(
-            error::RichError::new(error::Code::DeclaredFacts, msg).with_span(
-                fn_like.attr_target_span(),
-            ),
+            error::RichError::new(error::Code::DeclaredFacts, msg)
+                .with_span(fn_like.attr_target_span()),
         );
     }
 
@@ -651,11 +653,11 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             errors.push(
                 error::RichError::new(error::Code::CorpusGap, msg)
-                .with_span(fn_like.attr_target_span())
-                .with_fix(
-                    "fix REBUILD_ROOT so it contains the source with this #[origin] tag, \
+                    .with_span(fn_like.attr_target_span())
+                    .with_fix(
+                        "fix REBUILD_ROOT so it contains the source with this #[origin] tag, \
                      and re-run `cargo build` so the corpus re-scans",
-                ),
+                    ),
             );
         }
 
@@ -724,23 +726,19 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         // still reports "body doesn't". The trade-off mirrors DENY's documented
         // one (weakest-name-form check): a same-named collateral call can
         // satisfy a MISSING — it can never FIRE a HALLUCINATED.
-        let miss_satisfied: std::collections::BTreeSet<u64> =
-            body_calls
-                .plain
-                .iter()
-                .chain(body_calls.method.iter())
-                .fold(
-                std::collections::BTreeSet::new(),
-                |mut acc, n| {
-                    if let Some(s) = map.free_fns.get(n) {
-                        acc.extend(s.iter().copied());
-                    }
-                    if let Some(s) = map.methods.get(n) {
-                        acc.extend(s.iter().copied());
-                    }
-                    acc
-                },
-            );
+        let miss_satisfied: std::collections::BTreeSet<u64> = body_calls
+            .plain
+            .iter()
+            .chain(body_calls.method.iter())
+            .fold(std::collections::BTreeSet::new(), |mut acc, n| {
+                if let Some(s) = map.free_fns.get(n) {
+                    acc.extend(s.iter().copied());
+                }
+                if let Some(s) = map.methods.get(n) {
+                    acc.extend(s.iter().copied());
+                }
+                acc
+            });
         let vtm = vtable_method_map(&pe, &map.declared_vtables);
         let vtable_methods: std::collections::BTreeSet<u64> = vtm.keys().copied().collect();
         // VTABLE-ONLY DISPATCH (warning, not fatal): the origin IS referenced (passed the
@@ -842,12 +840,10 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                 for a in &d.missing {
                     let name = map.addr2name.get(a).cloned();
                     let msg = match name.as_deref() {
-                        Some(n) => format!(
-                            "binary calls `{n}` ({a:#010x}) — body doesn't"
-                        ),
-                        None => format!(
-                            "binary calls {a:#010x} (no name in corpus) — body doesn't"
-                        ),
+                        Some(n) => format!("binary calls `{n}` ({a:#010x}) — body doesn't"),
+                        None => {
+                            format!("binary calls {a:#010x} (no name in corpus) — body doesn't")
+                        }
                     };
                     errors.push(
                         error::RichError::new(error::Code::Missing, msg)
@@ -987,8 +983,11 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ),
                         )
                         .with_span(span)
-                        .with_fix("use the address the binary actually references at this \
-                             origin, or remove the literal if it's a stray".to_string()),
+                        .with_fix(
+                            "use the address the binary actually references at this \
+                             origin, or remove the literal if it's a stray"
+                                .to_string(),
+                        ),
                     );
                 }
             }
@@ -1056,8 +1055,7 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             // `if`/`match`/loops plus `&&`/`||` (each short-circuits through
             // its own JCC, so a fused `a && b && ...` condition earns its
             // keep); a single bare `if` wrapper no longer defeats the gate.
-            let branchiness =
-                r.ifs + r.matches + r.loops + facts.conds.lazy as usize;
+            let branchiness = r.ifs + r.matches + r.loops + facts.conds.lazy as usize;
             if fp.conditionals >= 12 && branchiness <= 1 {
                 errors.push(
                     error::RichError::new(
@@ -1323,8 +1321,11 @@ pub fn vtable_table(input: TokenStream) -> TokenStream {
                             format!("slot {slot}: engine VA {slot_va:#010x} not readable"),
                         )
                         .with_span(*lit_span)
-                        .with_fix("verify the vtable VA and slot count against the binary, or \
-                             reduce `slots = N` to the highest slot you actually wire".to_string()),
+                        .with_fix(
+                            "verify the vtable VA and slot count against the binary, or \
+                             reduce `slots = N` to the highest slot you actually wire"
+                                .to_string(),
+                        ),
                     );
                     continue;
                 };
@@ -1340,8 +1341,11 @@ pub fn vtable_table(input: TokenStream) -> TokenStream {
                             ),
                         )
                         .with_span(*lit_span)
-                        .with_fix("shrink `slots = N` so the last slot is fully readable, or \
-                             pick a smaller vtable VA that fits in its section".to_string()),
+                        .with_fix(
+                            "shrink `slots = N` so the last slot is fully readable, or \
+                             pick a smaller vtable VA that fits in its section"
+                                .to_string(),
+                        ),
                     );
                     continue;
                 }
@@ -1438,12 +1442,16 @@ mod tests {
         // Clean corpus: no suffix (existing E008 wording untouched).
         assert_eq!(parse_errors_note(&[]), None);
         // One broken file: named, with count.
-        let one = parse_errors_note(&["gen/broken.rs: unparseable (expected one of `!` or `::`)".to_string()]);
+        let one = parse_errors_note(&[
+            "gen/broken.rs: unparseable (expected one of `!` or `::`)".to_string()
+        ]);
         let text = one.expect("note for one broken file");
         assert!(text.contains("1 unreadable/unparseable file(s)"), "{text}");
         assert!(text.contains("gen/broken.rs"), "{text}");
         // Capped listing with overflow count.
-        let many: Vec<String> = (0..8).map(|i| format!("f{i}.rs: unparseable (e)").to_string()).collect();
+        let many: Vec<String> = (0..8)
+            .map(|i| format!("f{i}.rs: unparseable (e)").to_string())
+            .collect();
         let text = parse_errors_note(&many).expect("note for many broken files");
         assert!(text.contains("... and 3 more"), "{text}");
         for i in 0..5 {
@@ -1588,5 +1596,4 @@ mod tests {
             }
         }
     }
-
 }

@@ -48,8 +48,7 @@ fn fixtures_dir() -> PathBuf {
 /// `{"toolchain": ..., "symbols": {name: "0xVA", ...}}`.
 fn parse_manifest(json: &std::path::Path) -> (BTreeMap<String, u64>, String) {
     let text = std::fs::read_to_string(json).expect("read addrs manifest");
-    let v: serde_json::Value =
-        serde_json::from_str(&text).expect("parse addrs manifest");
+    let v: serde_json::Value = serde_json::from_str(&text).expect("parse addrs manifest");
     let toolchain = v
         .get("toolchain")
         .and_then(|t| t.as_str())
@@ -61,9 +60,9 @@ fn parse_manifest(json: &std::path::Path) -> (BTreeMap<String, u64>, String) {
         .unwrap_or_else(|| panic!("manifest {} has no symbols map", json.display()));
     let mut addrs = BTreeMap::new();
     for (k, val) in raw {
-        let s = val.as_str().unwrap_or_else(|| {
-            panic!("bad VA {val:?} for {k} in {}", json.display())
-        });
+        let s = val
+            .as_str()
+            .unwrap_or_else(|| panic!("bad VA {val:?} for {k} in {}", json.display()));
         let n = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
             u64::from_str_radix(h, 16)
         } else {
@@ -75,12 +74,7 @@ fn parse_manifest(json: &std::path::Path) -> (BTreeMap<String, u64>, String) {
     (addrs, toolchain)
 }
 
-fn load_fixture(
-    label: &'static str,
-    stem: &str,
-    exe_env: &str,
-    json_env: &str,
-) -> Option<Fixture> {
+fn load_fixture(label: &'static str, stem: &str, exe_env: &str, json_env: &str) -> Option<Fixture> {
     let exe = std::env::var(exe_env)
         .map(PathBuf::from)
         .unwrap_or_else(|_| fixtures_dir().join(format!("{stem}.exe")));
@@ -176,8 +170,7 @@ fn c_dbg_fixture() -> Option<Fixture> {
 }
 
 fn addr(fx: &Fixture, name: &str) -> u64 {
-    *fx
-        .addrs
+    *fx.addrs
         .get(name)
         .unwrap_or_else(|| panic!("{} manifest has no {name:?}", fx.label))
 }
@@ -256,7 +249,8 @@ fn cpp_fixture_is_pe32_with_text() {
 // --- C call graph: exact edges the compilers must have preserved ------------
 
 #[test]
-fn c_branch_caller_calls_both_leaves() {    let Some(fx) = c_fixture() else {
+fn c_branch_caller_calls_both_leaves() {
+    let Some(fx) = c_fixture() else {
         return;
     };
     let edges = call_edges(&fx, addr(&fx, "branch_caller"));
@@ -332,35 +326,21 @@ fn c_indirect_target_accepted_on_real_output() {
         let none = BTreeSet::new();
 
         // Baseline (no declaration): the direct spelling is flagged.
-        let d = diff_body_calls(
-            &fx.pe,
-            &[caller],
-            &corpus,
-            &idents,
-            &none,
-            &none,
-        )
-        .expect("diff_body_calls");
+        let d = diff_body_calls(&fx.pe, &[caller], &corpus, &idents, &none, &none)
+            .expect("diff_body_calls");
         assert!(
             d.hallucinated
                 .iter()
                 .any(|(n, addrs)| n == "inc_fn" && addrs.contains(&target)),
             "[{}] baseline must flag the direct callback call: {:?}",
-            fx.label, d.hallucinated
+            fx.label,
+            d.hallucinated
         );
 
         // Declared: accepted, and not converted into a MISSING requirement.
         let declared: BTreeSet<u64> = [target].into_iter().collect();
-        let d = diff_body_calls_ext(
-            &fx.pe,
-            &[caller],
-            &corpus,
-            &idents,
-            &none,
-            &none,
-            &declared,
-        )
-        .expect("diff_body_calls_ext");
+        let d = diff_body_calls_ext(&fx.pe, &[caller], &corpus, &idents, &none, &none, &declared)
+            .expect("diff_body_calls_ext");
         assert!(
             d.hallucinated.is_empty(),
             "[{}] declared indirect target must be accepted: {:?}",
@@ -513,12 +493,14 @@ fn c_tail_caller_global_covered() {
             assert!(
                 !cg.globals.contains(&g),
                 "[{}] tail path: caller must not reference the global directly: {:?}",
-                fx.label, cg.globals
+                fx.label,
+                cg.globals
             );
             assert!(
                 tail_referenced(&fx.pe, &cg).contains(&g),
                 "[{}] tail path: fold must cover g_tail_tag {:#x}",
-                fx.label, g
+                fx.label,
+                g
             );
         }
         // Sanity in both cases: the callee really does reference the global
@@ -527,7 +509,9 @@ fn c_tail_caller_global_covered() {
         assert!(
             cg_t.globals.contains(&g),
             "[{}] tail_target must reference g_tail_tag {:#x}: {:?}",
-            fx.label, g, cg_t.globals
+            fx.label,
+            g,
+            cg_t.globals
         );
     }
 }
@@ -830,11 +814,7 @@ fn c_switch_case_calls_recovered() {
     };
     let cg = analyze(&fx.pe, addr(&fx, "classify")).expect("analyze classify");
     let leaf = addr(&fx, "leaf_add");
-    let sites: Vec<_> = cg
-        .call_sites
-        .iter()
-        .filter(|s| s.target == leaf)
-        .collect();
+    let sites: Vec<_> = cg.call_sites.iter().filter(|s| s.target == leaf).collect();
     // Tail-merging could in principle fuse identical calls, so the
     // toolchain-neutral bar is "nearly all cases found"; MSVC pins the
     // exact eight below.
@@ -869,10 +849,7 @@ fn c_switch_case_calls_recovered() {
             first_args,
             (100u64..108).collect::<Vec<_>>(),
             "each case's pushed first-arg constant must be recovered: {:?}",
-            sites
-                .iter()
-                .map(|s| &s.stack)
-                .collect::<Vec<_>>()
+            sites.iter().map(|s| &s.stack).collect::<Vec<_>>()
         );
     } else {
         eprintln!(
@@ -891,11 +868,7 @@ fn c_od_switch_case_calls_recovered() {
     };
     let cg = analyze(&od.pe, addr(&od, "classify")).expect("analyze classify");
     let leaf = addr(&od, "leaf_add");
-    let sites: Vec<_> = cg
-        .call_sites
-        .iter()
-        .filter(|s| s.target == leaf)
-        .collect();
+    let sites: Vec<_> = cg.call_sites.iter().filter(|s| s.target == leaf).collect();
     assert!(
         sites.len() >= 7,
         "od classify must call leaf_add in (nearly) every case: toolchain={} direct={:?} tails={:?} ind_jumps={} fp={:?}",
@@ -1292,11 +1265,8 @@ fn c_o2_vs_od_inlining_differential() {
         return;
     };
     // Reverse map: od VA -> source name.
-    let od_names: std::collections::HashMap<u64, &str> = od
-        .addrs
-        .iter()
-        .map(|(k, &v)| (v, k.as_str()))
-        .collect();
+    let od_names: std::collections::HashMap<u64, &str> =
+        od.addrs.iter().map(|(k, &v)| (v, k.as_str())).collect();
     // (caller_name, callee_name) pairs inlined at /O2 but called at /Od.
     let mut events: Vec<(String, String)> = Vec::new();
     let mut compared = 0u32;
@@ -1305,14 +1275,10 @@ fn c_o2_vs_od_inlining_differential() {
             continue;
         };
         // Data symbols and vtables have no code to compare.
-        if !fx.pe.is_executable_section_va(o2_va)
-            || !od.pe.is_executable_section_va(od_va)
-        {
+        if !fx.pe.is_executable_section_va(o2_va) || !od.pe.is_executable_section_va(od_va) {
             continue;
         }
-        let (Ok(_cg_o2), Ok(_cg_od)) =
-            (analyze(&fx.pe, o2_va), analyze(&od.pe, od_va))
-        else {
+        let (Ok(_cg_o2), Ok(_cg_od)) = (analyze(&fx.pe, o2_va), analyze(&od.pe, od_va)) else {
             continue;
         };
         compared += 1;

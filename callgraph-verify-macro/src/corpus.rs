@@ -83,10 +83,8 @@ fn build(root: &str) -> Corpus {
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
-                c.parse_errors.push(format!(
-                    "{}: unreadable ({e})",
-                    disp_of(root_path, &path)
-                ));
+                c.parse_errors
+                    .push(format!("{}: unreadable ({e})", disp_of(root_path, &path)));
                 continue;
             }
         };
@@ -103,8 +101,14 @@ fn build(root: &str) -> Corpus {
             }
             Err(e) => {
                 // syn errors are multi-line; keep the first line (file:line + kind).
-                let first = e.to_string().lines().next().unwrap_or("parse error").to_string();
-                c.parse_errors.push(format!("{disp}: unparseable ({first})"));
+                let first = e
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("parse error")
+                    .to_string();
+                c.parse_errors
+                    .push(format!("{disp}: unparseable ({first})"));
             }
         }
     }
@@ -199,7 +203,13 @@ fn scan_trait_fn(m: &TraitItemFn, disp_path: &str, c: &mut Corpus) {
 
 /// Walk an attribute list looking for `#[origin(0xA)]`
 /// and the `unreferenced` flag. Record every origin address into `c`.
-fn scan_attrs_and_record(attrs: &[Attribute], name: &str, is_method: bool, disp_path: &str, c: &mut Corpus) {
+fn scan_attrs_and_record(
+    attrs: &[Attribute],
+    name: &str,
+    is_method: bool,
+    disp_path: &str,
+    c: &mut Corpus,
+) {
     let mut addrs: Vec<u64> = Vec::new();
 
     for attr in attrs {
@@ -347,7 +357,12 @@ mod tests {
 pub unsafe fn foo() {}
 ",
         );
-        assert_eq!(c.corpus.len(), 1, "expected only the attribute's addr: {:?}", c.corpus);
+        assert_eq!(
+            c.corpus.len(),
+            1,
+            "expected only the attribute's addr: {:?}",
+            c.corpus
+        );
         assert!(c.corpus.contains(&0x004028d0));
         assert!(!c.corpus.contains(&0x0070b780));
     }
