@@ -654,12 +654,28 @@ pub fn analyze_opt(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph,
                     break;
                 }
                 FlowControl::Return | FlowControl::Exception => break,
-                // NOTE: `Interrupt` (`int n`) is deliberately NOT terminal:
-                // DOS `int 21h` / DPMI `int 31h` are API calls that return
-                // normally, so decoding must continue at `next_ip()`.
-                // Treating them like `ret` truncated listings and hid
-                // calls reachable only via post-`int` fallthrough.
-                FlowControl::Next | FlowControl::Interrupt | FlowControl::XbeginXabortXend => {}
+                // Most `int n` instructions are returning DOS/DPMI API calls,
+                // so keep decoding at next_ip(). DOS INT 21h/AH=4Ch terminates
+                // the process, though; following that fallthrough would merge
+                // the next adjacent function into this one.
+                FlowControl::Interrupt => {
+                    let dos_terminate = instr.op_count() == 1
+                        && instr.op0_kind() == OpKind::Immediate8
+                        && instr.immediate8() == 0x21
+                        && block_buf
+                            .get(block_buf.len().saturating_sub(2))
+                            .is_some_and(|prior| {
+                                prior.mnemonic() == Mnemonic::Mov
+                                    && prior.op0_kind() == OpKind::Register
+                                    && prior.op0_register() == Register::AX
+                                    && prior.op1_kind() == OpKind::Immediate16
+                                    && prior.immediate16() & 0xff00 == 0x4c00
+                            });
+                    if dos_terminate {
+                        break;
+                    }
+                }
+                FlowControl::Next | FlowControl::XbeginXabortXend => {}
             }
         }
     }

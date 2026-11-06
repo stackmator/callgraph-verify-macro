@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The callgraph walk stops at the DOS `INT 21h` process-termination service
+  (`AH=4Ch`) when the immediately preceding instruction loads AX with that
+  service. Other interrupt instructions remain fallthrough-capable API calls;
+  this prevents adjacent function bytes after a fatal DOS exit from being
+  attributed to the current function.
+
 - `callgraph_verify --asm` annotates zero-displacement LE-08 `CALL rel32`
   placeholders with their runtime destinations. The byte dump remains raw;
   the annotation explains call-graph edges that are not visible in the
