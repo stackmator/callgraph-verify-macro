@@ -134,19 +134,20 @@ fn scan_operands(pe: &Pe, instr: &Instruction, cg: &mut CallGraph) {
                 let disp = instr.memory_displacement64();
                 if base == Register::None && index == Register::None {
                     // absolute `[0x...]` — a global/static data reference.
-                    // Skip LEA: it computes an address without dereferencing, so
-                    // the operand isn't a memory reference. (BUG #14)
+                    // Skip absolute LEA: it materializes an address but does
+                    // not dereference it (kept out by the existing policy).
                     if pe.section_of(disp).is_some() && instr.mnemonic() != Mnemonic::Lea {
                         cg.globals.insert(disp);
                     }
-                } else if pe.section_of(disp).is_some() && instr.mnemonic() != Mnemonic::Lea {
+                } else if pe.section_of(disp).is_some() {
                     // Indexed `[base + index*scale + disp]` (or `[reg+disp]`)
                     // off a large in-image displacement — a table base, not a
                     // struct field (e.g. `[eax*4+0x18F01]` in a real LE binary). Record it
                     // as a global so bodies may bake the true address without
                     // tripping HALLUCINATED-ADDR. Small offsets miss
-                    // `section_of` and fall through to the field branch below;
-                    // LEA never dereferences (BUG #14), so it stays excluded.
+                    // `section_of` and fall through to the field branch below.
+                    // LEA address materialization belongs here because its
+                    // result may be dereferenced by a later instruction.
                     cg.globals.insert(disp);
                 } else if base != Register::None
                     && base != Register::ESP

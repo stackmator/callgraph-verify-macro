@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-11-06
+
+### Fixed
+
+- Count indexed in-image LEA displacements as referenced data addresses.
+  LEA materializes an address that later instructions may dereference, so
+  omitting indexed LEA operands caused faithful table-base literals to fail E015.
+
 ## [0.1.9] - 2026-11-05
 
 ### Performance

@@ -913,6 +913,26 @@ mod tests {
         );
     }
 
+    /// An indexed LEA with an in-image displacement materializes a global
+    /// table base. The resulting address may be dereferenced by later code,
+    /// so its displacement must be accepted by HALLUCINATED-ADDR.
+    #[test]
+    fn test_scan_operands_lea_indexed_table_base_is_a_global() {
+        // LEA EAX, [EAX*4 + 0x00401007] ; RET
+        let code = [
+            0x8D, 0x04, 0x85, 0x07, 0x10, 0x40, 0x00, // indexed LEA
+            0xC3, // RET
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let cg = analyze(&pe, entry).expect("analyze");
+        assert!(
+            cg.globals.contains(&0x00401007),
+            "0x00401007 should be a global table base for indexed LEA; globals = {:?}",
+            cg.globals
+        );
+    }
+
     /// Sanity: a MOV (not LEA) with the same operand form DOES count as a global.
     /// Guards against an over-eager fix that drops the genuine global case.
     #[test]
