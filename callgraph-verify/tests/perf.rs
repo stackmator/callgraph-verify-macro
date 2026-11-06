@@ -22,7 +22,7 @@
 //! ~500× slowdown of the batch before firing. What remains (a descheduled
 //! box) cannot bridge a 400× gap without a real regression.
 
-use callgraph_verify::{has_direct_branch_target, Pe};
+use callgraph_verify::{analyze, has_direct_branch_target, Pe};
 use std::time::Instant;
 
 /// Serializes the perf tests in this binary. Each test builds and decodes a
@@ -191,4 +191,23 @@ fn has_direct_branch_target_finds_hits_in_large_text() {
         &pe,
         BASE + TEXT_RVA as u64 + 0x40
     ));
+}
+
+/// Accuracy guard: opcode-looking bytes inside another instruction's immediate
+/// are data, not a CALL. A raw byte scan would invent a branch to offset 6;
+/// both the function analyzer and the whole-section branch index must ignore it.
+#[test]
+fn embedded_call_opcode_in_immediate_is_not_a_call_or_branch_target() {
+    // `mov eax, 0x000000E8; ret` — the E8 byte begins at offset 1, but is
+    // inside the MOV immediate. The real instruction stream has no CALL.
+    let pe = pe_with_text(NOP_FILL, &[0xB8, 0xE8, 0x00, 0x00, 0x00, 0xC3], 0x1000);
+    let entry = BASE + TEXT_RVA as u64;
+    let embedded_call_target = entry + 6;
+
+    let cg = analyze(&pe, entry).expect("analyze MOV/RET function");
+    assert!(cg.direct_calls.is_empty(), "invented calls: {:?}", cg.direct_calls);
+    assert!(
+        !has_direct_branch_target(&pe, embedded_call_target),
+        "an E8 byte inside a MOV immediate must not create a branch target"
+    );
 }
