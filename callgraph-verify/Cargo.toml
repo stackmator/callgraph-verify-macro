@@ -19,7 +19,7 @@ documentation = "https://docs.rs/callgraph-verify"
 readme = "../README.md"
 keywords = ["reverse-engineering", "disassembly", "verification", "x86", "call-graph"]
 categories = ["development-tools"]
-exclude = ["test-bin/"]
+exclude = ["test-bin/", "examples/peek.rs"]
 
 [lib]
 name = "callgraph_verify"
