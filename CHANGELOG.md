@@ -7,20 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- The callgraph walk stops at the DOS `INT 21h` process-termination service
-  (`AH=4Ch`) when the immediately preceding instruction loads AX with that
-  service. Other interrupt instructions remain fallthrough-capable API calls;
-  this prevents adjacent function bytes after a fatal DOS exit from being
-  attributed to the current function.
-
-- `callgraph_verify --asm` annotates zero-displacement LE-08 `CALL rel32`
-  placeholders with their runtime destinations. The byte dump remains raw;
-  the annotation explains call-graph edges that are not visible in the
-  pre-fixup operand bytes.
-
-## [0.1.8] - 2026-11-01
+## [0.1.8] - 2026-11-05
 
 ### Added
 
@@ -66,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   analysis feeds the acceptance set, so a body may spell an arm's `CALL`
   without tripping `E012` and is never required to (`E013` unchanged).
   This unblocks porting hidden arms with no regression on existing ports.
+- The callgraph walk stops at the DOS `INT 21h` process-termination service
+  (`AH=4Ch`) when the immediately preceding instruction loads AX with that
+  service. Other interrupt instructions remain fallthrough-capable API calls;
+  this prevents adjacent function bytes after a fatal DOS exit from being
+  attributed to the current function.
+- `callgraph_verify --asm` annotates zero-displacement LE-08 `CALL rel32`
+  placeholders with their runtime destinations. The byte dump remains raw;
+  the annotation explains call-graph edges that are not visible in the
+  pre-fixup operand bytes.
 
 ## [0.1.7] - 2026-11-01
 
@@ -352,7 +348,8 @@ Initial crates.io release.
 - `vtable_table!` declaration support with indirectly-called slot
   verification.
 
-[Unreleased]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.4...v0.1.5
