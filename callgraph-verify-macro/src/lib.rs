@@ -873,9 +873,9 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                         listed.push_str(&format!(" (+{} more)", d.unported.len() - SHOW));
                     }
                     note(&format!(
-                        "UNPORTED-CALLS: binary at {:#010x} also calls {} with no \
-                         #[origin] in the corpus ({} edge(s)) — omitted with TODO is \
-                         allowed, but consider porting them",
+                        "UNPORTED-CALLS: binary at {:#010x} has direct-call or out-of-span \
+                         branch edge(s) to {} with no #[origin] in the corpus ({} edge(s)) — \
+                         omitted with TODO is allowed, but consider porting them",
                         args.addr,
                         listed,
                         d.unported.len()

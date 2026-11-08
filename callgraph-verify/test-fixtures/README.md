@@ -81,7 +81,9 @@ it skips when the variable is unset, even under REQUIRE.
   the /O2-vs-/Od inlining differential), an indirect call (`apply_twice`),
   globals (`g_counter`, `g_k2`), a struct field pair
   (`field_read`/`field_write`), a self-recursion (`recurse_sum`, the MISSING
-  self-edge pin), and — C++ only — a virtual call
+  self-edge pin), a direct call immediately followed by an internal JMP
+  back-edge (`call_then_goto_loop`, the DOS Watcom regression), and — C++
+  only — a virtual call
   (`cpp_use_virtual_fn`) plus a member-reading method (`Circle::kind`,
   the thiscall/vtable-only pins).
 * DOS scope: LE fixup tables are absorbed for post-fixup address facts

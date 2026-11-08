@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-11-08
+
+### Fixed
+
+- Preserve instruction-level loop and exit branches after direct calls instead
+  of misclassifying their one-instruction JMP blocks as entry thunks.
+- Follow backward early-return labels that immediately JMP into their own
+  function span, and exclude branches into another known origin's reachable
+  body or shared stack-restoring epilogues from the unported-call inventory.
+  Direct calls and external branch targets remain reported.
+- Describe `UNPORTED-CALLS` as call/jump edges, since its inventory includes
+  both direct calls and external tail jumps.
+
 ## [0.1.11] - 2026-11-08
 
 ### Fixed
@@ -373,7 +386,8 @@ Initial crates.io release.
 - `vtable_table!` declaration support with indirectly-called slot
   verification.
 
-[Unreleased]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.11...v0.1.12
 [0.1.9]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/stackmator/callgraph-verify-macro/compare/v0.1.6...v0.1.7

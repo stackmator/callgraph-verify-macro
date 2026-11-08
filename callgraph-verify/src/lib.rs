@@ -488,6 +488,7 @@ pub fn diff_body_calls_ext(
     // spelled; a self tail-JMP is a loop (covered by the CFG gate), so it
     // stays out of this set.
     let mut bin_direct = BTreeSet::new();
+    let mut bin_tail = BTreeSet::new();
     let mut wide_extras = BTreeSet::new();
     let mut footprint = BTreeSet::new();
     let mut indirect = 0u32;
@@ -507,6 +508,7 @@ pub fn diff_body_calls_ext(
         // cache-wrapper that tail-calls the base getter), so count it as a call -
         // a faithful port spells it as an ordinary call.
         bin_calls.extend(&cg_d.tail_calls);
+        bin_tail.extend(&cg_d.tail_calls);
         tail_targets.extend(&cg_d.tail_calls);
         wide_calls.extend(cg_w.call_targets());
         wide_tail.extend(&cg_w.tail_calls);
@@ -628,11 +630,23 @@ pub fn diff_body_calls_ext(
     // Unported inventory (MISSING-unknown gap): real binary edges with no
     // corpus origin. Never fatal — bodies may omit these with a `TODO` — but
     // listing them keeps the omission visible instead of silently green.
-    let unported: Vec<u64> = bin_calls
+    let mut unported: BTreeSet<u64> = bin_direct
         .difference(corpus)
         .filter(|a| !own.contains(a))
         .copied()
         .collect();
+    for target in bin_tail.difference(corpus).filter(|a| !own.contains(a)) {
+        // A JMP into an instruction block reached from another known origin
+        // is an internal/shared code edge, not evidence of a missing callee.
+        // Direct CALLs remain in the inventory even when their target is in
+        // another body's instruction set: they are genuine call boundaries.
+        if !is_known_origin_body_ip(pe, primary, *target, corpus)
+            && !disasm::is_epilogue_block(pe, *target)
+        {
+            unported.insert(*target);
+        }
+    }
+    let unported: Vec<u64> = unported.into_iter().collect();
     Ok(CorpusDiff {
         addr: primary,
         hallucinated,
@@ -642,6 +656,26 @@ pub fn diff_body_calls_ext(
         unported,
         indirect_calls: indirect,
     })
+}
+
+/// A tail target is internal only when one other known origin's reachable CFG
+/// contains both the source and target instructions. Checking both prevents a
+/// shared tail from being hidden merely because it appears inside some
+/// unrelated origin's broad range. Use actual instruction addresses, not
+/// `[entry, max_end)`, because linear extents can cross data and adjacent code.
+fn is_known_origin_body_ip(pe: &Pe, source: u64, target: u64, corpus: &BTreeSet<u64>) -> bool {
+    let upper = source.min(target);
+    for &entry in corpus.range(..upper).rev() {
+        if source - entry > disasm::MAX_FN_SPAN || target - entry > disasm::MAX_FN_SPAN {
+            break;
+        }
+        if let Ok(graph) = analyze(pe, entry) {
+            if graph.instruction_ips.contains(&source) && graph.instruction_ips.contains(&target) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Declare expected facts for `origin:` functions and generate one `#[test]` per

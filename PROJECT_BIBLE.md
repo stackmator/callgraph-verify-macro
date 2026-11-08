@@ -46,7 +46,7 @@ Everything is derived from disassembly. No Ghidra export, no decompiler, no
 | Host | `x86_64` (proc-macros always build for the host) |
 | Rust | edition 2021, MSRV 1.70 |
 | License | MIT |
-| Current version | 0.1.9 (workspace; release candidate pending CI) |
+| Current version | 0.1.12 (release candidate pending CI) |
 | Crate 1 | `callgraph-verify` — parser, disassembler, analysis, CLI |
 | Crate 2 | `callgraph-verify-macro` — `#[origin]` and `vtable_table!` proc-macros |
 
@@ -251,8 +251,12 @@ Then:
 - **MISSING** (`E013`): a `bin_ported` address is not resolved by any body
   call name, is not `miss_satisfied`, or is a direct self-call the body does
   not spell.
-- **UNPORTED-CALLS** (note, never fatal): a `bin_calls` address with no corpus
-  origin. Bodies may omit it with a `TODO`, but the omission stays visible.
+- **UNPORTED-CALLS** (note, never fatal): a direct-call or out-of-span branch
+  target with no corpus origin. Branches into instruction blocks reached by
+  another known origin are internal/shared control flow and are excluded from
+  this note; stack-restoring shared epilogues are excluded as well. Direct
+  calls remain listed because they are explicit call boundaries. Bodies may
+  omit remaining targets with a `TODO`.
 - **Inlining acceptance**: callee footprint must be a subset of the caller's
   footprint **and** contain at least two distinct in-image references. A single
   shared global/call target is coincidence, not proof.
@@ -342,7 +346,9 @@ Codes are stable and append-only. `E010` is intentionally unused.
 
 ### Advisory notes (never fatal)
 
-- `UNPORTED-CALLS` — real binary edges with no `#[origin]`; omitting them is
+- `UNPORTED-CALLS` — direct calls or out-of-span branches with no `#[origin]`;
+  internal branches into another origin's reachable body and shared
+  stack-restoring epilogues are excluded. Omitting remaining targets is
   allowed with a `TODO`.
 - `FAKE-LOOP PLACEHOLDER` — `loop { break; }` scaffolding inflated the keyword
   counter.
@@ -449,7 +455,7 @@ and diagnostics anchor at the attribute line.
 | C-od | same | MSVC `/Od`, MinGW `-O0 -mno-accumulate-outgoing-args` | Weak-optimizer/EBP-frame shapes, PUSH args |
 | C-dbg | same | MSVC `/Od` + `/INCREMENTAL` | ILT `JMP` thunks; MSVC-only |
 | C++ | `test-fixtures/cpp/callgraph.cpp` | MSVC `/O2`, MinGW `g++ -O2` | Vtables, thiscall, virtual dispatch |
-| DOS | `test-fixtures/dos/callgraph.c` | Open Watcom `owcc -bdos4g` | No optimization; LE fixups; shape-discovered functions |
+| DOS | `test-fixtures/dos/callgraph.c` | Open Watcom `owcc -bdos4g` | No optimization; LE fixups; shape-discovered functions; call-then-JMP loop regression |
 
 ### Running fixtures locally
 

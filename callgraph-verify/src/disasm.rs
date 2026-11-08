@@ -7,7 +7,8 @@
 //! decoded operands, every fact that lets us catch a rebuild hallucination:
 //!
 //!   * `direct_calls`  — targets of `CALL rel16/rel32` (the call graph proper)
-//!   * `tail_calls`    — `JMP rel` leaving the body (a tail call into another fn)
+//!   * `tail_calls`    — direct branch targets leaving the walked body
+//!     (unconditional tail JMPs and out-of-span conditional branches)
 //!   * `indirect_calls`/`indirect_jumps` — counts of register/memory dispatch
 //!   * `vcall_slots`   — displacements of `CALL/JMP [reg+0xNN]` (vtable slots)
 //!   * `iat_calls`     — absolute targets of `CALL [0x00a28xxx]` (IAT imports)
@@ -30,7 +31,7 @@ type AnalyzeCache = Mutex<HashMap<AnalyzeCacheKey, Arc<Result<CallGraph, String>
 /// Upper bound on how far past the entry we follow control flow. Real-world
 /// largest functions are a few KB; 64 KB stops a mis-decoded `JMP` from walking
 /// the whole section.
-const MAX_FN_SPAN: u64 = 0x10000;
+pub(crate) const MAX_FN_SPAN: u64 = 0x10000;
 /// `[reg+disp]` with disp below this is treated as a struct-field access; larger
 /// displacements are almost certainly absolute addresses or noise.
 const MAX_FIELD_OFFSET: u64 = 0x8000;
@@ -66,6 +67,10 @@ pub struct CallSite {
 #[derive(Debug, Default, Clone)]
 pub struct CallGraph {
     pub entry: u64,
+    /// Instruction addresses reached by this walk. Used to distinguish a
+    /// tail edge into another known origin's body from a call to a missing
+    /// function; `max_end` alone is too coarse around embedded data.
+    pub instruction_ips: BTreeSet<u64>,
     /// Direct `CALL` targets → number of call sites hitting that target.
     pub direct_calls: BTreeMap<u64, u32>,
     /// Fall-through addresses of decoded direct CALL instructions. These are
@@ -75,7 +80,8 @@ pub struct CallGraph {
     pub call_continuations: BTreeSet<u64>,
     /// Per-call-site recovered argument shapes (one entry per direct `CALL` instruction).
     pub call_sites: Vec<CallSite>,
-    /// Direct `JMP rel` targets that leave the walked body (tail calls).
+    /// Direct `JMP`/`Jcc` targets that leave the walked body. Unconditional
+    /// `JMP`s are tail calls; out-of-span conditional targets are external edges.
     pub tail_calls: BTreeSet<u64>,
     pub indirect_calls: u32,
     pub indirect_jumps: u32,
@@ -517,6 +523,7 @@ fn analyze_uncached(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph
                 }
                 break;
             }
+            cg.instruction_ips.insert(ip);
             cg.max_end = cg.max_end.max(instr.next_ip());
             scan_operands(pe, &instr, &mut cg);
             block_buf.push(instr);
@@ -576,6 +583,17 @@ fn analyze_uncached(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph
                     if (lo..hi).contains(&t) {
                         branch_seed.entry(t).or_insert_with(|| block_buf.clone());
                         work.push(t);
+                    } else if let Some(internal) = internal_jump_trampoline(pe, t, lo, hi) {
+                        // Some functions place a shared cleanup label just
+                        // before their apparent entry, then branch back to
+                        // it from the body (e.g. a null-input early return).
+                        // If that label is only a JMP into this function's
+                        // own span, follow the destination as intra-function
+                        // control flow instead of reporting a missing callee.
+                        branch_seed
+                            .entry(internal)
+                            .or_insert_with(|| block_buf.clone());
+                        work.push(internal);
                     } else {
                         cg.tail_calls.insert(t);
                     }
@@ -600,7 +618,7 @@ fn analyze_uncached(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph
                         // exactly one instruction so a `JMP` that skips an
                         // inline jump table after a prologue (multi-instr
                         // entry block) keeps the follow behavior below.
-                        if start == lo && block_buf.len() == 1 {
+                        if ip == lo && block_buf.len() == 1 {
                             cg.tail_calls.insert(t);
                         } else {
                             branch_seed.entry(t).or_insert_with(|| block_buf.clone());
@@ -741,6 +759,67 @@ fn analyze_uncached(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph
         }
     }
     Ok(cg)
+}
+
+/// Resolve a one-instruction JMP label just outside the walked origin when it
+/// immediately jumps back into that origin's span. Such labels are commonly
+/// shared epilogues placed before an entry point, not tail callees.
+fn internal_jump_trampoline(pe: &Pe, target: u64, lo: u64, hi: u64) -> Option<u64> {
+    let bytes = pe.read(target, 15)?;
+    let mut decoder = Decoder::with_ip(32, bytes, target, DecoderOptions::NONE);
+    let instr = decoder.decode();
+    if instr.is_invalid() || instr.flow_control() != FlowControl::UnconditionalBranch {
+        return None;
+    }
+    let dest = instr.near_branch_target();
+    (lo..hi).contains(&dest).then_some(dest)
+}
+
+/// Recognize a standalone shared cleanup block. A true tail target can point
+/// backward to an epilogue emitted next to another function; that block only
+/// restores the current frame and returns, so it is not a missing callee.
+pub(crate) fn is_epilogue_block(pe: &Pe, target: u64) -> bool {
+    let Some(bytes) = pe.read(target, 64) else {
+        return false;
+    };
+    let mut decoder = Decoder::with_ip(32, bytes, target, DecoderOptions::NONE);
+    let mut instr = Instruction::default();
+    let mut saw_stack_restore = false;
+    let mut popped = 0u8;
+    for _ in 0..10 {
+        if !decoder.can_decode() {
+            return false;
+        }
+        decoder.decode_out(&mut instr);
+        if instr.is_invalid() {
+            return false;
+        }
+        match instr.mnemonic() {
+            Mnemonic::Lea
+                if instr.op0_kind() == OpKind::Register
+                    && instr.op0_register() == Register::ESP
+                    && instr.op1_kind() == OpKind::Memory
+                    && instr.memory_base() == Register::EBP
+                    && instr.memory_index() == Register::None =>
+            {
+                saw_stack_restore = true;
+            }
+            Mnemonic::Mov
+                if instr.op0_kind() == OpKind::Register
+                    && instr.op0_register() == Register::ESP
+                    && instr.op1_kind() == OpKind::Register
+                    && instr.op1_register() == Register::EBP =>
+            {
+                saw_stack_restore = true;
+            }
+            Mnemonic::Pop if instr.op0_kind() == OpKind::Register => {
+                popped = popped.saturating_add(1);
+            }
+            Mnemonic::Ret | Mnemonic::Retf => return saw_stack_restore && popped > 0,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Addresses a tail-call target references (its globals, baked immediates,

@@ -23,7 +23,8 @@
 //! `CALLGRAPH_REQUIRE_FIXTURES=1`.
 
 use callgraph_verify::{
-    analyze, cfg_fingerprint, diff_calls, has_direct_branch_target, FixupStatus, Pe, Spec,
+    analyze, cfg_fingerprint, diff_body_calls_ext, diff_calls, has_direct_branch_target,
+    FixupStatus, Pe, Spec,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -174,6 +175,68 @@ fn dos_compiled_c_calls_have_verified_return_addresses() {
         cg.call_continuations.len() as u32,
         calls,
         "every decoded direct CALL in compiled C at {entry:#x} pushes one unique fall-through return address"
+    );
+}
+
+#[test]
+fn dos_internal_jump_after_call_is_not_unported_but_real_call_is() {
+    let Some((_, pe)) = load_dos() else {
+        return;
+    };
+    let mut candidates = Vec::new();
+    for entry in sweep_functions(&pe, 512) {
+        let Ok(cg) = analyze(&pe, entry) else {
+            continue;
+        };
+        let shape = cfg_fingerprint(&pe, entry).ok();
+        // The fixture function calls a zero-argument helper and immediately
+        // jumps back to its loop label. Pin that compiler shape so this test
+        // would catch the old CALL-buffer-reset / entry-JMP misclassification.
+        let call_followed_by_jmp = cg.call_continuations.iter().any(|&ret| {
+            pe.read(ret, 1)
+                .is_some_and(|bytes| matches!(bytes[0], 0xE9 | 0xEB))
+        });
+        if cg.direct_calls.len() == 1
+            && shape.is_some_and(|fp| fp.loops == 1 && fp.conditionals == 1)
+            && call_followed_by_jmp
+            && cg.tail_calls.is_empty()
+        {
+            candidates.push((entry, cg));
+        }
+    }
+    assert_eq!(
+        candidates.len(),
+        1,
+        "expected one unique Open Watcom call_then_goto_loop shape, found {}",
+        candidates.len()
+    );
+    let (entry, cg) = candidates.pop().unwrap();
+    assert!(
+        cg.tail_calls
+            .iter()
+            .all(|target| !cg.instruction_ips.contains(target)),
+        "internal back-edge was misclassified as a tail call at {entry:#x}: {:?}",
+        cg.tail_calls
+    );
+
+    // Empty corpus makes the direct call an intentionally unported target.
+    // The unhappy path must keep that real CALL visible while the happy path
+    // excludes the loop's internal JMP from the warning list.
+    let empty = BTreeSet::new();
+    let diff = diff_body_calls_ext(&pe, &[entry], &empty, &[], &empty, &empty, &empty)
+        .expect("diff compiled DOS loop caller");
+    for &target in cg.direct_calls.keys() {
+        assert!(
+            diff.unported.contains(&target),
+            "real direct CALL {target:#x} was incorrectly filtered from {entry:#x}"
+        );
+    }
+    assert!(
+        diff.unported
+            .iter()
+            .all(|target| !cg.instruction_ips.contains(target)),
+        "internal instruction target leaked into unported calls at {entry:#x}: {:?}",
+        diff.unported
     );
 }
 

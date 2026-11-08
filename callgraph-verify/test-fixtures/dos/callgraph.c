@@ -57,6 +57,26 @@ int loop_sum(int n) {
     return s;
 }
 
+volatile int loop_ticks = 0;
+
+void loop_tick(void) {
+    loop_ticks++;
+}
+
+/* Keep a direct CALL immediately before a goto back-edge. With Watcom's
+ * unoptimized output this exercises the CALL-buffer reset followed by a
+ * one-instruction JMP basic block. The back-edge is internal control flow,
+ * not a missing tail-called function. */
+int call_then_goto_loop(int n) {
+again:
+    if (n <= 0) {
+        return loop_ticks;
+    }
+    n--;
+    loop_tick();
+    goto again;
+}
+
 int nested_sum(int n, int m) {
     int s;
     int i;
@@ -160,6 +180,7 @@ int main(void) {
     total += branch_caller(7);
     total += parent_fn(5);
     total += loop_sum(10);
+    total += call_then_goto_loop(3);
     total += nested_sum(10, 10);
     total += classify(3);
     total += classify(99);
