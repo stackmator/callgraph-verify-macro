@@ -827,6 +827,44 @@ mod tests {
         );
     }
 
+    /// The continuation of a verified direct CALL is an architectural guest
+    /// return address and may be materialized by a faithful call-boundary
+    /// model. It should not fail the address-fact gate as an invented VA.
+    #[test]
+    fn direct_call_continuation_is_a_verified_address_fact() {
+        // CALL 0x0040100A ; MOV EAX, 0x00401005 ; RET
+        // The CALL continuation is entry+5; the immediate spells the same
+        // binary-derived return address as a data value.
+        let code = [
+            0xE8, 0x05, 0x00, 0x00, 0x00, // call entry+10
+            0xB8, 0x05, 0x10, 0x40, 0x00, // mov eax, entry+5
+            0xC3,
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let cg = analyze(&pe, entry).expect("analyze");
+        assert!(cg.direct_calls.contains_key(&(entry + 10)));
+        assert!(cg.call_continuations.contains(&(entry + 5)));
+        assert!(cg.operand_references().contains(&(entry + 5)));
+    }
+
+    /// CALL $+5 has no call-graph callee, but still pushes its fall-through
+    /// address for get-PC/call-next code.
+    #[test]
+    fn get_pc_call_continuation_is_a_verified_address_fact() {
+        let code = [
+            0xE8, 0x00, 0x00, 0x00, 0x00, // call next instruction
+            0x58, // pop eax
+            0xC3, // ret
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let cg = analyze(&pe, entry).expect("analyze");
+        assert!(cg.direct_calls.is_empty());
+        assert!(cg.call_continuations.contains(&(entry + 5)));
+        assert!(cg.operand_references().contains(&(entry + 5)));
+    }
+
     /// SIB-indexed `[base + index*scale + disp32]` with an IN-SECTION
     /// displacement is a table-base load (e.g. `[eax*4+0x18F01]` in a real LE
     /// binary),

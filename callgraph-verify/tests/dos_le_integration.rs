@@ -156,6 +156,28 @@ fn dos_byte_scan_agrees_with_analyze() {
 }
 
 #[test]
+fn dos_compiled_c_calls_have_verified_return_addresses() {
+    let Some((_, pe)) = load_dos() else {
+        return;
+    };
+    let addrs = sweep_functions(&pe, 512);
+    let caller = addrs
+        .iter()
+        .find_map(|entry| {
+            let cg = analyze(&pe, *entry).ok()?;
+            (!cg.direct_calls.is_empty()).then_some((*entry, cg))
+        })
+        .expect("compiled DOS C fixture has a direct-call function");
+    let (entry, cg) = caller;
+    let calls: u32 = cg.direct_calls.values().sum();
+    assert_eq!(
+        cg.call_continuations.len() as u32,
+        calls,
+        "every decoded direct CALL in compiled C at {entry:#x} pushes one unique fall-through return address"
+    );
+}
+
+#[test]
 fn dos_diff_clean_when_declared_equals_real() {
     let Some(_) = load_dos() else {
         return;

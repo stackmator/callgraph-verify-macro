@@ -68,6 +68,11 @@ pub struct CallGraph {
     pub entry: u64,
     /// Direct `CALL` targets → number of call sites hitting that target.
     pub direct_calls: BTreeMap<u64, u32>,
+    /// Fall-through addresses of decoded direct CALL instructions. These are
+    /// guest return addresses pushed by the instruction, not arbitrary body
+    /// immediates; operand validation may accept them when a port models the
+    /// architectural return address explicitly.
+    pub call_continuations: BTreeSet<u64>,
     /// Per-call-site recovered argument shapes (one entry per direct `CALL` instruction).
     pub call_sites: Vec<CallSite>,
     /// Direct `JMP rel` targets that leave the walked body (tail calls).
@@ -116,6 +121,18 @@ impl CallGraph {
     /// into F, so a Rust call F→C is faithful (un-inlined), not hallucinated.
     pub fn footprint(&self) -> BTreeSet<u64> {
         let mut s: BTreeSet<u64> = self.direct_calls.keys().copied().collect();
+        s.extend(&self.tail_calls);
+        s.extend(&self.iat_calls);
+        s.extend(&self.globals);
+        s.extend(&self.imm_addrs);
+        s
+    }
+
+    /// Addresses the operand gate may accept when a port spells binary facts
+    /// directly, including architectural return PCs pushed by direct CALLs.
+    pub fn operand_references(&self) -> BTreeSet<u64> {
+        let mut s: BTreeSet<u64> = self.direct_calls.keys().copied().collect();
+        s.extend(&self.call_continuations);
         s.extend(&self.tail_calls);
         s.extend(&self.iat_calls);
         s.extend(&self.globals);
@@ -507,6 +524,9 @@ fn analyze_uncached(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph
             match instr.flow_control() {
                 FlowControl::Call => {
                     let t = instr.near_branch_target();
+                    // Every decoded near CALL pushes next_ip, even when a
+                    // call-next/get-PC pattern has no recoverable callee.
+                    cg.call_continuations.insert(instr.next_ip());
                     // `call $+5` (rel32 == 0, target == next_ip) is either a
                     // genuine get-PC/fall-through or a load-time relocation
                     // site (LE 08 self-relative fixup) whose on-disk field is

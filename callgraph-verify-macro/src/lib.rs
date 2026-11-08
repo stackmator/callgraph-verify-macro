@@ -920,11 +920,11 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     match analyze(&pe, args.addr) {
         Ok(cg) => {
             let mut referenced: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-            referenced.extend(cg.direct_calls.keys().copied());
-            referenced.extend(&cg.tail_calls);
-            referenced.extend(&cg.globals);
-            referenced.extend(&cg.imm_addrs);
-            referenced.extend(&cg.iat_calls);
+            // A decoded direct CALL itself pushes its fall-through address
+            // onto the guest stack. Ports that explicitly materialize this
+            // return PC (for example, when modelling a call-next dispatch
+            // thunk) are spelling a binary-derived control-flow fact.
+            referenced.extend(cg.operand_references());
             // Fold in each tail target's own referenced addresses (globals,
             // immediates, IAT slots) — the address-side mirror of the
             // call-side wide set in `diff_body_calls`, which already counts
@@ -977,8 +977,8 @@ fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
                             error::Code::HallucinatedAddr,
                             format!(
                                 "body bakes in {v:#010x} (inside the image), but binary \
-                                 at {:#010x} never references it (not a CALL target, \
-                                 global, baked immediate, or IAT slot)",
+                                 at {:#010x} never references it (not a CALL target or \
+                                 return address, global, baked immediate, or IAT slot)",
                                 args.addr
                             ),
                         )

@@ -14,7 +14,7 @@ error:   [CG-VERIFY-E013 MISSING] binary calls `real_call` (0x00402000) — body
 11 | pub fn f() -> u32 {
    |     ^^
 
-error:   [CG-VERIFY-E015 HALLUCINATED-ADDR] body bakes in 0x00a00004 (inside the image), but binary at 0x00401000 never references it (not a CALL target, global, baked immediate, or IAT slot)
+error:   [CG-VERIFY-E015 HALLUCINATED-ADDR] body bakes in 0x00a00004 (inside the image), but binary at 0x00401000 never references it (not a CALL target or return address, global, baked immediate, or IAT slot)
            -> fix: use the address the binary actually references at this origin, or remove the literal if it's a stray
   --> tests/ui/e015_hallucinated_addr.rs:12:15
    |

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- E015 now accepts the fall-through address of a verified direct CALL as a
+  binary-grounded guest return address, covering faithful call-next dispatch
+  models without broadly allowing unreferenced in-image addresses.
+
 ## [0.1.10] - 2026-11-06
 
 ### Fixed
