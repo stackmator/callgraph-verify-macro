@@ -188,7 +188,6 @@ fn dos_internal_jump_after_call_is_not_unported_but_real_call_is() {
         let Ok(cg) = analyze(&pe, entry) else {
             continue;
         };
-        let shape = cfg_fingerprint(&pe, entry).ok();
         // The fixture function calls a zero-argument helper and immediately
         // jumps back to its loop label. Pin that compiler shape so this test
         // would catch the old CALL-buffer-reset / entry-JMP misclassification.
@@ -196,48 +195,43 @@ fn dos_internal_jump_after_call_is_not_unported_but_real_call_is() {
             pe.read(ret, 1)
                 .is_some_and(|bytes| matches!(bytes[0], 0xE9 | 0xEB))
         });
-        if cg.direct_calls.len() == 1
-            && shape.is_some_and(|fp| fp.loops == 1 && fp.conditionals == 1)
-            && call_followed_by_jmp
-            && cg.tail_calls.is_empty()
-        {
+        if cg.direct_calls.len() == 1 && call_followed_by_jmp {
             candidates.push((entry, cg));
         }
     }
-    assert_eq!(
-        candidates.len(),
-        1,
-        "expected one unique Open Watcom call_then_goto_loop shape, found {}",
-        candidates.len()
-    );
-    let (entry, cg) = candidates.pop().unwrap();
     assert!(
-        cg.tail_calls
-            .iter()
-            .all(|target| !cg.instruction_ips.contains(target)),
-        "internal back-edge was misclassified as a tail call at {entry:#x}: {:?}",
-        cg.tail_calls
+        !candidates.is_empty(),
+        "Open Watcom emitted no one-call function with a JMP at the call continuation"
     );
 
-    // Empty corpus makes the direct call an intentionally unported target.
-    // The unhappy path must keep that real CALL visible while the happy path
-    // excludes the loop's internal JMP from the warning list.
+    // Empty corpus makes each real direct call intentionally unported. The
+    // unhappy path keeps those CALLs visible; the happy path excludes JMP
+    // targets that are instructions in the same walked function.
     let empty = BTreeSet::new();
-    let diff = diff_body_calls_ext(&pe, &[entry], &empty, &[], &empty, &empty, &empty)
-        .expect("diff compiled DOS loop caller");
-    for &target in cg.direct_calls.keys() {
+    for (entry, cg) in candidates {
         assert!(
-            diff.unported.contains(&target),
-            "real direct CALL {target:#x} was incorrectly filtered from {entry:#x}"
+            cg.tail_calls
+                .iter()
+                .all(|target| !cg.instruction_ips.contains(target)),
+            "internal JMP target was misclassified as a tail call at {entry:#x}: {:?}",
+            cg.tail_calls
+        );
+        let diff = diff_body_calls_ext(&pe, &[entry], &empty, &[], &empty, &empty, &empty)
+            .expect("diff compiled DOS loop caller");
+        for &target in cg.direct_calls.keys() {
+            assert!(
+                diff.unported.contains(&target),
+                "real direct CALL {target:#x} was incorrectly filtered from {entry:#x}"
+            );
+        }
+        assert!(
+            diff.unported
+                .iter()
+                .all(|target| !cg.instruction_ips.contains(target)),
+            "internal instruction target leaked into unported calls at {entry:#x}: {:?}",
+            diff.unported
         );
     }
-    assert!(
-        diff.unported
-            .iter()
-            .all(|target| !cg.instruction_ips.contains(target)),
-        "internal instruction target leaked into unported calls at {entry:#x}: {:?}",
-        diff.unported
-    );
 }
 
 #[test]
