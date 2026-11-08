@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - E015 now accepts the fall-through address of a verified direct CALL as a
   binary-grounded guest return address, covering faithful call-next dispatch
   models without broadly allowing unreferenced in-image addresses.
+- Keep DOS LE integration coverage on the repository's Open Watcom C fixture;
+  external real-binary sweeps are restricted to PE files.
 
 ## [0.1.10] - 2026-11-06
 

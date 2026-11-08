@@ -114,16 +114,15 @@ REBUILD_ROOT = "C:/path/to/rebuild/source"
 |---|---|---|
 | `TARGET_EXE` | Macro is a no-op (emits a NOTE). | Hard `E004 TARGET-EXE-UNLOADABLE`. A configured-but-broken binary must never produce a green unverified build. |
 | `REBUILD_ROOT` | Body-call diff is skipped; explicit `fields/globals/vtables/...` checks, `E005/E006`, operand checks, and CFG checks still run. | `E008 CORPUS-GAP` if this function's own address is not in the scanned corpus. |
-| `CALLGRAPH_REQUIRE_FIXTURES=1` | Fixture tests skip when artifacts are missing. | Missing committed fixtures become hard test failures. |
-| `CALLGRAPH_REAL_EXE` | Real-binary sweep skips. | Loads the given PE/LE and sweeps it. |
+| `CALLGRAPH_REQUIRE_FIXTURES=1` | Missing fixtures skip during local runs when unset. | Missing CI fixtures become hard test failures. |
+| `CALLGRAPH_REAL_EXE` | Real-binary sweep skips. | Loads the given PE and sweeps it. |
 
 Fixture-path overrides (tests only): `CALLGRAPH_C_EXE/ADDRS`,
 `CALLGRAPH_C_OD_EXE/ADDRS`, `CALLGRAPH_C_DBG_EXE/ADDRS`,
-`CALLGRAPH_CPP_EXE/ADDRS`, `CALLGRAPH_DOS_EXE`.
+`CALLGRAPH_CPP_EXE/ADDRS`.
 
 Deliberate exceptions to `CALLGRAPH_REQUIRE_FIXTURES`:
 - `c_callgraph_dbg` — ILT thunks are an MSVC-only artifact; GNU ld cannot make one.
-- `dos_callgraph.exe` — Open Watcom is installed only on the Ubuntu CI job.
 
 ---
 

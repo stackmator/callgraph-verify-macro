@@ -1,8 +1,8 @@
 //! Local-only sweep over a user-provided real binary (e.g. a 2000s-era
-//! exe built with MSVC 2005/2008 — the crate's actual domain, which cannot
+//! PE built with MSVC 2005/2008 — the crate's actual domain, which cannot
 //! be committed to the repo for size and licensing reasons).
 //!
-//! Set `CALLGRAPH_REAL_EXE` to a 32-bit PE (or DOS4GW LE) path. Skipped when
+//! Set `CALLGRAPH_REAL_EXE` to a 32-bit PE path. Skipped when
 //! unset — including under `CALLGRAPH_REQUIRE_FIXTURES=1`, which governs
 //! only the committed fixtures (this file can never exist in CI).
 //!
@@ -10,20 +10,22 @@
 //! decoder/byte-scan agreement and diff-cleanliness over every analyzable
 //! function, plus a printed summary (run with `-- --nocapture` to see it).
 
-use callgraph_verify::{analyze, cfg_fingerprint, diff_calls, has_direct_branch_target, Pe};
+use callgraph_verify::{analyze, diff_calls, has_direct_branch_target, Pe};
 
 #[test]
 fn real_binary_sweeps_agree_and_diff_clean() {
     let exe = match std::env::var("CALLGRAPH_REAL_EXE") {
         Ok(p) if !p.trim().is_empty() => p,
         _ => {
-            eprintln!(
-                "skipping: set CALLGRAPH_REAL_EXE=<path-to-32bit-exe> to sweep a real binary"
-            );
+            eprintln!("skipping: set CALLGRAPH_REAL_EXE=<path-to-32bit-PE> to sweep a real PE");
             return;
         }
     };
     let pe = Pe::load(&exe).unwrap_or_else(|e| panic!("load {exe}: {e}"));
+    assert!(
+        !pe.is_le(),
+        "DOS LE coverage uses the repository's Open Watcom C fixture"
+    );
     // Only check callers that are REFERENCED (a rel32 target or a stored
     // dword): that is the crate's own definition of a plausible function
     // entry (the ORIGIN-UNREFERENCED gate). A blind extent-skip walk also
@@ -101,137 +103,5 @@ fn real_binary_sweeps_agree_and_diff_clean() {
         unclean.is_empty(),
         "{} of {fns} functions not diff-clean: {unclean:?}",
         unclean.len()
-    );
-}
-
-#[test]
-fn real_le_fixup_post_images_are_referenced() {
-    let exe = match std::env::var("CALLGRAPH_REAL_EXE") {
-        Ok(p) if !p.trim().is_empty() => p,
-        _ => {
-            eprintln!(
-                "skipping: set CALLGRAPH_REAL_EXE=<path-to-DOS4GW-LE> to pin fixup post images"
-            );
-            return;
-        }
-    };
-    let pe = Pe::load(&exe).unwrap_or_else(|e| panic!("load {exe}: {e}"));
-    if pe.fixup_count() == 0 {
-        eprintln!("{exe}: no 07 fixup pairs; nothing to pin");
-        return;
-    }
-    // Real-binary counterpart of the synthetic pe.rs test: every link-time
-    // value the byte scan saw as referenced must also contribute its runtime
-    // (post-fixup) image to the ORIGIN-UNREFERENCED accept set. This is the
-    // `mov dword [slot],pre; call [slot]` callback pattern that motivated the
-    // widening (e.g. an LE binary seeds slot 0x25AE4 with link-time 0x64ABA, so
-    // post 0x74ABA must count as referenced).
-    let refs = pe.referenced_addrs();
-    let mut checked = 0u32;
-    let mut sample: Vec<(u64, u64)> = Vec::new();
-    for &(pre, post) in pe.fixup_pairs() {
-        if (pre as u32) == (post as u32) || !refs.contains(&(pre as u32)) {
-            continue;
-        }
-        assert!(
-            refs.contains(&(post as u32)),
-            "post-fixup image {post:#x} of referenced link-time {pre:#x} \
-             missing from referenced_addrs on {exe}"
-        );
-        if sample.len() < 8 {
-            sample.push((pre, post));
-        }
-        checked += 1;
-        if checked >= 512 {
-            break;
-        }
-    }
-    eprintln!("{exe}: verified {checked} pre->post references; sample {sample:x?}");
-    assert!(
-        checked > 0,
-        "{exe}: no in-image 07 pre value appeared in referenced_addrs"
-    );
-}
-
-/// Real-binary regression for the 0.1.8 LE jump-table fix: on a DOS4GW LE
-/// the switch table's base AND its entries are stored as link-time values
-/// and are relocated by the loader, so `follow_jump_table` must translate
-/// both through `Pe::fixup_post_image`. Before the fix every entry read as
-/// an out-of-span pre value, `switch_cases` collapsed to 0, and a body
-/// calling a hidden arm looked HALLUCINATED (the arm's CALL was never
-/// harvested).
-///
-/// Shape-based, no address manifest: walk every *referenced* entry (a
-/// plausible function start), and for each function that dispatches through
-/// an indirect jump require the switch to resolve. Skipped when
-/// `CALLGRAPH_REAL_EXE` is unset or the binary has no 07 fixups (PE).
-#[test]
-fn real_le_jump_table_entries_translate_to_post_images() {
-    let exe = match std::env::var("CALLGRAPH_REAL_EXE") {
-        Ok(p) if !p.trim().is_empty() => p,
-        _ => {
-            eprintln!(
-                "skipping: set CALLGRAPH_REAL_EXE=<path-to-DOS4GW-LE> to pin jump-table translation"
-            );
-            return;
-        }
-    };
-    let pe = Pe::load(&exe).unwrap_or_else(|e| panic!("load {exe}: {e}"));
-    if pe.fixup_count() == 0 {
-        eprintln!("{exe}: no 07 fixup pairs (not LE); jump-table translation is a no-op");
-        return;
-    }
-    let refs = pe.referenced_addrs();
-    let mut starts: Vec<(u64, u64)> = pe
-        .sections()
-        .iter()
-        .filter(|s| s.is_executable())
-        .map(|s| {
-            let start = pe.image_base + s.virtual_address as u64;
-            (start, start + s.virtual_size.max(s.raw_size) as u64)
-        })
-        .collect();
-    starts.sort();
-
-    let mut indirect_fns = 0u32;
-    let mut resolved_fns = 0u32;
-    let mut resolved_cases = 0u32;
-    let mut sample: Vec<(u64, usize, usize)> = Vec::new();
-    for (start, end) in starts {
-        let mut va = start;
-        while va < end {
-            if refs.contains(&(va as u32)) {
-                if let Ok(cg) = analyze(&pe, va) {
-                    if cg.indirect_jumps > 0 {
-                        indirect_fns += 1;
-                        if let Ok(fp) = cfg_fingerprint(&pe, va) {
-                            if fp.switch_cases >= 1 {
-                                resolved_fns += 1;
-                                resolved_cases += fp.switch_cases as u32;
-                                if sample.len() < 8 {
-                                    sample.push((va, fp.switch_cases, cg.direct_calls.len()));
-                                }
-                            }
-                        }
-                    }
-                    va = va.saturating_add(cg.max_end.saturating_sub(va).max(1));
-                    continue;
-                }
-            }
-            va += 1;
-        }
-    }
-    eprintln!(
-        "{exe}: {indirect_fns} indirect-jump entries, {resolved_fns} resolved \
-         ({resolved_cases} cases); sample {sample:x?}"
-    );
-    if indirect_fns == 0 {
-        eprintln!("{exe}: no indirect-jump entries; nothing to pin");
-        return;
-    }
-    assert!(
-        resolved_fns > 0,
-        "{exe}: {indirect_fns} indirect-jump entries but none resolved a switch table \
-         - pre-fixup table translation regressed"
     );
 }

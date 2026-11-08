@@ -35,10 +35,10 @@ python3 build_fixtures.py --out <dir>   # default: <repo>/target/fixtures
 * Linux: needs `i686-w64-mingw32-gcc` / `-g++` (`gcc-mingw-w64-i686`,
   `g++-mingw-w64-i686` packages).
 * DOS: built automatically when `owcc` is on PATH (CI installs it on the
-  ubuntu job via `open-watcom/setup-watcom` with `target: dos`; skipped
-  elsewhere — the dos tests skip even under REQUIRE, since Windows CI can
-  never have Watcom; the   ubuntu job is the DOS gate). No optimization flags on purpose — `wcc386`
-  does not inline without `-oe`, so every call edge survives.
+  Ubuntu job via `open-watcom/setup-watcom` with `target: dos` and requires
+  the output before running DOS tests). A local run without the fixture skips
+  unless `CALLGRAPH_REQUIRE_FIXTURES=1`. No optimization flags on purpose —
+  `wcc386` does not inline without `-oe`, so every call edge survives.
 
 Each PE fixture also gets a `<stem>_addrs.json` manifest
 (`{"leaf_add": "0x401000", ...}`) with preferred VAs extracted from the
@@ -48,20 +48,21 @@ map parsing is not worth the fragility.
 
 ## Consuming tests
 
-Tests resolve fixtures via `$CALLGRAPH_{C,CPP,DOS}_EXE` (+ `$..._ADDRS` for
+Tests resolve PE fixtures via `$CALLGRAPH_{C,CPP}_EXE` (+ `$..._ADDRS` for
 the manifests, plus `$CALLGRAPH_C_{OD,DBG}_EXE/ADDRS` for the `/Od` and
-`/INCREMENTAL` C twins), falling back to `<repo>/target/fixtures/`. When
+`/INCREMENTAL` C twins), falling back to `<repo>/target/fixtures/`. DOS tests
+always use the Open Watcom fixture at that location. When
 nothing is found they SKIP (plain `cargo test` without a C toolchain stays
 green). CI exports `CALLGRAPH_REQUIRE_FIXTURES=1`, which turns a missing
 fixture into a hard failure so a broken build step can never silently
-green the suite by skipping. Two deliberate exceptions, documented at
-their use sites: the MSVC-only `c_callgraph_dbg` twin (GNU ld cannot emit
-ILT thunks) and `CALLGRAPH_REAL_EXE` below.
+green the suite by skipping. The deliberate exception is the MSVC-only
+`c_callgraph_dbg` twin (GNU ld cannot emit ILT thunks); CI requires the DOS
+fixture after building it with Open Watcom.
 
 ## Sweeping your own sample binaries
 
 `tests/real_binary_sweep.rs` runs the whole-image agreement + diff-clean
-sweeps over any 32-bit PE/LE pointed at by `CALLGRAPH_REAL_EXE` — e.g. a
+sweep over a 32-bit PE pointed at by `CALLGRAPH_REAL_EXE` — e.g. a
 2000s-era exe built with MSVC 2005/2008, the crate's actual domain,
 which can never be committed (size + licensing). Local-only by design:
 it skips when the variable is unset, even under REQUIRE.

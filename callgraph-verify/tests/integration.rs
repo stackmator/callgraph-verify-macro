@@ -100,6 +100,7 @@ mod tests {
     #[test]
     fn test_binary_loads() {
         let pe = load_test_pe();
+        assert!(!pe.is_le());
         assert!(!pe.sections().is_empty());
         assert!(pe.sections().iter().any(|s| s.name == ".text"));
     }

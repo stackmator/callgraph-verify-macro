@@ -17,13 +17,9 @@
 //! indirect counts, and CFG shape only; `dos_fixup_post_images_accepted`
 //! pins the widening itself on real Watcom output.
 //!
-//! Fixture discovery mirrors `c_cpp_integration.rs`: `$CALLGRAPH_DOS_EXE`
-//! wins, else `<repo>/target/fixtures/dos_callgraph.exe`. Missing fixture
-//! skips — EVEN under `CALLGRAPH_REQUIRE_FIXTURES=1`. The DOS toolchain
-//! (Open Watcom) is installed on the ubuntu CI job only, so requiring the
-//! fixture everywhere would red the Windows job for a toolchain it can
-//! never have; the ubuntu job is the DOS gate. Same precedent as the
-//! MSVC-only ILT-thunk fixture in the other direction.
+//! Fixture discovery uses only `<repo>/target/fixtures/dos_callgraph.exe`.
+//! Missing fixture skips locally without Open Watcom. CI builds the fixture
+//! before tests and requires it when `CALLGRAPH_REQUIRE_FIXTURES=1`.
 
 use callgraph_verify::{
     analyze, cfg_fingerprint, diff_calls, has_direct_branch_target, FixupStatus, Pe, Spec,
@@ -32,25 +28,27 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 fn load_dos() -> Option<(PathBuf, Pe)> {
-    let exe = std::env::var("CALLGRAPH_DOS_EXE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("target")
-                .join("fixtures")
-                .join("dos_callgraph.exe")
-        });
+    let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("target")
+        .join("fixtures")
+        .join("dos_callgraph.exe");
     if !exe.exists() {
-        // NOTE: deliberately exempt from CALLGRAPH_REQUIRE_FIXTURES (see
-        // header): Watcom lives on the ubuntu job only.
-        eprintln!(
-            "skipping DOS4GW LE tests: {} not present (need owcc -bdos4g; see test-fixtures/README.md)",
+        let message = format!(
+            "{} not present (build with owcc -bdos4g; see test-fixtures/README.md)",
             exe.display()
         );
+        if std::env::var_os("CALLGRAPH_REQUIRE_FIXTURES").is_some() {
+            panic!("required DOS fixture is missing: {message}");
+        }
+        eprintln!("skipping DOS4GW LE tests: {message}");
         return None;
     }
     let pe = Pe::load(exe.to_str().unwrap()).expect("load DOS LE fixture");
+    assert!(
+        pe.is_le(),
+        "the Open Watcom fixture must be an LE executable"
+    );
     Some((exe, pe))
 }
 
@@ -99,6 +97,7 @@ fn dos_le_parses_with_code_sections() {
     };
     // LE images are identity-mapped: parse_le synthesizes image_base 0 with
     // object reloc bases as RVAs (a PE would carry 0x400000-style base).
+    assert!(pe.is_le());
     assert_eq!(
         pe.image_base,
         0,

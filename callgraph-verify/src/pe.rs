@@ -28,6 +28,7 @@ pub enum FixupStatus {
 pub struct Pe {
     data: Vec<u8>,
     pub image_base: u64,
+    is_le: bool,
     sections: Vec<Section>,
     /// LE fixup absorption (07 absolute records only): `(pre, post)` content
     /// pairs for every patched dword — `pre` is the link-time dword in the
@@ -182,6 +183,7 @@ impl Pe {
         Ok(Pe {
             data,
             image_base,
+            is_le: false,
             sections,
             fixup_posts: Vec::new(),
             fixup_rel32: Vec::new(),
@@ -193,6 +195,11 @@ impl Pe {
     /// Process-unique id assigned at parse time (see the field docs).
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Whether the loaded executable uses the DOS4GW LE container format.
+    pub fn is_le(&self) -> bool {
+        self.is_le
     }
 
     /// Runtime (post-fixup) images of link-time (pre-fixup) addresses: for
@@ -674,6 +681,7 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
     Ok(Pe {
         data: new_data,
         image_base: 0,
+        is_le: true,
         sections,
         fixup_posts,
         fixup_rel32,
