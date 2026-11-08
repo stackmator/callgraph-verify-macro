@@ -18,8 +18,9 @@
 //! pins the widening itself on real Watcom output.
 //!
 //! Fixture discovery uses only `<repo>/target/fixtures/dos_callgraph.exe`.
-//! Missing fixture skips locally without Open Watcom. CI builds the fixture
-//! before tests and requires it when `CALLGRAPH_REQUIRE_FIXTURES=1`.
+//! Missing fixture skips locally and on Windows (which has no Open Watcom).
+//! The Ubuntu CI job builds the fixture and requires it when
+//! `CALLGRAPH_REQUIRE_FIXTURES=1`.
 
 use callgraph_verify::{
     analyze, cfg_fingerprint, diff_calls, has_direct_branch_target, FixupStatus, Pe, Spec,
@@ -38,7 +39,7 @@ fn load_dos() -> Option<(PathBuf, Pe)> {
             "{} not present (build with owcc -bdos4g; see test-fixtures/README.md)",
             exe.display()
         );
-        if std::env::var_os("CALLGRAPH_REQUIRE_FIXTURES").is_some() {
+        if std::env::var_os("CALLGRAPH_REQUIRE_FIXTURES").is_some() && !cfg!(windows) {
             panic!("required DOS fixture is missing: {message}");
         }
         eprintln!("skipping DOS4GW LE tests: {message}");

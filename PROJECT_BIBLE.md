@@ -123,6 +123,7 @@ Fixture-path overrides (tests only): `CALLGRAPH_C_EXE/ADDRS`,
 
 Deliberate exceptions to `CALLGRAPH_REQUIRE_FIXTURES`:
 - `c_callgraph_dbg` — ILT thunks are an MSVC-only artifact; GNU ld cannot make one.
+- DOS LE tests on Windows — Open Watcom is installed only on Ubuntu; Ubuntu CI builds and requires the fixture.
 
 ---
 

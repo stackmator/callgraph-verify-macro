@@ -55,9 +55,10 @@ always use the Open Watcom fixture at that location. When
 nothing is found they SKIP (plain `cargo test` without a C toolchain stays
 green). CI exports `CALLGRAPH_REQUIRE_FIXTURES=1`, which turns a missing
 fixture into a hard failure so a broken build step can never silently
-green the suite by skipping. The deliberate exception is the MSVC-only
-`c_callgraph_dbg` twin (GNU ld cannot emit ILT thunks); CI requires the DOS
-fixture after building it with Open Watcom.
+green the suite by skipping. Deliberate exceptions are the MSVC-only
+`c_callgraph_dbg` twin (GNU ld cannot emit ILT thunks) and DOS tests on Windows
+(Open Watcom is installed only on Ubuntu). Ubuntu CI requires the DOS fixture
+after building it with Open Watcom.
 
 ## Sweeping your own sample binaries
 
