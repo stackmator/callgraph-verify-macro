@@ -849,6 +849,24 @@ mod tests {
         assert!(cg.operand_references().contains(&(entry + 5)));
     }
 
+    /// The fall-through of CALL r/m32 is also pushed as the guest return
+    /// address. A port boundary may faithfully materialize that continuation.
+    #[test]
+    fn indirect_call_continuation_is_a_verified_address_fact() {
+        // CALL EAX ; MOV EAX, entry+2 ; RET
+        let code = [
+            0xFF, 0xD0, // call eax
+            0xB8, 0x02, 0x10, 0x40, 0x00, // mov eax, entry+2
+            0xC3,
+        ];
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let cg = analyze(&pe, entry).expect("analyze");
+        assert_eq!(cg.indirect_calls, 1);
+        assert!(cg.indirect_call_continuations.contains(&(entry + 2)));
+        assert!(cg.operand_references().contains(&(entry + 2)));
+    }
+
     /// CALL $+5 has no call-graph callee, but still pushes its fall-through
     /// address for get-PC/call-next code.
     #[test]

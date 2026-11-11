@@ -78,6 +78,10 @@ pub struct CallGraph {
     /// immediates; operand validation may accept them when a port models the
     /// architectural return address explicitly.
     pub call_continuations: BTreeSet<u64>,
+    /// Fall-through addresses of decoded indirect CALL instructions. Like
+    /// direct CALLs, these are architectural return addresses pushed by the
+    /// instruction and may be spelled by a faithful indirect-call boundary.
+    pub indirect_call_continuations: BTreeSet<u64>,
     /// Per-call-site recovered argument shapes (one entry per direct `CALL` instruction).
     pub call_sites: Vec<CallSite>,
     /// Direct `JMP`/`Jcc` targets that leave the walked body. Unconditional
@@ -139,6 +143,7 @@ impl CallGraph {
     pub fn operand_references(&self) -> BTreeSet<u64> {
         let mut s: BTreeSet<u64> = self.direct_calls.keys().copied().collect();
         s.extend(&self.call_continuations);
+        s.extend(&self.indirect_call_continuations);
         s.extend(&self.tail_calls);
         s.extend(&self.iat_calls);
         s.extend(&self.globals);
@@ -561,6 +566,7 @@ fn analyze_uncached(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph
                 }
                 FlowControl::IndirectCall => {
                     cg.indirect_calls += 1;
+                    cg.indirect_call_continuations.insert(instr.next_ip());
                     record_indirect_target(&instr, pe, &mut cg);
                     block_buf.clear(); // an indirect call's args must not leak into the next call
                 }

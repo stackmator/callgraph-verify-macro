@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Accept the fall-through address of a verified indirect CALL as its
+  architectural guest return address for E015 operand validation.
+
 ## [0.1.12] - 2026-11-08
 
 ### Fixed

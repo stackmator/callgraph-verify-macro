@@ -153,6 +153,8 @@ For each `#[origin(addr, ...)]` function, on every `cargo check`/`build`:
 9. **`arg_shape_check`**: `E014 ARG-SHAPE` at unambiguous call sites.
 10. **Operand check**: every in-image hex literal in the body must be
     referenced by the binary at this origin → `E015 HALLUCINATED-ADDR`.
+    Fall-through addresses of decoded direct and indirect CALLs count as
+    architectural guest return addresses; arbitrary in-image literals do not.
 11. **CFG check**: `E016 CFG` for missing loops/switches or gross
     under-branching; `E021 POLARITY-NOTE` advisory; fake-loop note.
 12. **Emit diagnostics**: one `compile_error!` per finding, each with its own
