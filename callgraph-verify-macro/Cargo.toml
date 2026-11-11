@@ -9,7 +9,7 @@
 # iced-x86 dependency never touches the rebuild's i686 target binary.
 [package]
 name = "callgraph-verify-macro"
-version.workspace = true
+version = "0.1.14"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

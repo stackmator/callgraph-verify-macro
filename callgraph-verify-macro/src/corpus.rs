@@ -27,6 +27,9 @@ pub struct Corpus {
     /// per fn. A binary fn may be implemented by exactly ONE Rust fn, so any address
     /// with >1 owner here is a duplicate (mirrors `check_origins.py`'s dup-addr check).
     pub addr_owners: HashMap<u64, Vec<String>>,
+    /// Source bodies for originated free functions, used only by the explicit
+    /// `body_from` shared-entry mechanism.
+    pub bodies_by_addr: HashMap<u64, String>,
     pub corpus: BTreeSet<u64>,
     /// `(engine vtable VA, slot count)` for every `vtable_table!` the rebuild declares.
     /// Lets the verifier read those engine vtables from the PE and recognize which call
@@ -73,6 +76,7 @@ fn build(root: &str) -> Corpus {
         methods: HashMap::new(),
         addr2name: HashMap::new(),
         addr_owners: HashMap::new(),
+        bodies_by_addr: HashMap::new(),
         corpus: BTreeSet::new(),
         declared_vtables: Vec::new(),
         macro_defs: HashMap::new(),
@@ -184,21 +188,23 @@ fn path_is(path: &syn::Path, name: &str) -> bool {
 fn scan_fn(f: &ItemFn, disp_path: &str, c: &mut Corpus) {
     let name = f.sig.ident.to_string();
     let is_method = is_method_sig(&f.sig);
-    scan_attrs_and_record(&f.attrs, &name, is_method, disp_path, c);
+    use quote::ToTokens;
+    let body = f.block.to_token_stream().to_string();
+    scan_attrs_and_record(&f.attrs, &name, is_method, disp_path, Some(body), c);
 }
 
 /// Harvest an `impl`-block method's origin annotation.
 fn scan_impl_fn(m: &ImplItemFn, disp_path: &str, c: &mut Corpus) {
     let name = m.sig.ident.to_string();
     let is_method = true; // `self` is implicit inside an impl block
-    scan_attrs_and_record(&m.attrs, &name, is_method, disp_path, c);
+    scan_attrs_and_record(&m.attrs, &name, is_method, disp_path, None, c);
 }
 
 /// Harvest a trait method's origin annotation (a trait default body).
 fn scan_trait_fn(m: &TraitItemFn, disp_path: &str, c: &mut Corpus) {
     let name = m.sig.ident.to_string();
     let is_method = true;
-    scan_attrs_and_record(&m.attrs, &name, is_method, disp_path, c);
+    scan_attrs_and_record(&m.attrs, &name, is_method, disp_path, None, c);
 }
 
 /// Walk an attribute list looking for `#[origin(0xA)]`
@@ -208,6 +214,7 @@ fn scan_attrs_and_record(
     name: &str,
     is_method: bool,
     disp_path: &str,
+    body: Option<String>,
     c: &mut Corpus,
 ) {
     let mut addrs: Vec<u64> = Vec::new();
@@ -233,6 +240,14 @@ fn scan_attrs_and_record(
                 // uses the existing `Args` parser.
                 if let Ok(o) = parse_origin_attr(m.tokens.clone()) {
                     addrs.push(o.addr);
+                    if o.body_from.is_some() {
+                        continue;
+                    }
+                    if !is_method {
+                        if let Some(body) = &body {
+                            c.bodies_by_addr.insert(o.addr, body.clone());
+                        }
+                    }
                 }
             }
         }
@@ -324,6 +339,7 @@ mod tests {
             methods: std::collections::HashMap::new(),
             addr2name: std::collections::HashMap::new(),
             addr_owners: std::collections::HashMap::new(),
+            bodies_by_addr: std::collections::HashMap::new(),
             corpus: std::collections::BTreeSet::new(),
             declared_vtables: Vec::new(),
             macro_defs: std::collections::HashMap::new(),
@@ -532,6 +548,17 @@ fn helper() {}
         let c = scan_text("    #[origin(0x004028d0)]\n    pub fn foo() {}");
         assert!(c.free_fns.contains_key("foo"));
         assert!(c.corpus.contains(&0x004028d0));
+    }
+
+    #[test]
+    fn body_from_alias_does_not_become_a_source_body() {
+        let c = scan_text(
+            "#[origin(0x100)] pub fn source() { real_call(); }\n\
+             #[origin(0x110, body_from = [0x100])] pub fn alias() {}",
+        );
+        assert!(c.bodies_by_addr[&0x100].contains("real_call"));
+        assert!(!c.bodies_by_addr.contains_key(&0x110));
+        assert!(c.corpus.contains(&0x110));
     }
 
     /// A doc comment mentioning `origin:` (the legacy convention) alongside the

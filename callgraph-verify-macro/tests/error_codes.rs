@@ -21,7 +21,8 @@
 //! E004 TARGET-EXE-UNLOADABLE, E007 DECLARED-FACTS, E009 DUP-ADDR,
 //! E011 VTABLE-DISPATCH, E012 HALLUCINATED,
 //! E013 MISSING, E014 ARG-SHAPE, E015 HALLUCINATED-ADDR, E016 CFG,
-//! E017 ANALYZE, E018 CFG-FINGERPRINT, E019 VTABLE-SLOT, E020 VTABLE-SLOT-OOB.
+//! E017 ANALYZE, E018 CFG-FINGERPRINT, E019 VTABLE-SLOT, E020 VTABLE-SLOT-OOB,
+//! E022 BODY-SOURCE-UNAVAILABLE.
 //!
 //! ## Workflow
 //!
@@ -286,6 +287,7 @@ fn ui() {
     {
         let t = trybuild::TestCases::new();
         t.compile_fail("tests/ui/e00[1-4]*.rs");
+        t.compile_fail("tests/ui/e022_body_source_unavailable.rs");
     }
 
     // Phase2: PE-loaded. Synthetic PE + corpus. Explicit per-fixture names

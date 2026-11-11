@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.14] - 2026-11-11
+
+### Added
+
+- Support `#[origin(VA, body_from = [SOURCE_VA])]` for real entry points
+  that share one instruction body. The shared source is copied at expansion
+  time and verified independently at every attributed address.
+- Add E022 `BODY-SOURCE-UNAVAILABLE` for missing, invalid, or chained body
+  sources.
 
 ## [0.1.13] - 2026-11-10
 

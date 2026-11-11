@@ -75,6 +75,8 @@ pub enum Code {
     /// body never tests — a wrong-class predicate the call/CFG checks can't
     /// see. E021.
     Polarity,
+    /// A `body_from` source is unavailable or invalid. E022.
+    BodySourceUnavailable,
 }
 
 impl Code {
@@ -101,6 +103,7 @@ impl Code {
             Code::VTableSlot => "E019",
             Code::VTableSlotOob => "E020",
             Code::Polarity => "E021",
+            Code::BodySourceUnavailable => "E022",
         }
     }
 
@@ -127,6 +130,7 @@ impl Code {
             Code::VTableSlot => "VTABLE-SLOT",
             Code::VTableSlotOob => "VTABLE-SLOT-OOB",
             Code::Polarity => "POLARITY",
+            Code::BodySourceUnavailable => "BODY-SOURCE-UNAVAILABLE",
         }
     }
 
@@ -297,6 +301,7 @@ mod tests {
             ("E019", "VTABLE-SLOT", VTableSlot),
             ("E020", "VTABLE-SLOT-OOB", VTableSlotOob),
             ("E021", "POLARITY", Polarity),
+            ("E022", "BODY-SOURCE-UNAVAILABLE", BodySourceUnavailable),
         ];
         for (number, label, code) in cases {
             assert_eq!(code.number(), *number, "number drift for {:?}", code);

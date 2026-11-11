@@ -1,0 +1,13 @@
+error: [CG-VERIFY-E022 BODY-SOURCE-UNAVAILABLE] no originated free-function body found at 0xdeadbeef
+ --> tests/ui/e022_body_source_unavailable.rs:4:1
+  |
+4 | #[origin(0x00401000, body_from = [0xdeadbeef])]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `origin` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/ui/e022_body_source_unavailable.rs:5:18
+  |
+5 | pub fn alias() {}
+  |                  ^ consider adding a `main` function to `$DIR/tests/ui/e022_body_source_unavailable.rs`

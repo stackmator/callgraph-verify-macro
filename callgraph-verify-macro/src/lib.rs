@@ -48,6 +48,9 @@ mod expand;
 
 struct Args {
     addr: u64,
+    /// Reuse another originated free function's source body, but verify that
+    /// body independently against this address as well.
+    body_from: Option<u64>,
     fields: Vec<u64>,
     globals: Vec<u64>,
     vtables: Vec<u64>,
@@ -71,6 +74,7 @@ struct Args {
 #[derive(Debug, Clone)]
 pub(crate) struct OriginAttr {
     pub addr: u64,
+    pub body_from: Option<u64>,
 }
 
 /// Parse the inner tokens of `#[origin(…)]`.
@@ -78,7 +82,10 @@ pub(crate) struct OriginAttr {
 /// the syn AST) can call it without round-tripping through `proc_macro`.
 pub(crate) fn parse_origin_attr(tokens: proc_macro2::TokenStream) -> syn::Result<OriginAttr> {
     let args: Args = syn::parse2(tokens)?;
-    Ok(OriginAttr { addr: args.addr })
+    Ok(OriginAttr {
+        addr: args.addr,
+        body_from: args.body_from,
+    })
 }
 
 fn array_of_u64(arr: &ExprArray) -> syn::Result<Vec<u64>> {
@@ -99,6 +106,7 @@ impl Parse for Args {
         let addr: u64 = input.parse::<LitInt>()?.base10_parse()?;
         let mut a = Args {
             addr,
+            body_from: None,
             fields: Vec::new(),
             globals: Vec::new(),
             vtables: Vec::new(),
@@ -126,7 +134,7 @@ impl Parse for Args {
                         let msg = format!(
                             "[CG-VERIFY-E002 UNKNOWN-ATTR-FLAG] unknown flag `{other}` in \
                              #[origin(...)] — only `unreferenced` is supported as a bare flag. \
-                             Maybe you meant one of: fields, globals, vtables, vcall_slots, indirect_targets, iat"
+                             Maybe you meant one of: body_from, fields, globals, vtables, vcall_slots, indirect_targets, iat"
                         );
                         return Err(syn::Error::new(key.span(), msg));
                     }
@@ -135,6 +143,15 @@ impl Parse for Args {
             input.parse::<Token![=]>()?;
             let vals = array_of_u64(&input.parse::<ExprArray>()?)?;
             match key.to_string().as_str() {
+                "body_from" => {
+                    if vals.len() != 1 {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "body_from requires exactly one origin address",
+                        ));
+                    }
+                    a.body_from = Some(vals[0]);
+                }
                 "fields" => a.fields = vals,
                 "globals" => a.globals = vals,
                 "vtables" => a.vtables = vals,
@@ -144,7 +161,7 @@ impl Parse for Args {
                 other => {
                     let msg = format!(
                         "[CG-VERIFY-E001 UNKNOWN-ATTR-KEY] unknown key `{other}` in \
-                         #[origin(...)] — supported keys: fields, globals, vtables, \
+                         #[origin(...)] — supported keys: body_from, fields, globals, vtables, \
                          vcall_slots, indirect_targets, iat (each takes \
                          `= [0xNN, ...]`). Bare flag: unreferenced"
                     );
@@ -454,7 +471,45 @@ fn arg_shape_check(
 
 fn verify_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as Args);
-    let item2 = proc_macro2::TokenStream::from(item);
+    let mut item2 = proc_macro2::TokenStream::from(item);
+
+    // A real interior entry may share a machine-code body with another entry.
+    // Copy the source AST body at expansion time, then run every ordinary
+    // verifier check against the new VA. This keeps one authored body while
+    // preserving an independently checked call/CFG/operand contract.
+    if let Some(source_addr) = args.body_from {
+        let root = match std::env::var("REBUILD_ROOT") {
+            Ok(root) => root,
+            Err(_) => {
+                let err = syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "[CG-VERIFY-E022 BODY-SOURCE-UNAVAILABLE] body_from requires REBUILD_ROOT",
+                )
+                .to_compile_error();
+                return quote! { #err #item2 }.into();
+            }
+        };
+        let map = corpus::corpus_map(&root);
+        let Some(source_body) = map.bodies_by_addr.get(&source_addr) else {
+            let err = syn::Error::new(proc_macro2::Span::call_site(), format!(
+                "[CG-VERIFY-E022 BODY-SOURCE-UNAVAILABLE] no originated free-function body found at {source_addr:#010x}"))
+                .to_compile_error();
+            return quote! { #err #item2 }.into();
+        };
+        let parsed = syn::parse2::<syn::ItemFn>(item2.clone());
+        match (parsed, syn::parse_str::<syn::Block>(source_body)) {
+            (Ok(mut target), Ok(body)) => {
+                target.block = Box::new(body);
+                item2 = quote! { #target };
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                let err = syn::Error::new(proc_macro2::Span::call_site(), format!(
+                    "[CG-VERIFY-E022 BODY-SOURCE-UNAVAILABLE] body_from requires free functions and a parseable source body: {e}"))
+                    .to_compile_error();
+                return quote! { #err #item2 }.into();
+            }
+        }
+    }
 
     // The attribute only makes sense on a function. Parse the item AS a fn
     // (free or impl-method) and harvest the body from the syn AST — the old

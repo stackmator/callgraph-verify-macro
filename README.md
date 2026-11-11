@@ -102,6 +102,13 @@ Pin field offsets, globals, vtables, vcall slots, IAT slots:
 pub unsafe fn SomeFn(...) { ... }
 ```
 
+Two real entry addresses that begin the same instruction body can share one
+authored Rust implementation. Put `body_from = [0xFIRST]` on the second free
+function's origin. The macro copies the first body's source at expansion time
+and independently runs the normal checks against the second address.
+`body_from` requires `REBUILD_ROOT`, must name a concrete originated free
+function, and cannot chain through another `body_from` alias.
+
 ### 4. VTable declarations with compile-time slot verification
 
 ```rust
@@ -214,6 +221,11 @@ On every `cargo check`/`cargo build`:
     - `DUP-ADDR` — multiple Rust fns claim same binary address → **fatal**
     - `ORIGIN-UNREFERENCED` — attributed address never called/jumped/stored
       in the binary → waive with `#[origin(VA, unreferenced)]` (boot anchors only)
+
+For real entry addresses that begin the same instruction body, the second
+free-function origin may use `body_from = [0xSOURCE]`. The macro copies the
+concrete source body's AST and runs all checks independently at the second
+address. This does not waive call, CFG, operand, or reference checks.
 
 ---
 
