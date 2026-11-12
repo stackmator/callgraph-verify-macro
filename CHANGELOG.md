@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Stop reachable-code decoding after a direct call to a verified `POP reg; RET`
+  thunk. The thunk consumes the call continuation as data, so bytes there are
+  inline payload rather than fall-through instructions. Apply the same boundary
+  in `--asm`, `--skeleton`, and CFG fingerprints.
+
 ## [0.1.14] - 2026-11-11
 
 ### Added

@@ -205,7 +205,11 @@ fn embedded_call_opcode_in_immediate_is_not_a_call_or_branch_target() {
     let embedded_call_target = entry + 6;
 
     let cg = analyze(&pe, entry).expect("analyze MOV/RET function");
-    assert!(cg.direct_calls.is_empty(), "invented calls: {:?}", cg.direct_calls);
+    assert!(
+        cg.direct_calls.is_empty(),
+        "invented calls: {:?}",
+        cg.direct_calls
+    );
     assert!(
         !has_direct_branch_target(&pe, embedded_call_target),
         "an E8 byte inside a MOV immediate must not create a branch target"

@@ -6,7 +6,9 @@
 //! asm is ground truth, Ghidra C gives high-level naming, and this gives the byte-accurate call
 //! order + arguments + offsets + control flow in the porter's target idiom.
 
-use crate::disasm::{follow_jump_table, recover_call_site, ArgKind};
+use crate::disasm::{
+    direct_call_target, follow_jump_table, is_call_pop_return_thunk, recover_call_site, ArgKind,
+};
 use crate::pe::Pe;
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, Mnemonic, NasmFormatter, OpKind,
@@ -109,6 +111,12 @@ fn decode_all(pe: &Pe, entry: u64) -> (BTreeMap<u64, Instruction>, BTreeSet<u64>
                     break;
                 }
                 FlowControl::Return | FlowControl::Exception => break,
+                FlowControl::Call
+                    if direct_call_target(pe, &instr)
+                        .is_some_and(|target| is_call_pop_return_thunk(pe, target)) =>
+                {
+                    break;
+                }
                 // `int n` falls through (DOS/DPMI API call that returns;
                 // see disasm.rs) — it ends neither a leader walk nor a block.
                 _ => {}
@@ -175,13 +183,17 @@ fn build_cfg(pe: &Pe, entry: u64) -> (BTreeMap<u64, Instruction>, Vec<Block>) {
             // IndirectCall is NOT a terminator: the callee returns and
             // execution continues at the next IP, so the call is
             // "synchronous" from a CFG perspective.
-            let is_term = !matches!(
-                instr.flow_control(),
-                FlowControl::Next
-                    | FlowControl::Call
-                    | FlowControl::IndirectCall
-                    | FlowControl::XbeginXabortXend
-            );
+            let call_pop_return = instr.flow_control() == FlowControl::Call
+                && direct_call_target(pe, &instr)
+                    .is_some_and(|target| is_call_pop_return_thunk(pe, target));
+            let is_term = call_pop_return
+                || !matches!(
+                    instr.flow_control(),
+                    FlowControl::Next
+                        | FlowControl::Call
+                        | FlowControl::IndirectCall
+                        | FlowControl::XbeginXabortXend
+                );
             if is_term {
                 match instr.flow_control() {
                     FlowControl::ConditionalBranch => {
@@ -370,6 +382,12 @@ fn cfg_fingerprint_uncached(pe: &Pe, entry: u64) -> Result<CfgFingerprint, Strin
                 }
             }
             FlowControl::Return | FlowControl::Interrupt => fp.returns += 1,
+            FlowControl::Call
+                if direct_call_target(pe, &instr)
+                    .is_some_and(|target| is_call_pop_return_thunk(pe, target)) =>
+            {
+                fp.returns += 1
+            }
             FlowControl::IndirectBranch => {
                 let mut cases = Vec::new();
                 // SIB-only read (see above). On LE the table base and its

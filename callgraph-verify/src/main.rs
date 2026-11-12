@@ -496,6 +496,7 @@ fn print_set(label: &str, set: &BTreeSet<u64>, small: bool) {
 /// operands here; annotate their runtime destinations so a `call $+5` is not
 /// mistaken for a fall-through when the loader patches it into a real call.
 fn print_asm(pe: &Pe, entry: u64) {
+    use callgraph_verify::disasm::{direct_call_target, is_call_pop_return_thunk};
     use iced_x86::{Decoder, DecoderOptions, FlowControl, Formatter, NasmFormatter};
     use std::collections::{BTreeMap, BTreeSet};
     const MAX_FN_SPAN: u64 = 0x10000;
@@ -537,6 +538,13 @@ fn print_asm(pe: &Pe, entry: u64) {
                         work.push(t);
                     }
                     break;
+                }
+                FlowControl::Call => {
+                    if direct_call_target(pe, &instr)
+                        .is_some_and(|target| is_call_pop_return_thunk(pe, target))
+                    {
+                        break;
+                    }
                 }
                 FlowControl::IndirectBranch | FlowControl::Return => break,
                 // `int n` returns normally (DOS/DPMI API call) — keep

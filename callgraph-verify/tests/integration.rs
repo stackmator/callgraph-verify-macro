@@ -884,6 +884,38 @@ mod tests {
         assert!(cg.operand_references().contains(&(entry + 5)));
     }
 
+    /// A CALL to `POP reg; RET` consumes its own continuation into the
+    /// register and returns to its caller. Following the bytes after that CALL
+    /// would mistake an inline payload for reachable instructions.
+    #[test]
+    fn call_pop_return_thunk_ends_inline_payload_walk() {
+        let mut code = vec![0u8; 0x22];
+        let thunk_offset = 0x20usize;
+        let first_disp = (thunk_offset as i32) - 5;
+        code[0] = 0xE8; // CALL thunk
+        code[1..5].copy_from_slice(&first_disp.to_le_bytes());
+        // This second CALL is inline data at the first CALL's continuation.
+        // A linear sweep would report it as a second reachable edge.
+        let payload_disp = (thunk_offset as i32) - 10;
+        code[5] = 0xE8;
+        code[6..10].copy_from_slice(&payload_disp.to_le_bytes());
+        code[thunk_offset] = 0x5F; // POP EDI
+        code[thunk_offset + 1] = 0xC3; // RET
+
+        let pe = pe_with_code(&code);
+        let entry = pe.image_base + 0x1000;
+        let thunk = entry + thunk_offset as u64;
+        let cg = analyze(&pe, entry).expect("analyze call-pop thunk");
+        assert_eq!(cg.direct_calls.get(&thunk), Some(&1));
+        assert_eq!(cg.call_continuations, [entry + 5].into_iter().collect());
+        assert_eq!(cg.instruction_ips, [entry].into_iter().collect());
+        assert_eq!(cg.max_end, entry + 5);
+
+        let cfg = cfg_fingerprint(&pe, entry).expect("fingerprint call-pop thunk");
+        assert_eq!(cfg.returns, 1);
+        assert_eq!(cfg.loops, 0);
+    }
+
     /// SIB-indexed `[base + index*scale + disp32]` with an IN-SECTION
     /// displacement is a table-base load (e.g. `[eax*4+0x18F01]` in a real LE
     /// binary),

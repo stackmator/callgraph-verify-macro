@@ -423,6 +423,50 @@ pub fn analyze(pe: &Pe, entry: u64) -> Result<CallGraph, String> {
     analyze_opt(pe, entry, true)
 }
 
+/// Resolve one direct CALL's loaded target, including LE08 self-relative
+/// fixups that are zero placeholders in the on-disk instruction bytes.
+pub fn direct_call_target(pe: &Pe, instr: &Instruction) -> Option<u64> {
+    if instr.flow_control() != FlowControl::Call {
+        return None;
+    }
+    let target = instr.near_branch_target();
+    if target == instr.next_ip() {
+        pe.fixup_rel32_target(instr.ip() + 1)
+    } else if target != 0 {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+/// A call to a `POP reg; RET` thunk consumes its own CALL continuation as
+/// data, then returns to the caller of that CALL. Bytes at the continuation
+/// are inline payload, not reachable fall-through instructions.
+pub fn is_call_pop_return_thunk(pe: &Pe, target: u64) -> bool {
+    if !pe.is_executable_va(target) {
+        return false;
+    }
+    let Some(bytes) = pe.read(target, 16) else {
+        return false;
+    };
+    let mut decoder = Decoder::with_ip(32, bytes, target, DecoderOptions::NONE);
+    let mut pop = Instruction::default();
+    decoder.decode_out(&mut pop);
+    if pop.is_invalid()
+        || pop.mnemonic() != Mnemonic::Pop
+        || pop.op_count() != 1
+        || pop.op0_kind() != OpKind::Register
+        || pop.op0_register() == Register::ESP
+    {
+        return false;
+    }
+    let mut ret = Instruction::default();
+    decoder.decode_out(&mut ret);
+    !ret.is_invalid()
+        && ret.mnemonic() == Mnemonic::Ret
+        && ret.flow_control() == FlowControl::Return
+}
+
 /// [`analyze`] with control over LE jump-table translation. With
 /// `translate_le = false` a table's pre-fixup base/entries are read raw
 /// (the pre-0.1.8 behaviour: LE arms are invisible). The gate uses both:
@@ -535,7 +579,6 @@ fn analyze_uncached(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph
 
             match instr.flow_control() {
                 FlowControl::Call => {
-                    let t = instr.near_branch_target();
                     // Every decoded near CALL pushes next_ip, even when a
                     // call-next/get-PC pattern has no recoverable callee.
                     cg.call_continuations.insert(instr.next_ip());
@@ -544,16 +587,7 @@ fn analyze_uncached(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph
                     // site (LE 08 self-relative fixup) whose on-disk field is
                     // a zero placeholder. Prefer the fixup's runtime target
                     // (operand sits at ip+1 for `E8 rel32`).
-                    let fixed = if t == instr.next_ip() {
-                        pe.fixup_rel32_target(instr.ip() + 1)
-                    } else {
-                        None
-                    };
-                    let dest = match fixed {
-                        Some(target) => Some(target),
-                        None if t != 0 && t != instr.next_ip() => Some(t),
-                        None => None,
-                    };
+                    let dest = direct_call_target(pe, &instr);
                     if let Some(target) = dest {
                         if target != 0 {
                             *cg.direct_calls.entry(target).or_insert(0) += 1;
@@ -563,6 +597,12 @@ fn analyze_uncached(pe: &Pe, entry: u64, translate_le: bool) -> Result<CallGraph
                         }
                     }
                     block_buf.clear(); // args after a call start fresh
+                    if dest.is_some_and(|target| is_call_pop_return_thunk(pe, target)) {
+                        // The callee POP consumes this CALL's return address,
+                        // then RET returns to this function's caller. The
+                        // apparent fall-through is inline payload, not code.
+                        break;
+                    }
                 }
                 FlowControl::IndirectCall => {
                     cg.indirect_calls += 1;
