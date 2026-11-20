@@ -266,10 +266,98 @@ fn parse_errors_note(parse_errors: &[String]) -> Option<String> {
     ))
 }
 
-/// `#[origin(0xADDR)]` — provenance tag + compile-time call-graph verifier.
+/// `#[origin(0xADDR)]` - provenance tag + compile-time call-graph verifier.
 #[proc_macro_attribute]
 pub fn origin(attr: TokenStream, item: TokenStream) -> TokenStream {
     verify_impl(attr, item)
+}
+
+/// Cached `(loc, pre) -> runtime target` map from TARGET_EXE's LE-07 records.
+/// Parsed once per compiler process: 1,800+ invocations must not re-read the
+/// 37K-record table for every call site.
+fn post_fixup_map() -> &'static Result<std::collections::HashMap<(u64, u64), u64>, String> {
+    static MAP: OnceLock<Result<std::collections::HashMap<(u64, u64), u64>, String>> =
+        OnceLock::new();
+    MAP.get_or_init(|| {
+        // TARGET_EXE absent disables the gate too (see `origin`): keep the
+        // marker compilable in that mode by falling back to the identity.
+        let Ok(exe) = std::env::var("TARGET_EXE") else {
+            eprintln!("callgraph_verify_macro: post_fixup! validation DISABLED (TARGET_EXE unset)");
+            return Ok(std::collections::HashMap::new());
+        };
+        let pe = Pe::load(&exe).map_err(|e| format!("post_fixup!: cannot load {exe}: {e}"))?;
+        let mut map = std::collections::HashMap::new();
+        for (loc, pre, target) in pe.fixup_sites() {
+            if *pre == *target {
+                continue;
+            }
+            map.entry((*loc, *pre)).or_insert(*target);
+        }
+        Ok(map)
+    })
+}
+
+/// `post_fixup!(0xPRE, 0xLOC)` — compile-time-validated LE-07 translation.
+///
+/// The link-time operand `pre` sits at VA `loc` in TARGET_EXE; the DOS4GW
+/// loader rewrites that dword to `target` at load. This macro checks the
+/// actual fixup record at expansion time (build fails with `compile_error!`
+/// if `loc`/`pre` don't match the binary) and expands to the runtime VA as
+/// a bare literal. Nothing is hidden from the `#[origin]` gate: its
+/// expander substitutes the `pre` argument, so the static scan sees exactly
+/// the on-disk operand the binary contains.
+#[proc_macro]
+pub fn post_fixup(input: TokenStream) -> TokenStream {
+    let args = input.to_string();
+    let values: Vec<&str> = args
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let fail = |msg: String| -> TokenStream {
+        syn::Error::new(proc_macro2::Span::call_site(), msg)
+            .to_compile_error()
+            .into()
+    };
+    if values.len() != 2 {
+        return fail("post_fixup! expects (pre_literal, fixup_location_literal)".to_string());
+    }
+    let parse = |s: &str| {
+        let t = s.trim_start_matches("0x").trim_start_matches("0X");
+        u64::from_str_radix(t, 16).map_err(|e| format!("post_fixup!: bad hex literal {s}: {e}"))
+    };
+    let (pre, loc) = match (parse(values[0]), parse(values[1])) {
+        (Ok(p), Ok(l)) => (p, l),
+        (Err(e), _) | (_, Err(e)) => return fail(e),
+    };
+    let map = match post_fixup_map().as_ref() {
+        Ok(m) => m,
+        Err(e) => return fail(e.clone()),
+    };
+    match map.get(&(loc, pre)) {
+        Some(target) => {
+            let lit = proc_macro2::Literal::u32_unsuffixed(*target as u32);
+            quote! { #lit }.into()
+        }
+        None if std::env::var("TARGET_EXE").is_err() => {
+            let lit = proc_macro2::Literal::u32_unsuffixed(pre as u32);
+            quote! { #lit }.into()
+        }
+        None => {
+            let nearby: Vec<String> = map
+                .iter()
+                .filter(|((l, _), _)| *l >= loc.saturating_sub(8) && *l <= loc + 8)
+                .map(|((l, p), t)| format!("{l:#x}: {p:#x}->{t:#x}"))
+                .collect();
+            fail(format!(
+                "post_fixup!: no LE-07 record at {loc:#x} with pre {pre:#x} in TARGET_EXE{}",
+                if nearby.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (nearby: {})", nearby.join(", "))
+                }
+            ))
+        }
+    }
 }
 
 /// Map `engine method address -> (vtable VA, slot)` for every `vtable_table!` the rebuild

@@ -350,6 +350,23 @@ fn try_expand_at(
     if name == "macro_rules" {
         return None;
     }
+    // `post_fixup!(pre, loc)` is a known-safe DATA macro: the proc macro
+    // validates the LE-07 record against TARGET_EXE and expands to the
+    // runtime VA, while the gate's static scan must see the on-disk `pre`
+    // literal (the operand the binary actually contains). Substituting the
+    // first argument keeps the address fact visible and the invocation out
+    // of `facts.macros`, so OPAQUE-MACRO stays silent. It hides no calls or
+    // loops: all arguments are consumed at compile time by the proc macro.
+    if name == "post_fixup" {
+        // The first literal in the argument group is `pre` (the on-disk
+        // operand); the second is the fixup location. Pick by token shape
+        // rather than by split order so the gate sees exactly the `pre`
+        // fact from the binary.
+        let pre = args
+            .into_iter()
+            .find(|t| matches!(t, TokenTree::Literal(_)))?;
+        return Some((3, vec![pre]));
+    }
     let candidates = defs.get(&name)?;
     // Ambiguity: two different definition sites with the same name means
     // textual scope is unknowable here — stay opaque.

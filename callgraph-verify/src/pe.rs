@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 type FixupPair = (u64, u64);
-type FixupTables = (Vec<FixupPair>, Vec<FixupPair>);
+type FixupTables = (Vec<FixupPair>, Vec<FixupPair>, Vec<(u64, u64, u64)>);
 
 /// LE fixup-table outcome for one loaded image.
 #[derive(Debug, Clone)]
@@ -49,6 +49,13 @@ pub struct Pe {
     /// on-disk `rel32=0` placeholders (DOS4GW/Watcom `call $+5`), which are
     /// load-time call sites, not get-PC no-ops.
     fixup_rel32: Vec<(u64, u64)>,
+    /// LE 07 absolute records as `(loc, pre, target)`: the dword at VA `loc`
+    /// holds link-time value `pre` and the loader rewrites it to the runtime
+    /// VA `target`. The location-keyed form of [`Pe::fixup_pairs`]: a ported
+    /// body may only bake the link-time `pre` for an operand whose record is
+    /// NOT at that operand's location; a record at the operand location means
+    /// the runtime guest sees only `target`.
+    fixup_sites: Vec<(u64, u64, u64)>,
     /// What happened with the LE fixup tables (see `FixupStatus`).
     fixup_status: FixupStatus,
     /// Process-unique identity assigned at parse time. Whole-image derived
@@ -187,6 +194,7 @@ impl Pe {
             sections,
             fixup_posts: Vec::new(),
             fixup_rel32: Vec::new(),
+            fixup_sites: Vec::new(),
             fixup_status: FixupStatus::Absent,
             id: next_pe_id(),
         })
@@ -245,6 +253,15 @@ impl Pe {
     /// [`Pe::fixup_post_images`].
     pub fn fixup_pairs(&self) -> &[(u64, u64)] {
         &self.fixup_posts
+    }
+
+    /// The absorbed `(loc, pre, target)` triples for every 07 absolute
+    /// fixup record: the dword at VA `loc` holds link-time value `pre` and
+    /// the loader rewrites it to runtime VA `target`. The location-keyed
+    /// form of [`Pe::fixup_pairs`], for auditing whether a specific
+    /// operand site is patched.
+    pub fn fixup_sites(&self) -> &[(u64, u64, u64)] {
+        &self.fixup_sites
     }
 
     /// The LE 08 self-relative records as `(operand_va, target_va)`.
@@ -666,15 +683,20 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
             characteristics,
         });
     }
-    let (fixup_posts, fixup_rel32, fixup_status) = match collect_fixups(
+    let (fixup_posts, fixup_rel32, fixup_sites, fixup_status) = match collect_fixups(
         &data, le_off, &objs, numpages, pagesize, &sections, &new_data,
     ) {
-        Ok((pairs, rel32)) => {
+        Ok((pairs, rel32, sites)) => {
             let n = pairs.len();
-            (pairs, rel32, FixupStatus::Applied { pairs: n })
+            (pairs, rel32, sites, FixupStatus::Applied { pairs: n })
         }
         Err(e) if e.starts_with(NOVEL_FIXUP_PREFIX) => {
-            (Vec::new(), Vec::new(), FixupStatus::Skipped { reason: e })
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                FixupStatus::Skipped { reason: e },
+            )
         }
         Err(e) => return Err(e),
     };
@@ -685,6 +707,7 @@ fn parse_le(data: Vec<u8>, le_off: usize) -> Result<Pe, String> {
         sections,
         fixup_posts,
         fixup_rel32,
+        fixup_sites,
         fixup_status,
         id: next_pe_id(),
     })
@@ -767,7 +790,7 @@ fn collect_fixups(
         .ok_or("LE fixup record-table offset overflow")?;
     if fpt == le_off && frt == le_off {
         // Zeroed table offsets: the linker emitted no fixup tables.
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
     let tab_len = (numpages + 1)
         .checked_mul(4)
@@ -811,6 +834,7 @@ fn collect_fixups(
     }
     let mut out: Vec<(u64, u64)> = Vec::new();
     let mut out_rel32: Vec<(u64, u64)> = Vec::new();
+    let mut out_sites: Vec<(u64, u64, u64)> = Vec::new();
     for (pi, (start, end)) in bounds.iter().enumerate() {
         let lp = pi + 1; // logical pages are 1-based
         let (obase, _, opage, _) = objs
@@ -930,6 +954,7 @@ fn collect_fixups(
                 }
                 if low4 == 7 {
                     out.push((pre as u64, target as u64));
+                    out_sites.push((loc as u64, pre as u64, target as u64));
                 } else if low4 == 8 {
                     // Self-relative: the loader writes target-(loc+4), so the
                     // record target is the runtime branch/call destination.
@@ -945,7 +970,7 @@ fn collect_fixups(
             ));
         }
     }
-    Ok((out, out_rel32))
+    Ok((out, out_rel32, out_sites))
 }
 
 #[cfg(test)]
